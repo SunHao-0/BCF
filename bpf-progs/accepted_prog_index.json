@@ -1,0 +1,619 @@
+{
+  "cilium": {
+    "bpf_lxc.o": [
+      "clang-18_-O1_bpf_lxc.o",
+      "clang-15_-O1_bpf_lxc.o",
+      "clang-16_-O1_bpf_lxc.o",
+      "clang-14_-O1_bpf_lxc.o",
+      "clang-20_-O1_bpf_lxc.o"
+    ],
+    "bpf_wireguard.o": [
+      "clang-20_-O1_bpf_wireguard.o",
+      "clang-14_-O1_bpf_wireguard.o",
+      "clang-15_-O1_bpf_wireguard.o",
+      "clang-18_-O1_bpf_wireguard.o",
+      "clang-16_-O1_bpf_wireguard.o"
+    ],
+    "bpf_overlay.o": [
+      "clang-17_-O1_bpf_overlay.o",
+      "clang-20_-O1_bpf_overlay.o",
+      "clang-18_-O1_bpf_overlay.o"
+    ],
+    "bpf_host.o": [
+      "clang-15_-O1_bpf_host.o",
+      "clang-18_-O1_bpf_host.o",
+      "clang-20_-O1_bpf_host.o",
+      "clang-16_-O1_bpf_host.o",
+      "clang-14_-O1_bpf_host.o"
+    ]
+  },
+  "calico": {
+    "felix_bin_bpf_from_tnl_fib_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_no_log_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_no_log_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_debug_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_lo_debug_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_to_lo_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_to_lo_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_tnl_no_log.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_no_log.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_no_log.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_debug.o"
+    ],
+    "felix_bin_bpf_from_wep_dsr_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_wep_dsr_no_log_co-re_v6.o"
+    ],
+    "test_to_wep_fib_debug_co-re.o": [
+      "clang-17_-O1_test_to_wep_fib_debug_co-re.o",
+      "clang-16_-O1_test_to_wep_fib_debug_co-re.o",
+      "clang-15_-O1_test_to_wep_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_nat_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_to_nat_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_to_nat_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_to_nat_no_log.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_debug_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_hep_fib_dsr_no_log_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_fib_debug_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_to_hep_fib_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_fib_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_hep_fib_debug_v6.o"
+    ],
+    "test_to_hep_fib_debug_co-re.o": [
+      "clang-17_-O1_test_to_hep_fib_debug_co-re.o",
+      "clang-15_-O1_test_to_hep_fib_debug_co-re.o",
+      "clang-16_-O1_test_to_hep_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_tnl_debug_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_from_tnl_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_tnl_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_l3_debug_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_to_l3_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_l3_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_l3_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_l3_debug_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_from_l3_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_l3_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_l3_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_wep_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_to_wep_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_to_wep_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_to_wep_no_log.o"
+    ],
+    "felix_bin_bpf_to_nat_debug_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_to_nat_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_to_nat_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_to_nat_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_hep_fib_debug_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_to_hep_fib_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_fib_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_to_hep_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_nat_no_log_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_no_log_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_no_log_v6.o"
+    ],
+    "test_from_wep_fib_no_log.o": [
+      "clang-16_-O1_test_from_wep_fib_no_log.o",
+      "clang-15_-O1_test_from_wep_fib_no_log.o",
+      "clang-17_-O1_test_from_wep_fib_no_log.o"
+    ],
+    "test_to_wep_fib_debug_co-re_v6.o": [
+      "clang-16_-O1_test_to_wep_fib_debug_co-re_v6.o",
+      "clang-17_-O1_test_to_wep_fib_debug_co-re_v6.o",
+      "clang-15_-O1_test_to_wep_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_fib_dsr_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_debug_co-re_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_no_log.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_no_log.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_no_log.o"
+    ],
+    "felix_bin_bpf_to_lo_fib_no_log_co-re_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_to_lo_fib_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_fib_no_log_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_lo_fib_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_dsr_no_log_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_co-re.o"
+    ],
+    "test_to_hep_fib_debug_co-re_v6.o": [
+      "clang-17_-O1_test_to_hep_fib_debug_co-re_v6.o",
+      "clang-15_-O1_test_to_hep_fib_debug_co-re_v6.o",
+      "clang-16_-O1_test_to_hep_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_lo_debug_co-re_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_to_lo_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_lo_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_wep_dsr_no_log_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_from_wep_dsr_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_dsr_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_wep_dsr_no_log_co-re.o"
+    ],
+    "test_from_wep_fib_debug_co-re.o": [
+      "clang-15_-O1_test_from_wep_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_hep_debug_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_to_hep_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_hep_debug_co-re_v6.o"
+    ],
+    "test_to_nat_fib_debug_co-re_v6.o": [
+      "clang-16_-O1_test_to_nat_fib_debug_co-re_v6.o",
+      "clang-17_-O1_test_to_nat_fib_debug_co-re_v6.o",
+      "clang-15_-O1_test_to_nat_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_debug.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_debug.o"
+    ],
+    "felix_bin_bpf_to_wep_no_log_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_to_wep_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_to_wep_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_to_wep_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_from_tnl_no_log_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_tnl_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_no_log_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_tnl_no_log_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_no_log_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_no_log_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_no_log_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_nat_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_debug_v6.o"
+    ],
+    "felix_bin_bpf_to_l3_debug_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_to_l3_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_to_l3_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_to_l3_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_hep_fib_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_from_hep_fib_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_hep_fib_debug.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_fib_debug.o"
+    ],
+    "felix_bin_bpf_from_wep_debug.o": [
+      "clang-17_-O1_felix_bin_bpf_from_wep_debug.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_debug.o"
+    ],
+    "felix_bin_bpf_from_tnl_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_nat_debug_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_to_nat_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_nat_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_nat_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_dsr_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_hep_dsr_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_hep_dsr_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_dsr_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_dsr_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_dsr_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_dsr_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_dsr_no_log.o"
+    ],
+    "felix_bin_bpf_from_l3_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_from_l3_debug.o",
+      "clang-16_-O1_felix_bin_bpf_from_l3_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_l3_debug.o"
+    ],
+    "felix_bin_bpf_from_hep_fib_dsr_no_log_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_dsr_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log.o"
+    ],
+    "felix_bin_bpf_from_nat_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_from_nat_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_debug.o"
+    ],
+    "felix_bin_bpf_from_nat_debug_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_from_nat_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_lo_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_lo_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_wep_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_wep_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_wep_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_wep_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_tnl_debug_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_debug_co-re_v6.o"
+    ],
+    "test_from_hep_fib_no_log_skb0x0.o": [
+      "clang-17_-O1_test_from_hep_fib_no_log_skb0x0.o",
+      "clang-16_-O1_test_from_hep_fib_no_log_skb0x0.o",
+      "clang-15_-O1_test_from_hep_fib_no_log_skb0x0.o"
+    ],
+    "felix_bin_bpf_to_lo_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_lo_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_dsr_no_log_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_dsr_no_log_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_dsr_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_dsr_no_log_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_no_log_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_no_log_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_to_nat_no_log_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_to_nat_no_log_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_nat_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_nat_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_debug_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_to_hep_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_to_hep_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_hep_fib_debug_co-re_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_to_hep_fib_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_fib_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_l3_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_l3_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_l3_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_l3_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_dsr_no_log_co-re.o": [
+      "clang-16_-O1_felix_bin_bpf_from_hep_dsr_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_hep_dsr_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_dsr_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_from_wep_dsr_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_wep_dsr_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_debug_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_lo_fib_debug_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_to_lo_fib_debug_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_wep_debug.o": [
+      "clang-17_-O1_felix_bin_bpf_to_wep_debug.o",
+      "clang-16_-O1_felix_bin_bpf_to_wep_debug.o",
+      "clang-15_-O1_felix_bin_bpf_to_wep_debug.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_dsr_no_log_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_fib_debug.o": [
+      "clang-16_-O1_felix_bin_bpf_to_hep_fib_debug.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_fib_debug.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_fib_debug.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_dsr_debug.o": [
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_dsr_debug.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_dsr_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_dsr_debug.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_no_log_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_no_log_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_to_nat_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_nat_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_nat_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_nat_debug_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_debug.o": [
+      "clang-16_-O1_felix_bin_bpf_to_hep_debug.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_debug.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_debug.o"
+    ],
+    "felix_bin_bpf_from_l3_fib_no_log_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_l3_fib_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_l3_fib_no_log_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_l3_fib_no_log_v6.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_debug_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_debug_co-re_v6.o"
+    ],
+    "test_to_nat_fib_debug_co-re.o": [
+      "clang-15_-O1_test_to_nat_fib_debug_co-re.o",
+      "clang-16_-O1_test_to_nat_fib_debug_co-re.o",
+      "clang-17_-O1_test_to_nat_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_tnl_debug.o": [
+      "clang-17_-O1_felix_bin_bpf_from_tnl_debug.o",
+      "clang-15_-O1_felix_bin_bpf_from_tnl_debug.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_debug.o"
+    ],
+    "felix_bin_bpf_to_lo_fib_debug_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_to_lo_fib_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_lo_fib_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_lo_fib_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_lo_fib_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_fib_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_fib_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_l3_fib_no_log.o": [
+      "clang-16_-O1_felix_bin_bpf_from_l3_fib_no_log.o",
+      "clang-17_-O1_felix_bin_bpf_from_l3_fib_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_from_l3_fib_no_log.o"
+    ],
+    "felix_bin_bpf_to_nat_debug.o": [
+      "clang-17_-O1_felix_bin_bpf_to_nat_debug.o",
+      "clang-16_-O1_felix_bin_bpf_to_nat_debug.o",
+      "clang-15_-O1_felix_bin_bpf_to_nat_debug.o"
+    ],
+    "felix_bin_bpf_to_wep_no_log_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_to_wep_no_log_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_wep_no_log_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_wep_no_log_v6.o"
+    ],
+    "test_from_nat_fib_debug_co-re.o": [
+      "clang-16_-O1_test_from_nat_fib_debug_co-re.o",
+      "clang-17_-O1_test_from_nat_fib_debug_co-re.o",
+      "clang-15_-O1_test_from_nat_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_debug_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_debug_co-re.o"
+    ],
+    "felix_bin_bpf_to_hep_debug_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_to_hep_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_debug_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_dsr_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_to_hep_dsr_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_dsr_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_to_hep_dsr_no_log.o"
+    ],
+    "felix_bin_bpf_from_l3_debug_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_l3_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_l3_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_l3_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_no_log_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_no_log_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_no_log_v6.o"
+    ],
+    "felix_bin_bpf_to_lo_fib_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_to_lo_fib_debug.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_fib_debug.o",
+      "clang-17_-O1_felix_bin_bpf_to_lo_fib_debug.o"
+    ],
+    "felix_bin_bpf_from_l3_fib_no_log_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_l3_fib_no_log_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_l3_fib_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_l3_fib_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_wep_debug_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_to_wep_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_to_wep_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_to_wep_debug_co-re.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_debug_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_l3_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_to_l3_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_to_l3_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_to_l3_no_log.o"
+    ],
+    "felix_bin_bpf_to_lo_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_to_lo_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_to_lo_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_no_log.o"
+    ],
+    "felix_bin_bpf_from_l3_debug_co-re_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_from_l3_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_l3_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_l3_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_debug_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_debug_v6.o"
+    ],
+    "felix_bin_bpf_to_wep_debug_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_wep_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_wep_debug_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_wep_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_to_hep_fib_dsr_no_log_co-re_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_to_hep_fib_dsr_no_log_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_to_hep_fib_dsr_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_hep_fib_dsr_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_fib_dsr_no_log_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_hep_fib_dsr_no_log_v6.o"
+    ],
+    "felix_bin_bpf_from_tnl_no_log_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_from_tnl_no_log_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_no_log_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_tnl_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_to_lo_debug.o": [
+      "clang-17_-O1_felix_bin_bpf_to_lo_debug.o",
+      "clang-15_-O1_felix_bin_bpf_to_lo_debug.o",
+      "clang-16_-O1_felix_bin_bpf_to_lo_debug.o"
+    ],
+    "felix_bin_bpf_from_tnl_debug_v6.o": [
+      "clang-16_-O1_felix_bin_bpf_from_tnl_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_tnl_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_debug_v6.o"
+    ],
+    "felix_bin_bpf_to_l3_debug.o": [
+      "clang-15_-O1_felix_bin_bpf_to_l3_debug.o",
+      "clang-17_-O1_felix_bin_bpf_to_l3_debug.o",
+      "clang-16_-O1_felix_bin_bpf_to_l3_debug.o"
+    ],
+    "felix_bin_bpf_from_wep_debug_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_wep_debug_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_wep_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_wep_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_wep_debug_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_wep_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_wep_dsr_no_log.o": [
+      "clang-15_-O1_felix_bin_bpf_from_wep_dsr_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_wep_dsr_no_log.o",
+      "clang-17_-O1_felix_bin_bpf_from_wep_dsr_no_log.o"
+    ],
+    "felix_bin_bpf_from_wep_dsr_no_log_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_wep_dsr_no_log_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_no_log.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_no_log.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_no_log.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_no_log_co-re_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_no_log_co-re_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_no_log_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_no_log_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_wep_fib_dsr_no_log_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_v6.o",
+      "clang-17_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_wep_fib_dsr_no_log_v6.o"
+    ],
+    "test_from_nat_fib_debug_co-re_v6.o": [
+      "clang-15_-O1_test_from_nat_fib_debug_co-re_v6.o",
+      "clang-16_-O1_test_from_nat_fib_debug_co-re_v6.o",
+      "clang-17_-O1_test_from_nat_fib_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_nat_debug_co-re_v6.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_debug_co-re_v6.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_debug_co-re_v6.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_debug_co-re_v6.o"
+    ],
+    "felix_bin_bpf_from_l3_fib_no_log_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_from_l3_fib_no_log_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_l3_fib_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_l3_fib_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_from_tnl_fib_no_log_co-re.o": [
+      "clang-15_-O1_felix_bin_bpf_from_tnl_fib_no_log_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_tnl_fib_no_log_co-re.o",
+      "clang-17_-O1_felix_bin_bpf_from_tnl_fib_no_log_co-re.o"
+    ],
+    "felix_bin_bpf_to_wep_debug_v6.o": [
+      "clang-15_-O1_felix_bin_bpf_to_wep_debug_v6.o",
+      "clang-17_-O1_felix_bin_bpf_to_wep_debug_v6.o",
+      "clang-16_-O1_felix_bin_bpf_to_wep_debug_v6.o"
+    ],
+    "felix_bin_bpf_from_hep_debug.o": [
+      "clang-16_-O1_felix_bin_bpf_from_hep_debug.o",
+      "clang-17_-O1_felix_bin_bpf_from_hep_debug.o",
+      "clang-15_-O1_felix_bin_bpf_from_hep_debug.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_no_log.o": [
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_no_log.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_no_log.o",
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_no_log.o"
+    ],
+    "felix_bin_bpf_from_nat_fib_debug_co-re.o": [
+      "clang-17_-O1_felix_bin_bpf_from_nat_fib_debug_co-re.o",
+      "clang-16_-O1_felix_bin_bpf_from_nat_fib_debug_co-re.o",
+      "clang-15_-O1_felix_bin_bpf_from_nat_fib_debug_co-re.o"
+    ]
+  },
+  "bcc": {
+    "ksnoop.bpf.o": [
+      "clang-20_-Os_ksnoop.bpf.o",
+      "clang-20_-O2_ksnoop.bpf.o",
+      "clang-20_-O1_ksnoop.bpf.o"
+    ]
+  },
+  "inspektor-gadget": {
+    "seccomp_x86_bpfel.o": [
+      "clang-20_-O1_seccomp_x86_bpfel.o",
+      "clang-19_-O2_seccomp_x86_bpfel.o",
+      "clang-19_-O1_seccomp_x86_bpfel.o"
+    ]
+  }
+}
