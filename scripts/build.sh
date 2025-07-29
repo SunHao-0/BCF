@@ -12,7 +12,7 @@ trap 'echo -e "\033[0;31m[-] Error on line $LINENO\033[0m"; echo "Error on line 
 download_if_missing() {
     local url="$1" dest="$2"
     [[ -f "$dest" ]] && return
-    do_log "Downloading $(basename "$dest")"
+    info "Downloading $(basename "$dest")"
     curl -L -o "$dest" "$url" >>"$LOGFILE" 2>&1 || fatal "Failed to download $url (see $LOGFILE)"
 }
 

@@ -1,0 +1,111 @@
+From 0f0f7b06aa1f5a113fafcfda48a37ce858c705ee Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 5 Mar 2025 18:33:57 +0100
+Subject: [PATCH 32/32] bpf: Add bcf proof check count
+
+Add statistics collection support.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  4 ++++
+ kernel/bpf/verifier.c        | 20 +++++++++++++++++++-
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 53224590d627..37532102115f 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -710,6 +710,10 @@ struct bcf_state {
+ 	u32 expr_cnt;
+ 	u32 *path_conds;	/* path condition */
+ 	u32 cond_cnt;
++	u32 proof_check_cnt;
++	u32 backtrack_length;
++	u32 track_length;
++	u32 cond_size;
+ 	int path_cond;		/* conjunction of path_conds */
+ 	int refine_cond;	/* refinement condition */
+ 	/* The verifier states, including the base state (where the bcf tracking
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index adc2546f548e..3b65b23c8aca 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19528,6 +19528,7 @@ static int do_check(struct bpf_verifier_env *env)
+ 			pr_debug("path %s: (%d -> %d)\n",
+ 				path == PATH_MISMATCH ? "mismatch" : "match",
+ 				env->prev_insn_idx, env->insn_idx);
++			env->bcf.track_length++;
+ 			if (path == PATH_MISMATCH)
+ 				goto process_bpf_exit;
+ 			err = record_path_cond(env);
+@@ -22827,6 +22828,8 @@ static int init_bcf_state(struct bpf_verifier_env *env,
+ 	bcf->path_conds = NULL;
+ 	bcf->path_cond = -1;
+ 	bcf->refine_cond = -1;
++	bcf->track_length = 0;
++	bcf->cond_size = 0;
+ 	if (!base)
+ 		return 0;
+
+@@ -23017,6 +23020,7 @@ backtrack_base_state(struct bpf_verifier_env *env, u32 reg_masks)
+ 	bt_init(bt, env->cur_state->curframe);
+ 	bt->reg_masks[bt->frame] = reg_masks;
+ 	swap(env->log.level, log_level);
++	env->bcf.backtrack_length = 0;
+
+ 	for (;;) {
+ 		u32 hist_start = st->insn_hist_start;
+@@ -23038,6 +23042,7 @@ backtrack_base_state(struct bpf_verifier_env *env, u32 reg_masks)
+ 			}
+ 			if (err)
+ 				goto err_out;
++			env->bcf.backtrack_length++;
+ 			if (bt_empty(bt)) {
+ 				pr_debug("BCF: backtrack succ, parent found");
+ 				swap(env->log.level, log_level);
+@@ -23061,6 +23066,7 @@ backtrack_base_state(struct bpf_verifier_env *env, u32 reg_masks)
+ err_out:
+ 	bt_reset(bt);
+ 	swap(env->log.level, log_level);
++	env->bcf.backtrack_length = 0; /* clear when failed */
+ 	return base;
+ }
+
+@@ -23168,6 +23174,8 @@ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ out:
+ 	pr_debug("BCF: refine cond: %d, path cond: %d\n",
+ 		 bcf->refine_cond, bcf->path_cond);
++	if (bcf->refine_cond >= 0 || bcf->path_cond >= 0)
++		bcf->cond_size = bcf->expr_cnt * sizeof(struct bcf_expr);
+ 	kfree(bcf->parents);
+ 	if (bcf->cond_cnt) {
+ 		bcf->cond_cnt = 0;
+@@ -23184,14 +23192,24 @@ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+ 		      bpfptr_t uattr)
+ {
++	u64 start_time = ktime_get_ns();
++	bool unreachable;
+ 	int err;
+
+ 	err = bcf_check_proof(env, attr, uattr);
+ 	if (err)
+ 		return err;
+
++	unreachable = attr->bcf_flags & BCF_F_PROOF_PATH_UNREACHABLE;
++	env->bcf.proof_check_cnt++;
++	verbose(env, "bcf proof checked %d nth in %lld ns, size %d bytes, type %s backtrack_length %d track_length %d cond_size %d\n",
++		env->bcf.proof_check_cnt, ktime_get_ns() - start_time,
++		attr->bcf_buf_true_size, unreachable ? "path" : "range",
++		env->bcf.backtrack_length, env->bcf.track_length,
++		env->bcf.cond_size);
++
+ 	unmark_bcf_requested(env);
+-	if (attr->bcf_flags & BCF_F_PROOF_PATH_UNREACHABLE) {
++	if (unreachable) {
+ 		env->cur_state->refined = false;
+ 		env->bcf.path_unreachable = true;
+ 	} else {
+--
+2.34.1
+

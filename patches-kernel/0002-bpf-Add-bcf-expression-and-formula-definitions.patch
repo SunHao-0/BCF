@@ -1,0 +1,394 @@
+From b8e02da0bc5b4ac4d8444f1ea281ed6ecd13e452 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 24 Feb 2025 15:17:33 +0100
+Subject: [PATCH 02/32] bpf: Add bcf expression and proof data structure 
+
+Introduce core data structures for representing BCF expressions and proofs:
+- `include/uapi/linux/bcf.h`: UAPI definitions for BCF expression encoding,
+  proof steps, and associated constants.
+- `include/linux/bcf.h`: Internal kernel wrappers and helper macros for
+  manipulating BCF expressions.
+
+A bcf_expr is essentially a QF_BV SMT formula, which involves bitvec, or
+boolean type. Different types have different operators, e.g., bitvec uses
+arithmetic operations, while boolean supports logical operations. The op
+and the type information are encoded into bcf_expr, which first encode the
+meta information (code, vlen, params), and then the arguments (index into
+other bcf_exprs). The bcf_expr is a variable-length array, and the length
+is encoded in vlen. The encoding is u32-based.
+
+A proof consists of a header, a sequence of exprs (referred by steps), and
+a sequence of steps. This also bases on the u32-based encoding. Each step
+must be an valid rule application, which refers to several premises, exprs,
+and produces a conclusion.
+
+Note that in our latest implementation, the definition is simplified and
+more consistent.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bcf.h      | 177 +++++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/bcf.h | 167 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 344 insertions(+)
+ create mode 100644 include/linux/bcf.h
+ create mode 100644 include/uapi/linux/bcf.h
+
+diff --git a/include/linux/bcf.h b/include/linux/bcf.h
+new file mode 100644
+index 000000000000..8fcfcc865fcc
+--- /dev/null
++++ b/include/linux/bcf.h
+@@ -0,0 +1,177 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef __LINUX_BCF_H__
++#define __LINUX_BCF_H__
++
++#include <uapi/linux/bcf.h>
++#include <linux/types.h>
++#include <linux/bpf.h>
++
++static_assert(sizeof(struct bcf_expr) == sizeof(u32));
++
++struct bcf_expr_unary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++};
++
++static_assert(sizeof(struct bcf_expr_unary) == sizeof(u32) * 2);
++
++struct bcf_expr_binary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++	u32 arg1;
++};
++
++static_assert(sizeof(struct bcf_expr_binary) == sizeof(u32) * 3);
++
++struct bcf_expr_ternary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++	u32 arg1;
++	u32 arg2;
++};
++
++static_assert(sizeof(struct bcf_expr_ternary) == sizeof(u32) * 4);
++
++#define BCF_PRED_VAR                                  \
++	((struct bcf_expr){                           \
++		.code = BCF_BOOL_PRED | BCF_BOOL_VAR, \
++		.vlen = 0,                            \
++		.params = 0,                          \
++	})
++
++#define BCF_PRED_TRUE                                 \
++	((struct bcf_expr){                           \
++		.code = BCF_BOOL_PRED | BCF_BOOL_VAL, \
++		.vlen = 0,                            \
++		.params = BCF_BOOL_TRUE,              \
++	})
++
++#define BCF_PRED_FALSE                                \
++	((struct bcf_expr){                           \
++		.code = BCF_BOOL_PRED | BCF_BOOL_VAL, \
++		.vlen = 0,                            \
++		.params = BCF_BOOL_FALSE,             \
++	})
++
++#define BCF_PRED_NOT(ARG0)                       \
++	((struct bcf_expr_unary){                \
++		.code = BCF_BOOL_PRED | BCF_NOT, \
++		.vlen = 1,                       \
++		.params = 0,                     \
++		.arg0 = ARG0,                    \
++	})
++
++#define BCF_PRED_ITE(ARG0, ARG1, ARG2)           \
++	((struct bcf_expr_ternary){              \
++		.code = BCF_BOOL_PRED | BCF_ITE, \
++		.vlen = 3,                       \
++		.params = 0,                     \
++		.arg0 = ARG0,                    \
++		.arg1 = ARG1,                    \
++		.arg2 = ARG2,                    \
++	})
++
++#define BCF_BOOL_EXPR(OP, ARG0, ARG1)       \
++	((struct bcf_expr_binary){          \
++		.code = BCF_BOOL_PRED | OP, \
++		.vlen = 2,                  \
++		.params = 0,                \
++		.arg0 = ARG0,               \
++		.arg1 = ARG1,               \
++	})
++
++#define BCF_PRED_EQUIV(ARG0, ARG1) BCF_BOOL_EXPR(BCF_EQUIV, ARG0, ARG1)
++#define BCF_PRED_XOR(ARG0, ARG1) BCF_BOOL_EXPR(BCF_XOR, ARG0, ARG1)
++#define BCF_PRED_IMPLES(ARG0, ARG1) BCF_BOOL_EXPR(BCF_IMPLIES, ARG0, ARG1)
++
++#define BCF_BV_VAR32                                       \
++	((struct bcf_expr){                                \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR, \
++		.vlen = 0,                                 \
++		.params = 32,                              \
++	})
++
++#define BCF_BV_VAR64                                       \
++	((struct bcf_expr){                                \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR, \
++		.vlen = 0,                                 \
++		.params = 64,                              \
++	})
++
++#define BCF_BV_VAL32(IMM)                                  \
++	((struct bcf_expr_unary){                          \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAL, \
++		.vlen = 1,                                 \
++		.params = 32,                              \
++		.arg0 = IMM,                               \
++	})
++
++#define BCF_BV_VAL64(IMM)                                  \
++	((struct bcf_expr_binary){                         \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAL, \
++		.vlen = 2,                                 \
++		.params = 64,                              \
++		.arg0 = IMM,                               \
++		.arg1 = (u64)IMM >> 32,                    \
++	})
++
++#define BCF_BV_EXTRACT(SIZE, ARG0)                          \
++	((struct bcf_expr_unary){                           \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_EXTRACT, \
++		.vlen = 1,                                  \
++		.params = ((u16)SIZE - 1) << 8 | 0,         \
++		.arg0 = ARG0,                               \
++	})
++
++#define BCF_BV_ZEXT(SIZE, BITSZ, ARG0)                          \
++	((struct bcf_expr_unary){                               \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_ZERO_EXTEND, \
++		.vlen = 1,                                      \
++		.params = (u16)SIZE << 8 | BITSZ,               \
++		.arg0 = ARG0,                                   \
++	})
++
++#define BCF_BV_SEXT(SIZE, BITSZ, ARG0)                          \
++	((struct bcf_expr_unary){                               \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_SIGN_EXTEND, \
++		.vlen = 1,                                      \
++		.params = (u16)SIZE << 8 | BITSZ,               \
++		.arg0 = ARG0,                                   \
++	})
++
++#define BCF_BV_EXPR(CODE, ARG0, ARG1, BITS) \
++	((struct bcf_expr_binary){          \
++		.code = CODE,               \
++		.vlen = 2,                  \
++		.params = BITS,             \
++		.arg0 = ARG0,               \
++		.arg1 = ARG1,               \
++	})
++
++#define BCF_ALU(OP, ARG0, ARG1, BITS) \
++	BCF_BV_EXPR(BCF_BV_ALU | OP, ARG0, ARG1, BITS)
++
++#define BCF_ALU32(OP, ARG0, ARG1) BCF_ALU(OP, ARG0, ARG1, 32)
++#define BCF_ALU64(OP, ARG0, ARG1) BCF_ALU(OP, ARG0, ARG1, 64)
++
++#define BCF_PRED(OP, ARG0, ARG1, BITS) \
++	BCF_BV_EXPR(BCF_BV_PRED | OP, ARG0, ARG1, BITS)
++
++#define BCF_PRED32(OP, ARG0, ARG1) BCF_PRED(OP, ARG0, ARG1, 32)
++#define BCF_PRED64(OP, ARG0, ARG1) BCF_PRED(OP, ARG0, ARG1, 64)
++
++#define MAX_BCF_PROOF_SIZE BPF_COMPLEXITY_LIMIT_INSNS
++
++static_assert(sizeof(struct bcf_proof_step) == sizeof(u32));
++
++static_assert(__MAX_BCF_BUILTIN_RULES <= MAX_BCF_CLASS_RULES);
++static_assert(__MAX_BCF_BOOLEAN_RULES <= MAX_BCF_CLASS_RULES);
++static_assert(__MAX_BCF_EQUALITY_RULES <= MAX_BCF_CLASS_RULES);
++static_assert(__MAX_BCF_BV_RULES <= MAX_BCF_CLASS_RULES);
++#endif /* __LINUX_BCF_H__ */
+diff --git a/include/uapi/linux/bcf.h b/include/uapi/linux/bcf.h
+new file mode 100644
+index 000000000000..c714c2b610f4
+--- /dev/null
++++ b/include/uapi/linux/bcf.h
+@@ -0,0 +1,167 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI__LINUX_BCF_H__
++#define _UAPI__LINUX_BCF_H__
++
++#include <linux/types.h>
++#include <linux/bpf_common.h>
++
++/* BCF expression classes */
++#define BCF_BV_ALU	0x00
++#define BCF_BV_PRED	0x01
++#define BCF_BOOL_PRED	0x02
++#define BCF_BUILTIN	0x03
++
++#define BCF_EXT		0x08
++
++/* BCF bitvec extended operations (BCF_BV_ALU | BCF_EXT) */
++#define BCF_BV_VAR	0x00
++#define BCF_BV_VAL	0x10
++#define BCF_BBT		0x20
++#define BCF_EXTRACT	0x30
++#define BCF_SIGN_EXTEND 0x40
++#define BCF_ZERO_EXTEND 0x50
++#define BCF_CONCAT	0x60
++#define BCF_BVSIZE	0x70
++
++/* BCF bitvec predicate (BCF_BV_PRED) */
++#define BCF_BITOF	0x00
++
++/* BCF boolean predicate (BCF_BOOL_PRED) */
++#define BCF_BOOL_VAR	0x00
++#define BCF_BOOL_VAL	0x10
++#define BCF_CONJ	0x20
++#define BCF_DISJ	0x30
++#define BCF_IMPLIES	0x40
++#define BCF_XOR		0x50
++#define BCF_ITE		0x60
++#define BCF_NOT		0x70
++#define BCF_EQUIV	0x80
++
++/*BCF boolean value (BCF_BOOL_VAL) */
++#define BCF_BOOL_TRUE	0x0
++#define BCF_BOOL_FALSE	0x1
++
++/* BCF builtin expressions (BCF_BUILTIN) */
++#define BCF_ARG_LIST	0x00
++
++struct bcf_expr {
++	__u8	code;
++	/* number of args */
++	__u8	vlen;
++	/* Parameterize the code. For BCF_BV_*, the lower 8 bits is the bitvec
++	 * bit size, and the higher bits are reserved, except: (1) the higher
++	 * bits mean the extended bits for zero/sign extension, (2) the higher
++	 * and lower mean the start and end of the bit for extraction.
++	 * For BCF_BOOL_BPRED, the lowest one bit for BCF_BOOL_VAL is the val,
++	 * and all bits are reserved for other cases.
++	 */
++	__u16	params;
++	/* arguments (arg_idx), counted by vlen */
++	__u32	args[];
++};
++
++#define BCF_BV_BITSZ(params)		((params) & 0x00ff)
++#define BCF_BV_EXTSZ(params)		(((params) & 0xff00) >> 8)
++#define BCF_EXTRACT_START(params)	BCF_BV_EXTSZ(params)
++#define BCF_EXTRACT_LAST(params)	BCF_BV_BITSZ(params)
++#define BCF_PRED_VAL(params)		((params) & 0x0001)
++
++struct bcf_conds {
++	__s32	path_cond;
++	__s32	refine_cond;
++};
++
++#define BCF_MAGIC 0x0BCF
++
++struct bcf_proof_header {
++	__u32	magic;
++	__u32	expr_cnt;
++	__u32	step_cnt;
++};
++
++struct bcf_proof_step {
++	__u16	rule;
++	__u8	vlen;
++	__u8	params;
++	__u32	args[];
++};
++
++#define BCF_STEP_CLASS(rule)		((rule) & 0xe000)
++#define		BCF_RULE_BUILTIN	0x0000
++#define		BCF_RULE_BOOLEAN	0x2000
++#define		BCF_RULE_EQUALITY	0x4000
++#define		BCF_RULE_BV		0x6000
++
++#define MAX_BCF_CLASS_RULES	0x1fff
++#define BCF_STEP_RULE(step)	((step) & 0x1fff)
++
++/* Builtin Rules */
++enum {
++	BCF_RULE_ASSUME = 0,
++	BCF_RULE_REWRITE,
++
++	__MAX_BCF_BUILTIN_RULES,
++};
++
++/* Boolean Rules */
++enum {
++	BCF_RULE_RESOLUTION = 0,
++	BCF_RULE_CHAIN_RESOLUTION,
++	BCF_RULE_FACTORING,
++	BCF_RULE_REORDERING,
++	BCF_RULE_SPLIT,
++	BCF_RULE_EQ_RESOLVE,
++	BCF_RULE_MODUS_PONENS,
++	BCF_RULE_NOT_NOT_ELIM,
++	BCF_RULE_CONTRA,
++	BCF_RULE_AND_ELIM,
++	BCF_RULE_AND_INTRO,
++	BCF_RULE_NOT_OR_ELIM,
++	BCF_RULE_IMPLIES_ELIM,
++	BCF_RULE_NOT_IMPLIES_ELIM,
++	BCF_RULE_EQUIV_ELIM,
++	BCF_RULE_NOT_EQUIV_ELIM,
++	BCF_RULE_XOR_ELIM,
++	BCF_RULE_NOT_XOR_ELIM,
++	BCF_RULE_ITE_ELIM,
++	BCF_RULE_NOT_ITE_ELIM,
++	BCF_RULE_NOT_AND,
++	BCF_RULE_CNF_AND_POS,
++	BCF_RULE_CNF_AND_NEG,
++	BCF_RULE_CNF_OR_POS,
++	BCF_RULE_CNF_OR_NEG,
++	BCF_RULE_CNF_IMPLIES_POS,
++	BCF_RULE_CNF_IMPLIES_NEG,
++	BCF_RULE_CNF_EQUIV_POS,
++	BCF_RULE_CNF_EQUIV_NEG,
++	BCF_RULE_CNF_XOR_POS,
++	BCF_RULE_CNF_XOR_NEG,
++	BCF_RULE_CNF_ITE_POS,
++	BCF_RULE_CNF_ITE_NEG,
++	BCF_RULE_ITE_EQ,
++
++	__MAX_BCF_BOOLEAN_RULES,
++};
++
++/* Equality Rules */
++enum {
++	BCF_RULE_REFL = 0,
++	BCF_RULE_SYMM,
++	BCF_RULE_TRANS,
++	BCF_RULE_CONG,
++	BCF_RULE_TRUE_INTRO,
++	BCF_RULE_TRUE_ELIM,
++	BCF_RULE_FALSE_INTRO,
++	BCF_RULE_FALSE_ELIM,
++
++	__MAX_BCF_EQUALITY_RULES,
++};
++
++/* BitVector Rules */
++enum {
++	BCF_RULE_BITBLAST = 0,
++
++	__MAX_BCF_BV_RULES,
++};
++
++#endif /* _UAPI__LINUX_BCF_H__ */
+--
+2.34.1
+

@@ -1,0 +1,105 @@
+From fa08094e1a949a4756e9dea3c6170364521d9417 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Wed, 27 Nov 2024 15:57:18 +0100
+Subject: [PATCH 03/13] alf_printer: Accept more channels when printing
+
+Accept more channels when printing.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ src/proof/alf/alf_print_channel.cpp | 12 ++++++++++++
+ src/proof/alf/alf_print_channel.h   |  5 +++--
+ src/proof/alf/alf_printer.cpp       |  2 +-
+ src/proof/alf/alf_printer.h         |  2 +-
+ 4 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 2a92d92ed3..547066d9c7 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -30,6 +30,13 @@ AlfPrintChannel::AlfPrintChannel() {}
+
+ AlfPrintChannel::~AlfPrintChannel() {}
+
++void AlfPrintChannel::printLetList(LetBinding& lbind) {}
++
++std::ostream& AlfPrintChannel::getOStream()
++{
++  return std::cout;
++}
++
+ AlfPrintChannelOut::AlfPrintChannelOut(std::ostream& out,
+                                        const LetBinding* lbind,
+                                        const std::string& tprefix,
+@@ -189,6 +196,11 @@ void AlfPrintChannelOut::printLetList(LetBinding& lbind)
+   }
+ }
+
++std::ostream& AlfPrintChannelOut::getOStream()
++{
++  return d_out;
++}
++
+ void AlfPrintChannelOut::printNodeInternal(std::ostream& out, Node n)
+ {
+   if (d_lbind)
+diff --git a/src/proof/alf/alf_print_channel.h b/src/proof/alf/alf_print_channel.h
+index a52c1984ec..e60cf3bf40 100644
+--- a/src/proof/alf/alf_print_channel.h
++++ b/src/proof/alf/alf_print_channel.h
+@@ -68,7 +68,8 @@ class AlfPrintChannel
+                               const std::vector<size_t>& premises,
+                               const std::vector<Node>& args,
+                               TNode conc) = 0;
+-  virtual void printLetList(LetBinding& lbind) {};
++  virtual void printLetList(LetBinding& lbind);
++  virtual std::ostream& getOStream();
+ };
+
+ /** Prints the proof to output stream d_out */
+@@ -96,6 +97,7 @@ class AlfPrintChannelOut : public AlfPrintChannel
+                       const std::vector<Node>& args,
+                       TNode conc) override;
+   void printLetList(LetBinding& lbind) override;
++  std::ostream& getOStream() override;
+
+   /**
+    * Print node to stream in the expected format of ALF.
+@@ -105,7 +107,6 @@ class AlfPrintChannelOut : public AlfPrintChannel
+    * Print type node to stream in the expected format of ALF.
+    */
+   void printTypeNodeInternal(std::ostream& out, TypeNode tn);
+-  std::ostream& getOStream() { return d_out; }
+
+  private:
+   /**
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index 080b16ae06..9cc8a606f2 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -628,7 +628,7 @@ void AlfPrinter::print(std::ostream& out,
+   print(aprint, pfn, psm);
+ }
+
+-void AlfPrinter::print(AlfPrintChannelOut& aout,
++void AlfPrinter::print(AlfPrintChannel& aout,
+                        std::shared_ptr<ProofNode> pfn,
+                        ProofScopeMode psm)
+ {
+diff --git a/src/proof/alf/alf_printer.h b/src/proof/alf/alf_printer.h
+index bf474596fb..0a7bf83c1b 100644
+--- a/src/proof/alf/alf_printer.h
++++ b/src/proof/alf/alf_printer.h
+@@ -63,7 +63,7 @@ class AlfPrinter : protected EnvObj
+    * @param pfn The proof node.
+    * @param psm The scope mode.
+    */
+-  void print(AlfPrintChannelOut& out,
++  void print(AlfPrintChannel& out,
+              std::shared_ptr<ProofNode> pfn,
+              ProofScopeMode psm = ProofScopeMode::DEFINITIONS_AND_ASSERTIONS);
+   /**
+--
+2.34.1
+

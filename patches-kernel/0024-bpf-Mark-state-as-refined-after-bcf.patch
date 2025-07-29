@@ -1,0 +1,94 @@
+From 3d1bf31f4150686a018e3d3479b933df11522739 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 5 Mar 2025 17:55:34 +0100
+Subject: [PATCH 24/32] bpf: Mark state as refined after bcf
+
+When a state is refined by BCF, mark this information such that the
+backtrack stop at this state.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  4 ++++
+ kernel/bpf/verifier.c        | 18 ++++++++++++++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index b4c8950753df..ba98d75ff287 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -438,6 +438,10 @@ struct bpf_verifier_state {
+ 	 * is not, so it cannot be used for pruning.
+ 	 */
+ 	bool non_prunable;
++	/* This state is already refined by bcf, a marker used in the subsequent
++	 * backtrack_base_state().
++	 */
++	bool refined;
+
+ 	/* first and last insn idx of this verifier state */
+ 	u32 first_insn_idx;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index d66fef8f5d70..b44b62f64ba7 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1497,6 +1497,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
+ 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
+ 	dst_state->may_goto_depth = src->may_goto_depth;
+ 	dst_state->non_prunable = false;
++	dst_state->refined = false;
+ 	for (i = 0; i <= src->curframe; i++) {
+ 		dst = dst_state->frame[i];
+ 		if (!dst) {
+@@ -18921,6 +18922,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 	}
+ 	new->insn_idx = insn_idx;
+ 	new->non_prunable = cur->non_prunable;
++	new->refined = cur->refined;
+
+ 	WARN_ONCE(new->branches != 1,
+ 		  "BUG is_state_visited:branches_to_explore=%d insn %d\n", new->branches, insn_idx);
+@@ -18930,6 +18932,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 	cur->insn_hist_start = cur->insn_hist_end;
+ 	cur->dfs_depth = new->dfs_depth + 1;
+ 	cur->non_prunable = false;
++	cur->refined = false;
+ 	new_sl->next = *explored_state(env, insn_idx);
+ 	*explored_state(env, insn_idx) = new_sl;
+ 	/* connect new state to parentage chain. Current frame needs all
+@@ -22823,12 +22826,18 @@ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ 	/* Collect all parents before the base, and we follow jump history in
+ 	 * those states. After the tracking, they are marked as non-prunable.
+ 	 */
+-	vstate_cnt = 1; /* cur_state */
+-	parent = cur_state->parent;
++	vstate_cnt = 0;
++	parent = cur_state;
+ 	while (parent != base) {
++		if (parent->refined) {
++			base = parent;
++			break;
++		}
+ 		vstate_cnt++;
+ 		parent = parent->parent;
+ 	}
++	if (!vstate_cnt)
++		return -EFAULT;
+ 	bcf->parents = kmalloc_array(vstate_cnt, sizeof(parent), GFP_KERNEL);
+ 	if (!bcf->parents)
+ 		return -ENOMEM;
+@@ -22877,7 +22886,12 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+
+ 	unmark_bcf_requested(env);
+ 	if (attr->bcf_flags & BCF_F_PROOF_PATH_UNREACHABLE) {
++		env->cur_state->refined = false;
+ 		env->bcf.path_unreachable = true;
++	} else {
++		mark_prune_point(env, env->insn_idx);
++		mark_force_checkpoint(env, env->insn_idx);
++		env->cur_state->refined = true;
+ 	}
+
+ 	/* drop the last history entry */
+--
+2.34.1
+

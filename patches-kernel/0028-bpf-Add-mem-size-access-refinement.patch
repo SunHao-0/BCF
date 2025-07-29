@@ -1,0 +1,70 @@
+From 66681520ecd90c13b511674f51f9949320f61f26 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 16:04:42 +0100
+Subject: [PATCH 28/32] bpf: Add mem size access refinement
+
+Add the mem size access refinement routine, i.e., refine the size
+register used in helper mem access.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 7b16fe63a897..4fa4c6fa9cf3 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -8245,6 +8245,7 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
+ 			      bool zero_size_allowed,
+ 			      struct bpf_call_arg_meta *meta)
+ {
++	struct bcf_state *bcf = &env->bcf;
+ 	int err;
+
+ 	/* This is used to refine r0 return value bounds for helpers
+@@ -8282,8 +8283,18 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
+ 			regno);
+ 		return -EACCES;
+ 	}
+-	err = check_helper_mem_access(env, regno - 1, reg->umax_value,
++
++	if (regno == bcf->checked_regno) {
++		err = check_helper_mem_access(env, regno - 1, bcf->real_size,
++					      access_type, true, meta);
++		bcf->checked_regno = 0;
++	} else {
++		bcf->size_regno = regno;
++		err = check_helper_mem_access(env, regno - 1, reg->umax_value,
+ 				      access_type, zero_size_allowed, meta);
++		bcf->size_regno = 0;
++	}
++
+ 	if (!err)
+ 		err = mark_chain_precision(env, regno);
+ 	return err;
+@@ -22815,6 +22826,9 @@ struct states_backup {
+ 	struct bpf_verifier_state_list *free_list;
+ 	const struct bpf_line_info *prev_linfo;
+ 	u32 log_level;
++	u32 size_regno;
++	u32 prev_insn_processed, insn_processed;
++	u32 prev_jmps_processed, jmps_processed;
+ };
+
+ static void swap_env_states(struct states_backup *states,
+@@ -22831,6 +22845,11 @@ static void swap_env_states(struct states_backup *states,
+ 	/* disable log during bcf tracking */
+ 	swap(states->prev_linfo, env->prev_linfo);
+ 	swap(states->log_level, env->log.level);
++	swap(states->size_regno, env->bcf.size_regno);
++	swap(states->prev_insn_processed, env->prev_insn_processed);
++	swap(states->insn_processed, env->insn_processed);
++	swap(states->prev_jmps_processed, env->prev_jmps_processed);
++	swap(states->jmps_processed, env->jmps_processed);
+ }
+
+ /* Track bcf_expr for regno at env->insn_idx, following the parents' path. */
+--
+2.34.1
+

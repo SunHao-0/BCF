@@ -1,0 +1,342 @@
+From 56cf9d062e4b459dc0c76c3a2d6e3717c009887b Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 11:23:07 +0100
+Subject: [PATCH 06/32] bpf: Add bcf expression allocation
+
+Add various routines to allocate bcf_expr. The exprs buffer is currently
+managed as a whole, i.e., new exprs are appended to the end, and if the
+buffer is full, resize it. In the latest version, they are managed via
+refcount, which reduces the memory footprint during proof check.
+
+The index of path conditions are appended to path_conds, and the final
+path constraint is the conjunction of all path_conds.
+
+The bcf_bound_reg() is used to collect the verifier's range information
+of each register and represent them as bcf_expr when BCF tracking starts.
+This preserves the verifier's knowledge in BCF's symbolic expression.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 272 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 272 insertions(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 90ab45979a49..1e8005e88b49 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -4,12 +4,14 @@
+  * Copyright (c) 2018 Covalent IO, Inc. http://covalent.io
+  */
+ #include <uapi/linux/btf.h>
++#include <uapi/linux/bcf.h>
+ #include <linux/bpf-cgroup.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ #include <linux/slab.h>
+ #include <linux/bpf.h>
+ #include <linux/btf.h>
++#include <linux/bcf.h>
+ #include <linux/bpf_verifier.h>
+ #include <linux/filter.h>
+ #include <net/netlink.h>
+@@ -1793,6 +1795,273 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
+ 	return NULL;
+ }
+
++static int bcf_alloc_exprs(struct bpf_verifier_env *env, int cnt)
++{
++	struct bcf_state *bcf = &env->bcf;
++	int next_idx = bcf->expr_cnt;
++	struct bcf_expr *exprs;
++	u32 size, alloc_cnt;
++
++	bcf->expr_cnt += cnt;
++	if (bcf->expr_cnt <= bcf->expr_size)
++		return next_idx;
++
++	alloc_cnt = max_t(u32, env->prog->len, cnt);
++	size = size_mul(bcf->expr_size + alloc_cnt,  sizeof(struct bcf_expr));
++	exprs = kvrealloc(bcf->exprs, size, GFP_KERNEL);
++	if (!exprs) {
++		kvfree(bcf->exprs);
++		bcf->exprs = NULL;
++		return -ENOMEM;
++	}
++	bcf->exprs = exprs;
++	bcf->expr_size += alloc_cnt;
++
++	return next_idx;
++}
++
++static int bcf_add_exprs(struct bpf_verifier_env *env, struct bcf_expr *expr,
++			 int cnt)
++{
++	struct bcf_expr *exprs;
++	int idx;
++
++	idx = bcf_alloc_exprs(env, cnt);
++	exprs = env->bcf.exprs + idx;
++	if (idx >= 0)
++		memcpy(exprs, expr, sizeof(struct bcf_expr) * cnt);
++
++	return idx;
++}
++
++static int bcf_add_expr_unary(struct bpf_verifier_env *env,
++			      struct bcf_expr_unary expr)
++{
++	return bcf_add_exprs(env, (struct bcf_expr *)&expr,
++			     sizeof(expr) / sizeof(struct bcf_expr));
++}
++
++static int bcf_add_expr(struct bpf_verifier_env *env,
++			struct bcf_expr_binary expr)
++{
++	return bcf_add_exprs(env, (struct bcf_expr *)&expr,
++			     sizeof(expr) / sizeof(struct bcf_expr));
++}
++
++static int bcf_add_val(struct bpf_verifier_env *env, u64 imm, bool bit32)
++{
++	if (bit32)
++		return bcf_add_expr_unary(env, BCF_BV_VAL32(imm));
++	else
++		return bcf_add_expr(env, BCF_BV_VAL64(imm));
++}
++
++static int bcf_add_var(struct bpf_verifier_env *env, bool bit32)
++{
++	if (bit32)
++		return bcf_add_exprs(env, &BCF_BV_VAR32, 1);
++	else
++		return bcf_add_exprs(env, &BCF_BV_VAR64, 1);
++}
++
++static int bcf_add_pred(struct bpf_verifier_env *env, u8 op, int arg0, u64 imm,
++			bool bit32)
++{
++	int bits = bit32 ? 32 : 64;
++	int val_expr;
++
++	val_expr = bcf_add_val(env, imm, bit32);
++	if (arg0 < 0 || val_expr < 0)
++		return -ENOMEM;
++
++	return bcf_add_expr(env, BCF_PRED(op, arg0, val_expr, bits));
++}
++
++static int __bcf_add_cond(struct bpf_verifier_env *env, int expr)
++{
++	struct bcf_state *bcf = &env->bcf;
++	u32 cnt = bcf->cond_cnt;
++	size_t size;
++	u32 *conds;
++
++	if (expr < 0)
++		return expr;
++	if (cnt >= U8_MAX)
++		return -E2BIG;
++
++	cnt++;
++	size = kmalloc_size_roundup(cnt * sizeof(u32));
++	conds = krealloc(bcf->path_conds, size, GFP_USER);
++	if (!conds) {
++		kfree(bcf->path_conds);
++		bcf->path_conds = NULL;
++		return -ENOMEM;
++	}
++	bcf->path_conds = conds;
++	conds[bcf->cond_cnt++] = expr;
++	return 0;
++}
++
++static int bcf_zext_32_to_64(struct bpf_verifier_env *env,
++			     struct bpf_reg_state *reg)
++{
++	struct bcf_expr_unary ext = BCF_BV_ZEXT(32, 64, reg->bcf_expr);
++
++	if (reg->bcf_expr >= 0)
++		reg->bcf_expr = bcf_add_expr_unary(env, ext);
++	return reg->bcf_expr;
++}
++
++static int bcf_sext_32_to_64(struct bpf_verifier_env *env,
++			     struct bpf_reg_state *reg)
++{
++	struct bcf_expr_unary ext = BCF_BV_SEXT(32, 64, reg->bcf_expr);
++
++	if (reg->bcf_expr >= 0)
++		reg->bcf_expr = bcf_add_expr_unary(env, ext);
++	return reg->bcf_expr;
++}
++
++static bool is_zext_32_to_64(struct bcf_expr *expr)
++{
++	struct bcf_expr_unary ext = BCF_BV_ZEXT(32, 64, 0);
++
++	return expr->code == ext.code && expr->params == ext.params;
++}
++
++static bool is_sext_32_to_64(struct bcf_expr *expr)
++{
++	struct bcf_expr_unary ext = BCF_BV_SEXT(32, 64, 0);
++
++	return expr->code == ext.code && expr->params == ext.params;
++}
++
++static int bcf_expr32(struct bpf_verifier_env *env, int expr_idx)
++{
++	struct bcf_expr *expr;
++
++	if (expr_idx < 0)
++		return expr_idx;
++
++	expr = env->bcf.exprs + expr_idx;
++	if (is_zext_32_to_64(expr) || is_sext_32_to_64(expr))
++		return expr->args[0];
++
++	if (expr->code == (BCF_BV_ALU | BCF_EXT | BCF_BV_VAL) && !expr->args[1])
++		return bcf_add_val(env, expr->args[0], true);
++
++	return bcf_add_expr_unary(env, BCF_BV_EXTRACT(32, expr_idx));
++}
++
++static bool fit_u32(struct bpf_reg_state *reg)
++{
++	return reg->umin_value == reg->u32_min_value &&
++	       reg->umax_value == reg->u32_max_value;
++}
++
++static bool fit_s32(struct bpf_reg_state *reg)
++{
++	return reg->smin_value == reg->s32_min_value &&
++	       reg->smax_value == reg->s32_max_value;
++}
++
++static int bcf_reg_expr(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
++			bool subreg)
++{
++	if (!bcf_requested(env))
++		return -EFAULT;
++
++	if (reg->bcf_expr >= 0)
++		goto out;
++
++	if (tnum_is_const(reg->var_off)) {
++		reg->bcf_expr = bcf_add_val(env, reg->var_off.value, false);
++	} else if (fit_u32(reg)) {
++		reg->bcf_expr = bcf_add_var(env, true);
++		bcf_zext_32_to_64(env, reg);
++	} else if (fit_s32(reg)) {
++		reg->bcf_expr = bcf_add_var(env, true);
++		bcf_sext_32_to_64(env, reg);
++	} else {
++		reg->bcf_expr = bcf_add_var(env, false);
++	}
++out:
++	if (!subreg)
++		return reg->bcf_expr;
++	return bcf_expr32(env, reg->bcf_expr);
++}
++
++static int __bcf_bound_reg(struct bpf_verifier_env *env, int op, int expr,
++			   u64 imm, bool bit32)
++{
++	int pred = bcf_add_pred(env, op, expr, imm, bit32);
++
++	return __bcf_add_cond(env, pred);
++}
++
++static int bcf_bound_reg32(struct bpf_verifier_env *env,
++			   struct bpf_reg_state *reg)
++{
++	u32 umin = reg->u32_min_value, umax = reg->u32_max_value;
++	s32 smin = reg->s32_min_value, smax = reg->s32_max_value;
++	int expr = bcf_reg_expr(env, reg, true);
++	int ret = 0;
++
++	if (!bcf_requested(env))
++		return 0;
++
++	if (umin != 0)
++		ret = __bcf_bound_reg(env, BPF_JGE, expr, umin, true);
++	if (ret >= 0 && umax != U32_MAX)
++		ret = __bcf_bound_reg(env, BPF_JLE, expr, umax, true);
++
++	if (umin == smin && umax == smax)
++		return ret;
++
++	if (ret >= 0 && smin != S32_MIN)
++		ret = __bcf_bound_reg(env, BPF_JSGE, expr, smin, true);
++	if (ret >= 0 && smax != S32_MAX)
++		ret = __bcf_bound_reg(env, BPF_JSLE, expr, smax, true);
++
++	return ret;
++}
++
++static int bcf_bound_reg(struct bpf_verifier_env *env,
++			 struct bpf_reg_state *reg)
++{
++	u64 umin = reg->umin_value, umax = reg->umax_value;
++	s64 smin = reg->smin_value, smax = reg->smax_value;
++	int expr = bcf_reg_expr(env, reg, false);
++	int ret = 0;
++
++	if (!bcf_requested(env))
++		return 0;
++
++	ret = bcf_bound_reg32(env, reg);
++	if (ret < 0)
++		return ret;
++
++	/* If the reg fits in 32bits, bound_reg32() is enough */
++	if ((fit_u32(reg) && is_zext_32_to_64(env->bcf.exprs + expr)) ||
++	    (fit_s32(reg) && is_sext_32_to_64(env->bcf.exprs + expr)))
++		return ret;
++
++	if (umin != 0)
++		ret = __bcf_bound_reg(env, BPF_JGE, expr, umin, false);
++	if (ret >= 0 && umax != U64_MAX)
++		ret = __bcf_bound_reg(env, BPF_JLE, expr, umax, false);
++
++	if (umin == smin && umax == smax)
++		return ret;
++
++	if (ret >= 0 && smin != S64_MIN)
++		ret = __bcf_bound_reg(env, BPF_JSGE, expr, smin, false);
++	if (ret >= 0 && smax != S64_MAX)
++		ret = __bcf_bound_reg(env, BPF_JSLE, expr, smax, false);
++
++	return ret;
++}
++
+ #define CALLER_SAVED_REGS 6
+ static const int caller_saved[CALLER_SAVED_REGS] = {
+ 	BPF_REG_0, BPF_REG_1, BPF_REG_2, BPF_REG_3, BPF_REG_4, BPF_REG_5
+@@ -2434,6 +2703,7 @@ static int __mark_reg_s32_range(struct bpf_verifier_env *env,
+ 	reg->smax_value = min_t(s64, reg->smax_value, s32_max);
+
+ 	reg_bounds_sync(reg);
++	bcf_bound_reg(env, reg);
+
+ 	return reg_bounds_sanity_check(env, reg, "s32_range");
+ }
+@@ -10396,6 +10666,7 @@ static int do_refine_retval_range(struct bpf_verifier_env *env,
+ 		ret_reg->smin_value = -MAX_ERRNO;
+ 		ret_reg->s32_min_value = -MAX_ERRNO;
+ 		reg_bounds_sync(ret_reg);
++		bcf_bound_reg(env, ret_reg);
+ 		break;
+ 	case BPF_FUNC_get_smp_processor_id:
+ 		ret_reg->umax_value = nr_cpu_ids - 1;
+@@ -10407,6 +10678,7 @@ static int do_refine_retval_range(struct bpf_verifier_env *env,
+ 		ret_reg->smin_value = 0;
+ 		ret_reg->s32_min_value = 0;
+ 		reg_bounds_sync(ret_reg);
++		bcf_bound_reg(env, ret_reg);
+ 		break;
+ 	}
+
+--
+2.34.1
+

@@ -1,0 +1,192 @@
+From 05c9967285db8c141481b752f8a6d97fe27b4fac Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 18:47:25 +0100
+Subject: [PATCH 4/6] bpftool: Check cvc5 prover feature
+
+When building bpftool, check if cvc5 prover is available and add it to the
+feature tests.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ tools/build/Makefile.feature           |   3 +-
+ tools/build/feature/Makefile           |   6 +-
+ tools/build/feature/test-cvc5_prover.c | 129 +++++++++++++++++++++++++
+ 3 files changed, 136 insertions(+), 2 deletions(-)
+ create mode 100644 tools/build/feature/test-cvc5_prover.c
+
+diff --git a/tools/build/Makefile.feature b/tools/build/Makefile.feature
+index 805631543186..ff83446ccd10 100644
+--- a/tools/build/Makefile.feature
++++ b/tools/build/Makefile.feature
+@@ -71,7 +71,8 @@ FEATURE_TESTS_BASIC :=                  \
+         libzstd				\
+         disassembler-four-args		\
+         disassembler-init-styled	\
+-        file-handle
++        file-handle			\
++	cvc5_prover
+
+ # FEATURE_TESTS_BASIC + FEATURE_TESTS_EXTRA is the complete list
+ # of all feature tests
+diff --git a/tools/build/feature/Makefile b/tools/build/feature/Makefile
+index 043dfd00fce7..4fb500edc56c 100644
+--- a/tools/build/feature/Makefile
++++ b/tools/build/feature/Makefile
+@@ -76,7 +76,8 @@ FILES=                                          \
+          test-libzstd.bin			\
+          test-clang-bpf-co-re.bin		\
+          test-file-handle.bin			\
+-         test-libpfm4.bin
++         test-libpfm4.bin			\
++	 test-cvc5_prover.bin
+
+ FILES := $(addprefix $(OUTPUT),$(FILES))
+
+@@ -418,6 +419,9 @@ $(OUTPUT)test-file-handle.bin:
+ $(OUTPUT)test-libpfm4.bin:
+ 	$(BUILD) -lpfm
+
++$(OUTPUT)test-cvc5_prover.bin:
++	$(BUILD) -lcvc5 -I{REPLACE_INC} -L{REPLACE_LIB}
++
+ ###############################
+
+ clean:
+diff --git a/tools/build/feature/test-cvc5_prover.c b/tools/build/feature/test-cvc5_prover.c
+new file mode 100644
+index 000000000000..6ab550d4e503
+--- /dev/null
++++ b/tools/build/feature/test-cvc5_prover.c
+@@ -0,0 +1,129 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <cvc5/c/cvc5.h>
++#include <stdio.h>
++#include <stdint.h>
++
++int main(void)
++{
++	Cvc5TermManager *tm = cvc5_term_manager_new();
++	Cvc5 *slv = cvc5_new(tm);
++
++	cvc5_set_logic(slv, "QF_BV");
++	cvc5_set_option(slv, "produce-proofs", "true");
++	cvc5_set_option(slv, "bv-print-consts-as-indexed-symbols", "true");
++
++	// The following example has been adapted from the book A Hacker's Delight by
++	// Henry S. Warren.
++	//
++	// Given a variable x that can only have two values, a or b. We want to
++	// assign to x a value other than the current one. The straightforward code
++	// to do that is:
++	//
++	//(0) if (x == a ) x = b;
++	//    else x = a;
++	//
++	// Two more efficient yet equivalent methods are:
++	//
++	//(1) x = a ⊕ b ⊕ x;
++	//
++	//(2) x = a + b - x;
++	//
++	// We will use cvc5 to prove that the three pieces of code above are all
++	// equivalent by encoding the problem in the bit-vector theory.
++
++	// Creating a bit-vector type of width 32
++	Cvc5Sort bv32 = cvc5_mk_bv_sort(tm, 32);
++
++	// Variables
++	Cvc5Term x = cvc5_mk_const(tm, bv32, "x");
++	Cvc5Term a = cvc5_mk_const(tm, bv32, "a");
++	Cvc5Term b = cvc5_mk_const(tm, bv32, "b");
++
++	Cvc5Term args2[2];
++
++	// First encode the assumption that x must be equal to a or b
++	args2[0] = x;
++	args2[1] = a;
++	Cvc5Term x_eq_a = cvc5_mk_term(tm, CVC5_KIND_EQUAL, 2, args2);
++	args2[0] = x;
++	args2[1] = b;
++	Cvc5Term x_eq_b = cvc5_mk_term(tm, CVC5_KIND_EQUAL, 2, args2);
++	args2[0] = x_eq_a;
++	args2[1] = x_eq_b;
++	Cvc5Term assumption = cvc5_mk_term(tm, CVC5_KIND_OR, 2, args2);
++
++	// Assert the assumption
++	cvc5_assert_formula(slv, assumption);
++
++	// Introduce a new variable for the new value of x after assignment.
++	// x after executing code (0)
++	Cvc5Term new_x = cvc5_mk_const(tm, bv32, "new_x");
++	// x after executing code (1) or (2)
++	Cvc5Term new_x_ = cvc5_mk_const(tm, bv32, "new_x_");
++
++	// Encoding code (0)
++	// new_x = x == a ? b : a;
++	Cvc5Term args3[3] = { x_eq_a, b, a };
++	Cvc5Term ite = cvc5_mk_term(tm, CVC5_KIND_ITE, 3, args3);
++	args2[0] = new_x;
++	args2[1] = ite;
++	Cvc5Term assignment0 = cvc5_mk_term(tm, CVC5_KIND_EQUAL, 2, args2);
++
++	// Assert the encoding of code (0)
++	printf("Asserting %s to cvc5\n", cvc5_term_to_string(assignment0));
++	cvc5_assert_formula(slv, assignment0);
++
++	// Encoding code (1)
++	// new_x_ = a xor b xor x
++	args3[0] = a;
++	args3[1] = b;
++	args3[2] = x;
++	Cvc5Term a_xor_b_xor_x =
++		cvc5_mk_term(tm, CVC5_KIND_BITVECTOR_XOR, 3, args3);
++	args2[0] = new_x_;
++	args2[1] = a_xor_b_xor_x;
++	Cvc5Term assignment1 = cvc5_mk_term(tm, CVC5_KIND_EQUAL, 2, args2);
++
++	// Assert encoding to cvc5 in current context;
++	printf("Asserting %s to cvc5\n", cvc5_term_to_string(assignment1));
++	cvc5_assert_formula(slv, assignment1);
++	args2[0] = new_x;
++	args2[1] = new_x_;
++	Cvc5Term new_x_eq_new_x_ = cvc5_mk_term(tm, CVC5_KIND_EQUAL, 2, args2);
++
++	Cvc5Term args1[1] = { new_x_eq_new_x_ };
++	Cvc5Term not_new_x_eq_new_x_ =
++		cvc5_mk_term(tm, CVC5_KIND_NOT, 1, args1);
++	printf(" Check sat assuming: %s\n",
++	       cvc5_term_to_string(not_new_x_eq_new_x_));
++	printf(" Expect UNSAT.\n");
++
++	Cvc5Term assumptions[1] = { not_new_x_eq_new_x_ };
++	Cvc5Result result = cvc5_check_sat_assuming(slv, 1, assumptions);
++	printf(" cvc5: %s\n", cvc5_result_to_string(result));
++
++	if (cvc5_result_is_unsat(result)) {
++		size_t expr_size, step_size;
++		const Cvc5Proof *proof;
++		const uint32_t *bcf_proof;
++		size_t proof_size;
++
++		proof = cvc5_get_proof(slv, CVC5_PROOF_COMPONENT_FULL,
++				       &proof_size);
++		if (!proof) {
++			printf("failed to obtain proof\n");
++			goto err_free;
++		}
++
++		bcf_proof =
++			cvc5_proof_to_bcf(slv, *proof, &expr_size, &step_size);
++		(void)bcf_proof;
++		proof_size = (expr_size + step_size) * sizeof(uint32_t);
++		printf("binary format size: %ld\n", proof_size);
++	}
++
++err_free:
++	cvc5_delete(slv);
++	cvc5_term_manager_delete(tm);
++	return 0;
++}
+--
+2.34.1
+

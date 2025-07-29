@@ -1,0 +1,81 @@
+From 4127bbee38d3678113d483e8db3b28c41a899675 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 09:57:33 +0100
+Subject: [PATCH 19/32] bpf: Make bpf_check() resumable from last env
+
+Make bpf_check() resumable from the last env by storing the analysis
+related states from local variables to the global verifier_env.
+
+In bpf_check(), the only left state now is rnd_hi32. Move it to to
+verifier_env->test_rnd_hi32.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  1 +
+ kernel/bpf/verifier.c        | 10 +++++-----
+ 2 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 6203a1e3a06e..14353e8761dd 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -732,6 +732,7 @@ struct bpf_verifier_env {
+ 	bool strict_alignment;		/* perform strict pointer alignment checks */
+ 	bool test_state_freq;		/* test verifier with different pruning frequency */
+ 	bool test_reg_invariants;	/* fail verification on register invariants violations */
++	bool test_rnd_hi32;		/* randomize high 32-bit to test subreg def/use analysis */
+ 	struct bpf_verifier_state *cur_state; /* current verifier state */
+ 	struct bpf_verifier_state_list **explored_states; /* search pruning optimization */
+ 	struct bpf_verifier_state_list *free_list;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index d4db6e184d4d..27aad6e12691 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -20464,8 +20464,7 @@ static int opt_remove_nops(struct bpf_verifier_env *env)
+ 	return 0;
+ }
+
+-static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+-					 const union bpf_attr *attr)
++static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env)
+ {
+ 	struct bpf_insn *patch, zext_patch[2], rnd_hi32_patch[4];
+ 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+@@ -20474,7 +20473,7 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+ 	struct bpf_prog *new_prog;
+ 	bool rnd_hi32;
+
+-	rnd_hi32 = attr->prog_flags & BPF_F_TEST_RND_HI32;
++	rnd_hi32 = env->test_rnd_hi32;
+ 	zext_patch[1] = BPF_ZEXT_REG(0);
+ 	rnd_hi32_patch[1] = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, 0);
+ 	rnd_hi32_patch[2] = BPF_ALU64_IMM(BPF_LSH, BPF_REG_AX, 32);
+@@ -23625,6 +23624,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	if (is_priv)
+ 		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
+ 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
++	env->test_rnd_hi32 = attr->prog_flags & BPF_F_TEST_RND_HI32;
+
+ 	env->explored_states = kvcalloc(state_htab_size(env),
+ 				       sizeof(struct bpf_verifier_state_list *),
+@@ -23716,7 +23716,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	 * insns could be handled correctly.
+ 	 */
+ 	if (ret == 0 && !bpf_prog_is_offloaded(env->prog->aux)) {
+-		ret = opt_subreg_zext_lo32_rnd_hi32(env, attr);
++		ret = opt_subreg_zext_lo32_rnd_hi32(env);
+ 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
+ 								     : false;
+ 	}
+@@ -23724,7 +23724,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	if (ret == 0)
+ 		ret = fixup_call_args(env);
+
+-	env->verification_time = ktime_get_ns() - start_time;
++	env->verification_time += ktime_get_ns() - start_time;
+ 	print_verification_stats(env);
+ 	env->prog->aux->verified_insns = env->insn_processed;
+
+--
+2.34.1
+

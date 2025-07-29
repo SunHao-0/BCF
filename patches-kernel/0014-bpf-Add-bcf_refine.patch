@@ -1,0 +1,458 @@
+From 0a154dda07e50e67d4c5be229bff2c2de8312f03 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 18:49:17 +0100
+Subject: [PATCH 14/32] bpf: Add bcf_refine()
+
+Add the bcf_refine() routine, the core of BCF refinement. It is a general
+routine that can be called whenever refinement is needed.
+
+This process is as follows:
+
+(1) Program state collection:
+When the verifier cannot continue, a more precise state needs to be collected.
+The target registers that need refinement are specified by reg_masks, and the
+bcf_refine() routine will collect the symbolic states of those regs as well as
+the associated path conditions of the current analysis path. The reg state and
+the path condition collectively represent the exact information of the current
+program path.
+
+The symbolic tracking only follows a suffix where the target regs and their
+transitive dependencies are defined, see backtrack_base_state(). The state
+and conditions are stored in the bcf_state.
+
+(2) Refinement:
+When the symbolic tracking is done, the provided refinement callback is invoked
+to refine the current verifier state and emit the refinement condition.
+
+In different context, the verifier state needs to be refined differently. For
+example, if the verifier cannot continue due to oob access, the refinement is
+conducted on the relevant reg offset, and refinement condition asserts the
+offset (represented by the symbolic expression) is within the refined range;
+if the verifier cannot continue due to uninit reg, the refinement is to prove
+the current path is unreachable using the path conditions collected.
+
+Hence, a callback is required by the general bcf_refine() routine. The caller
+decides how the refinement is conducted and what the refinement condition is.
+
+(3) Pause and resume:
+Finally, when the verifier state is refined and the condition is emitted, the
+verifier will pause and preserve the everything by storing the verifier_env
+behind a anonymous file, which is referred by bcf_fd.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |   6 +
+ kernel/bpf/verifier.c        | 345 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 351 insertions(+)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index c6a0dc010753..a0116c725bd8 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -432,6 +432,12 @@ struct bpf_verifier_state {
+ 	bool used_as_loop_entry;
+ 	bool in_sleepable;
+
++	/* This state is non-prunable because itself or some of its children
++	 * states are not safe, those unsafe states are refined but this state
++	 * is not, so it cannot be used for pruning.
++	 */
++	bool non_prunable;
++
+ 	/* first and last insn idx of this verifier state */
+ 	u32 first_insn_idx;
+ 	u32 last_insn_idx;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 22046ccd5ba5..55fb06f6adb3 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1494,6 +1494,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
+ 	dst_state->callback_unroll_depth = src->callback_unroll_depth;
+ 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
+ 	dst_state->may_goto_depth = src->may_goto_depth;
++	dst_state->non_prunable = false;
+ 	for (i = 0; i <= src->curframe; i++) {
+ 		dst = dst_state->frame[i];
+ 		if (!dst) {
+@@ -1795,6 +1796,10 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
+ 	return NULL;
+ }
+
++typedef int (*do_refine_state_fn)(struct bpf_verifier_env *env, void *ctx);
++static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
++		      do_refine_state_fn refine_cb, void *ctx);
++
+ static int bcf_alloc_exprs(struct bpf_verifier_env *env, int cnt)
+ {
+ 	struct bcf_state *bcf = &env->bcf;
+@@ -7355,6 +7360,15 @@ static int check_stack_access_within_bounds(
+ 			verbose(env, "invalid variable-offset%s stack R%d var_off=%s off=%d size=%d\n",
+ 				err_extra, regno, tn_buf, off, access_size);
+ 		}
++
++		if (err != -EFAULT) {
++			int bcf_err;
++
++			bcf_err = bcf_refine(env, 0, NULL, NULL);
++			if (!bcf_err)
++				verbose(env, "bcf requested, try to refine R%d off\n", regno);
++		}
++
+ 		return err;
+ 	}
+
+@@ -18902,6 +18916,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 		return err;
+ 	}
+ 	new->insn_idx = insn_idx;
++	new->non_prunable = cur->non_prunable;
++
+ 	WARN_ONCE(new->branches != 1,
+ 		  "BUG is_state_visited:branches_to_explore=%d insn %d\n", new->branches, insn_idx);
+
+@@ -18909,6 +18925,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 	cur->first_insn_idx = insn_idx;
+ 	cur->insn_hist_start = cur->insn_hist_end;
+ 	cur->dfs_depth = new->dfs_depth + 1;
++	cur->non_prunable = false;
+ 	new_sl->next = *explored_state(env, insn_idx);
+ 	*explored_state(env, insn_idx) = new_sl;
+ 	/* connect new state to parentage chain. Current frame needs all
+@@ -22509,6 +22526,334 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	return ret;
+ }
+
++static int init_bcf_state(struct bpf_verifier_env *env,
++			  struct bpf_verifier_state *base)
++{
++	struct bcf_state *bcf = &env->bcf;
++	struct bpf_verifier_state *vstate;
++	struct bpf_reg_state *regs;
++	int err, i;
++
++	bcf->expr_cnt = 0;
++	bcf->path_conds = NULL;
++	bcf->path_cond = -1;
++	bcf->refine_cond = -1;
++	if (!base)
++		return 0;
++
++	vstate = kzalloc(sizeof(struct bpf_verifier_state), GFP_KERNEL);
++	if (!vstate)
++		return -ENOMEM;
++
++	err = copy_verifier_state(vstate, base);
++	if (err)
++		goto err_free;
++	vstate->parent = vstate->loop_entry = NULL;
++	env->insn_idx = vstate->first_insn_idx = base->insn_idx;
++	env->prev_insn_idx = base->last_insn_idx;
++	env->cur_state = vstate;
++
++	/* record the verifier's knowledge as bcf path conditions */
++	regs = cur_regs(env);
++	for (i = 0; i < MAX_BPF_REG; i++) {
++		if (regs[i].type != SCALAR_VALUE ||
++		    tnum_is_const(regs[i].var_off))
++			continue;
++
++		err = bcf_bound_reg(env, regs + i);
++		if (err < 0)
++			goto err_free;
++	}
++	return 0;
++err_free:
++	free_verifier_state(vstate, true);
++	env->cur_state = NULL;
++	return err;
++}
++
++struct states_backup {
++	u32 insn_idx;
++	u32 prev_insn_idx;
++	struct bpf_verifier_stack_elem *head;
++	int stack_size;
++	u32 id_gen;
++	struct bpf_verifier_state *cur_state;
++	struct bpf_verifier_state_list **explored_states;
++	struct bpf_verifier_state_list *free_list;
++	const struct bpf_line_info *prev_linfo;
++	u32 log_level;
++};
++
++static void swap_env_states(struct states_backup *states,
++			    struct bpf_verifier_env *env)
++{
++	swap(states->insn_idx, env->insn_idx);
++	swap(states->prev_insn_idx, env->prev_insn_idx);
++	swap(states->head, env->head);
++	swap(states->stack_size, env->stack_size);
++	swap(states->id_gen, env->id_gen);
++	swap(states->cur_state, env->cur_state);
++	swap(states->explored_states, env->explored_states);
++	swap(states->free_list, env->free_list);
++	/* disable log during bcf tracking */
++	swap(states->prev_linfo, env->prev_linfo);
++	swap(states->log_level, env->log.level);
++}
++
++/* Track bcf_expr for regno at env->insn_idx, following the parents' path. */
++static int bcf_track(struct bpf_verifier_env *env,
++		     struct bpf_verifier_state *base)
++{
++	struct bpf_verifier_state *vstate = env->cur_state;
++	struct bpf_reg_state *regs = cur_regs(env), *bcf_regs;
++	struct states_backup cur_states = { 0 };
++	int err, i;
++
++	/* backup verifier related states of current check */
++	cur_states.id_gen = env->id_gen;
++	swap_env_states(&cur_states, env);
++
++	err = init_bcf_state(env, base);
++	if (err)
++		goto out;
++
++	if (base) {
++		err = do_check(env);
++	} else {
++		u32 subprog = vstate->frame[0]->subprogno;
++
++		env->insn_idx = env->subprog_info[subprog].start;
++		err = do_check_common(env, subprog);
++	}
++	if (!err && !same_callsites(env->cur_state, vstate))
++		err = -EFAULT;
++	if (err)
++		goto out;
++
++	bcf_regs = cur_regs(env);
++	for (i = 0; i < MAX_BPF_REG; i++)
++		regs[i].bcf_expr = bcf_regs[i].bcf_expr;
++out:
++	free_states(env);
++	swap_env_states(&cur_states, env);
++	return err;
++}
++
++static int build_conj(struct bpf_verifier_env *env, u32 *path_conds,
++		      u32 cond_cnt, int refine_cond)
++{
++	struct bcf_state *bcf = &env->bcf;
++	struct bcf_expr *conj;
++	int idx, i, cnt;
++
++	cnt = cond_cnt;
++	if (refine_cond >= 0)
++		cnt++;
++	if (cnt == 1)
++		return *path_conds;
++
++	idx = bcf_alloc_exprs(env, cnt + 1);
++	if (idx < 0)
++		return idx;
++	conj = bcf->exprs + idx;
++	conj->code = BCF_BOOL_PRED | BCF_CONJ;
++	conj->vlen = cnt;
++	conj->params = 0;
++	for (i = 0; i < cond_cnt; i++)
++		conj->args[i] = path_conds[i];
++	if (refine_cond >= 0)
++		conj->args[conj->vlen - 1] = refine_cond;
++
++	return idx;
++}
++
++static int build_formula(struct bpf_verifier_env *env)
++{
++	struct bcf_state *bcf = &env->bcf;
++
++	/* No path and refine conds generated */
++	if (!bcf->cond_cnt && bcf->refine_cond < 0)
++		return -EFAULT;
++	if (bcf->cond_cnt >= U8_MAX)
++		return -E2BIG;
++
++	if (!bcf->cond_cnt)
++		return 0;
++
++	bcf->path_cond = build_conj(env, bcf->path_conds, bcf->cond_cnt, -1);
++	if (bcf->path_cond < 0)
++		return bcf->path_cond;
++
++	if (bcf->refine_cond < 0)
++		return 0;
++
++	bcf->refine_cond = build_conj(env, bcf->path_conds, bcf->cond_cnt,
++				      bcf->refine_cond);
++	if (bcf->refine_cond < 0)
++		return bcf->refine_cond;
++	return 0;
++}
++
++/* Pinpoint the base vstate to start bcf tracking, which is the parent state
++ * with all regs (regmasks) defined, or the state at a force checkpoint. In
++ * the latter case, this because the verifier is trying hard to compute a fix
++ * point and refining a state make the states between the base and cur_state
++ * non-prunable, which may slow down the loop convergence. So we use the state
++ * at the this checkpoint as a base and stop backtracking in this case.
++ */
++static struct bpf_verifier_state *
++backtrack_base_state(struct bpf_verifier_env *env, u32 reg_masks)
++{
++	struct backtrack_state *bt = &env->bt;
++	struct bpf_verifier_state *st = env->cur_state;
++	struct bpf_verifier_state *base = NULL;
++	int first_idx = st->first_insn_idx;
++	int last_idx = env->insn_idx;
++	int subseq_idx = -1;
++	bool skip_first = true;
++	int i, err;
++	int log_level = 0;
++
++	bt_init(bt, env->cur_state->curframe);
++	bt->reg_masks[bt->frame] = reg_masks;
++	swap(env->log.level, log_level);
++
++	for (;;) {
++		u32 hist_start = st->insn_hist_start;
++		u32 hist_end = st->insn_hist_end;
++		struct bpf_insn_hist_entry *hist;
++
++		if (last_idx < 0 || !st->parent)
++			break;
++
++		for (i = last_idx;;) {
++			if (skip_first) {
++				err = 0;
++				skip_first = false;
++			} else {
++				hist = get_insn_hist_entry(env, hist_start,
++							   hist_end, i);
++				err = backtrack_insn(env, i, subseq_idx, hist,
++						     bt);
++			}
++			if (err)
++				goto err_out;
++			if (bt_empty(bt)) {
++				swap(env->log.level, log_level);
++				return st->parent;
++			}
++			subseq_idx = i;
++			i = get_prev_insn_idx(env, st, i, hist_start,
++					      &hist_end);
++			if (i == -ENOENT)
++				break;
++			if (i >= env->prog->len)
++				goto err_out;
++		}
++
++		st = st->parent;
++		subseq_idx = first_idx;
++		last_idx = st->last_insn_idx;
++		first_idx = st->first_insn_idx;
++	}
++
++err_out:
++	bt_reset(bt);
++	swap(env->log.level, log_level);
++	return base;
++}
++
++/* The core of BCF refinement:
++ *	(1) find the base state to start bcf track (backtrack_base_state());
++ *	(2) collect bcf expression (bcf_track()) following the same checked
++ *	    path by matching the jump history (bcf_match_path());
++ *	(3) invoke the callback (refine_cb) that emits the refine condition,
++ *	    based on the collected bcf expressions of registers;
++ *	(4) build the path condition, and wait for a proof that shows:
++ *		4.1 the path is unreachable; or
++ *		4.2 the path is reachable, but the refine condition is unsat.
++ *
++ *	@env.cur_state: the current state to refine
++ *	@reg_masks: regs that we care, 0 for all inited regs
++ *	@refine_cb: the callback to emit the refine condition
++ *	@ctx: the context for the callback
++ *
++ *	Return: 0 if both the refine and path cond are ready, or error code
++ */
++static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
++		      do_refine_state_fn refine_cb, void *ctx)
++{
++	struct bpf_verifier_state *cur_state = env->cur_state;
++	struct bpf_verifier_state *base, *parent;
++	struct bcf_state *bcf = &env->bcf;
++	struct bpf_reg_state *regs;
++	u32 vstate_cnt;
++	int err, i;
++
++	if (!bcf->available || cur_state->speculative)
++		return -EINVAL;
++	/* Another error happened during bcf tracking, cannot continue */
++	if (bcf_requested(env))
++		return -EFAULT;
++
++	/* If the mask is zero, we are proving that the path is unreachable,
++	 * so backtrack should base on all the defined regs
++	 */
++	if (!reg_masks) {
++		regs = cur_regs(env);
++		for (i = 0; i < BPF_REG_FP; i++) {
++			if (regs[i].type != NOT_INIT)
++				reg_masks |= 1 << i;
++		}
++	}
++	base = backtrack_base_state(env, reg_masks);
++
++	/* Collect all parents before the base, and we follow jump history in
++	 * those states. After the tracking, they are marked as non-prunable.
++	 */
++	vstate_cnt = 1; /* cur_state */
++	parent = cur_state->parent;
++	while (parent != base) {
++		vstate_cnt++;
++		parent = parent->parent;
++	}
++	bcf->parents = kmalloc_array(vstate_cnt, sizeof(parent), GFP_KERNEL);
++	if (!bcf->parents)
++		return -ENOMEM;
++	bcf->vstate_cnt = vstate_cnt;
++	parent = cur_state;
++	while (vstate_cnt) {
++		bcf->parents[--vstate_cnt] = parent;
++		parent = parent->parent;
++	}
++	bcf->cur_vstate = 0;
++	bcf->cur_jmp_entry = bcf->parents[0]->insn_hist_start;
++
++	mark_bcf_requested(env);
++	err = bcf_track(env, base);
++	if (err == 0 && refine_cb)
++		err = refine_cb(env, ctx);	/* refine_cond */
++	err = err ?: build_formula(env);	/* path_cond */
++	if (err)
++		goto out;
++
++	for (i = 0; i < bcf->vstate_cnt - 1; i++)
++		bcf->parents[i]->non_prunable = true;
++
++out:
++	kfree(bcf->parents);
++	if (bcf->cond_cnt) {
++		bcf->cond_cnt = 0;
++		kfree(bcf->path_conds);
++	}
++	if (err)
++		unmark_bcf_requested(env);
++	regs = cur_regs(env);
++	for (i = 0; i < MAX_BPF_REG; i++)
++		regs[i].bcf_expr = -1;
++	return err;
++}
++
+ /* Lazily verify all global functions based on their BTF, if they are called
+  * from main BPF program or any of subprograms transitively.
+  * BPF global subprogs called from dead code are not validated.
+--
+2.34.1
+

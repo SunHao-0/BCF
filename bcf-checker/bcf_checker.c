@@ -1,0 +1,2334 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Author: Hao Sun <hao.sun@inf.ethz.ch> */
+#include <uapi/linux/bcf.h>
+#include <uapi/linux/bpf.h>
+#include <linux/bcf.h>
+#include <linux/bpf.h>
+#include <linux/bpf_verifier.h>
+#include <linux/kernel.h>
+#include <linux/bitmap.h>
+#include <linux/stringify.h>
+#include <linux/errno.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/printk.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/overflow.h>
+#include <linux/bpfptr.h>
+#include <linux/refcount.h>
+
+#define EXPR_BUF_LEN 255
+#define CMP_STACK_SIZE 128
+
+struct expr_cmp_state {
+	struct bcf_expr *e0;
+	struct bcf_expr *e1;
+	u32 cur_arg;
+};
+
+struct bcf_checker_env {
+	struct bpf_verifier_env *verifier_env;
+	struct bcf_expr *exprs; /* bcf expression buffer */
+	u32 expr_cnt;
+	u32 expr_size;
+	unsigned long *expr_idx_bitmap; /* valid expr index */
+	u32 bitmap_size;
+	u32 step_cnt; /* total step count */
+	struct bcf_proof_step *steps;
+	int goal; /* goal to prove, idx to exprs */
+	u32 cur_step; /* current checking step */
+	u32 *step_facts; /* conclusion of each step, idx to exprs */
+
+	struct {
+		u16 code;
+		u8 vlen;
+		u8 params;
+		u32 args[EXPR_BUF_LEN];
+	} expr_buf; /* tmp buffer for building expr */
+
+	struct expr_cmp_state cmp_stack[CMP_STACK_SIZE]; /* for expr equiv cmp */
+};
+
+static bool valid_idx(struct bcf_checker_env *env, u32 idx)
+{
+	return idx < env->bitmap_size && test_bit(idx, env->expr_idx_bitmap);
+}
+
+static bool is_ite(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_ITE);
+}
+
+static bool bv_expr(struct bcf_expr *expr)
+{
+	u8 class = BPF_CLASS(expr->code);
+
+	if (is_ite(expr->code))
+		return expr->params != 0;
+
+	return class == BCF_BV_ALU;
+}
+
+static bool is_pred_class(u8 code)
+{
+	return BPF_CLASS(code) == BCF_BV_PRED ||
+	       BPF_CLASS(code) == BCF_BOOL_PRED;
+}
+
+static bool pred_expr(struct bcf_expr *expr)
+{
+	if (is_ite(expr->code))
+		return expr->params == 0;
+
+	return is_pred_class(expr->code);
+}
+
+static bool is_pred_false(struct bcf_expr *expr)
+{
+	return expr->code == (BCF_BOOL_PRED | BCF_BOOL_VAL) &&
+	       BCF_PRED_VAL(expr->params) == BCF_BOOL_FALSE;
+}
+
+static bool is_pred_true(struct bcf_expr *expr)
+{
+	return expr->code == (BCF_BOOL_PRED | BCF_BOOL_VAL) &&
+	       BCF_PRED_VAL(expr->params) == BCF_BOOL_TRUE;
+}
+
+static bool is_disj(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_DISJ);
+}
+
+static bool is_conj(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_CONJ);
+}
+
+static bool is_equiv(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_EQUIV) ||
+	       code == (BCF_BV_PRED | BPF_JEQ);
+}
+
+static bool is_xor(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_XOR);
+}
+
+static bool is_implies(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_IMPLIES);
+}
+
+static bool is_pred_not(u8 code)
+{
+	return code == (BCF_BOOL_PRED | BCF_NOT);
+}
+
+static bool is_bv_var(u8 code)
+{
+	return code == (BCF_BV_ALU | BCF_EXT | BCF_BV_VAR);
+}
+
+static bool is_bv_val(u8 code)
+{
+	return code == (BCF_BV_ALU | BCF_EXT | BCF_BV_VAL);
+}
+
+static bool is_bitof(u8 code)
+{
+	return code == (BCF_BV_PRED | BCF_BITOF);
+}
+
+static bool bcf_code_intable(u8 code)
+{
+#define BV_ALU(OP) (BCF_BV_ALU | BPF_##OP)
+#define BV_EXT(OP) (BCF_BV_ALU | BCF_EXT | BCF_##OP)
+#define BV_PRED(OP) (BCF_BV_PRED | BPF_##OP)
+#define BOOL_PRED(OP) (BCF_BOOL_PRED | BCF_##OP)
+#define BCF_OPCODE(MAPPER)                                                    \
+	MAPPER(BV_ALU(ADD)), MAPPER(BV_ALU(SUB)), MAPPER(BV_ALU(MUL)),        \
+		MAPPER(BV_ALU(OR)), MAPPER(BV_ALU(AND)), MAPPER(BV_ALU(LSH)), \
+		MAPPER(BV_ALU(RSH)), MAPPER(BV_ALU(XOR)),                     \
+		MAPPER(BV_ALU(ARSH)), MAPPER(BV_ALU(NEG)),                    \
+		MAPPER(BV_ALU(MOD)), MAPPER(BV_ALU(DIV)),                     \
+		MAPPER(BV_EXT(BV_VAR)), MAPPER(BV_EXT(BV_VAL)),               \
+		MAPPER(BV_EXT(BBT)), MAPPER(BV_EXT(EXTRACT)),                 \
+		MAPPER(BV_EXT(SIGN_EXTEND)), MAPPER(BV_EXT(ZERO_EXTEND)),     \
+		MAPPER(BV_EXT(CONCAT)), MAPPER(BV_EXT(BVSIZE)),               \
+		MAPPER(BV_PRED(JEQ)), MAPPER(BV_PRED(JGT)),                   \
+		MAPPER(BV_PRED(JGE)), MAPPER(BV_PRED(JNE)),                   \
+		MAPPER(BV_PRED(JLT)), MAPPER(BV_PRED(JLE)),                   \
+		MAPPER(BV_PRED(JSGT)), MAPPER(BV_PRED(JSGE)),                 \
+		MAPPER(BV_PRED(JSLT)), MAPPER(BV_PRED(JSLE)),                 \
+		MAPPER((BCF_BV_PRED | BCF_BITOF)),                            \
+		MAPPER(BOOL_PRED(BOOL_VAL)), MAPPER(BOOL_PRED(BOOL_VAR)),     \
+		MAPPER(BOOL_PRED(CONJ)), MAPPER(BOOL_PRED(DISJ)),             \
+		MAPPER(BOOL_PRED(IMPLIES)), MAPPER(BOOL_PRED(XOR)),           \
+		MAPPER(BOOL_PRED(ITE)), MAPPER(BOOL_PRED(NOT)),               \
+		MAPPER(BOOL_PRED(EQUIV)), MAPPER((BCF_BUILTIN | BCF_ARG_LIST))
+
+#define CODE_TBL(OPCODE) [OPCODE] = true
+	static const bool code_table[256] = {
+		[0 ... 255] = false,
+		BCF_OPCODE(CODE_TBL),
+	};
+#undef BV_ALU
+#undef BV_EXT
+#undef BV_PRED
+#undef BOOL_PRED
+#undef BCF_OPCODE
+#undef CODE_TBL
+	return code_table[code];
+}
+
+static u8 bv_size(struct bcf_expr *expr)
+{
+	u8 op = BPF_OP(expr->code);
+
+	if (op == BCF_EXTRACT) {
+		u8 start = BCF_EXTRACT_START(expr->params);
+		u8 last = BCF_EXTRACT_LAST(expr->params);
+
+		return start - last + 1;
+	}
+
+	return BCF_BV_BITSZ(expr->params);
+}
+
+static int check_bv_arg(struct bcf_checker_env *env, u32 arg, u8 bv_sz)
+{
+	struct bcf_expr *expr;
+
+	if (!valid_idx(env, arg))
+		return -EINVAL;
+
+	expr = env->exprs + arg;
+	if (!bv_expr(expr) || bv_size(expr) != bv_sz)
+		return -EINVAL;
+	return 0;
+}
+
+static int check_bv(struct bcf_checker_env *env, struct bcf_expr *bv)
+{
+	u8 op = BPF_OP(bv->code), bv_sz = BCF_BV_BITSZ(bv->params);
+	int i, err;
+
+	pr_debug("%s: %x %d %x\n", __func__, bv->code, bv->vlen, bv->params);
+
+	switch (op) {
+	case BPF_NEG:
+		if (bv->vlen != 1)
+			return -EINVAL;
+		break;
+	case BPF_LSH:
+	case BPF_RSH:
+	case BPF_ARSH:
+	case BPF_DIV:
+	case BPF_MOD:
+		if (bv->vlen != 2)
+			return -EINVAL;
+		break;
+	case BPF_ADD:
+	case BPF_SUB:
+	case BPF_MUL:
+	case BPF_OR:
+	case BPF_AND:
+	case BPF_XOR:
+		if (bv->vlen < 2)
+			return -EINVAL;
+		break;
+	default:
+		pr_debug("unsupported bv op: %x\n", op);
+		/* BPF_SDIV BPF_SMOD BPF_MOV BPF_SMOV BPF_END */
+		return -ENOTSUPP;
+	}
+
+	if (bv->params & 0xFF00 || !bv_sz)
+		return -EINVAL;
+
+	for (i = 0; i < bv->vlen; i++) {
+		err = check_bv_arg(env, bv->args[i], bv_sz);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int check_bv_ext(struct bcf_checker_env *env, struct bcf_expr *bv_ext)
+{
+	u8 op = BPF_OP(bv_ext->code), bv_sz = bv_size(bv_ext);
+	struct bcf_expr *arg_expr;
+	u8 start, last, ext_sz, u32_bits;
+	u32 arg_bv_sz;
+	int vlen, i;
+
+	pr_debug("%s: %x %d %x\n", __func__, bv_ext->code, bv_ext->vlen,
+		 bv_ext->params);
+	if (op != BCF_EXTRACT && !bv_sz)
+		return -EINVAL;
+
+	switch (op) {
+	case BCF_EXTRACT:
+		start = BCF_EXTRACT_START(bv_ext->params);
+		last = BCF_EXTRACT_LAST(bv_ext->params);
+		if (start < last || bv_ext->vlen != 1)
+			return -EINVAL;
+
+		if (!valid_idx(env, bv_ext->args[0]))
+			return -EINVAL;
+
+		arg_expr = env->exprs + bv_ext->args[0];
+		if (!bv_expr(arg_expr) || bv_size(arg_expr) <= start)
+			return -EINVAL;
+
+		return 0;
+	case BCF_SIGN_EXTEND:
+	case BCF_ZERO_EXTEND:
+		if (bv_ext->vlen != 1)
+			return -EINVAL;
+
+		ext_sz = BCF_BV_EXTSZ(bv_ext->params);
+		if (!ext_sz || ext_sz >= bv_sz)
+			return -EINVAL;
+
+		return check_bv_arg(env, bv_ext->args[0], bv_sz - ext_sz);
+	case BCF_BV_VAL:
+		u32_bits = BITS_PER_BYTE * sizeof(u32);
+		vlen = ALIGN(bv_sz, u32_bits) / u32_bits;
+		/* TODO check unused bits are zeroed */
+		if (bv_ext->vlen != vlen)
+			return -EINVAL;
+		break;
+	case BCF_BV_VAR:
+		if (bv_ext->vlen)
+			return -EINVAL;
+		break;
+	case BCF_CONCAT:
+		if (bv_ext->vlen <= 1)
+			return -EINVAL;
+
+		arg_bv_sz = 0;
+		for (i = 0; i < bv_ext->vlen; i++) {
+			arg_expr = env->exprs + bv_ext->args[i];
+			if (!bv_expr(arg_expr))
+				return -EINVAL;
+			arg_bv_sz += bv_size(arg_expr);
+		}
+
+		if (arg_bv_sz != bv_sz)
+			return -EINVAL;
+		break;
+	case BCF_BBT:
+		if (!bv_ext->vlen || bv_ext->vlen != bv_sz)
+			return -EINVAL;
+		for (i = 0; i < bv_ext->vlen; i++) {
+			arg_expr = env->exprs + bv_ext->args[i];
+			if (!pred_expr(arg_expr))
+				return -EINVAL;
+		}
+		break;
+	case BCF_BVSIZE:
+		/* TODO BVSIZE is actually of the int type */
+		if (bv_ext->vlen != 1 || bv_sz != 64)
+			return -EINVAL;
+		arg_expr = env->exprs + bv_ext->args[0];
+		if (!bv_expr(arg_expr))
+			return -EINVAL;
+		break;
+	default:
+		return -ENOTSUPP;
+	}
+
+	if (bv_ext->params & 0xFF00)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int check_bv_pred(struct bcf_checker_env *env, struct bcf_expr *bv_pred)
+{
+	u8 bv_sz = BCF_BV_BITSZ(bv_pred->params);
+	int err;
+
+	pr_debug("%s: %x %d %x\n", __func__, bv_pred->code, bv_pred->vlen,
+		 bv_pred->params);
+	if (is_bitof(bv_pred->code)) {
+		u8 bit = bv_pred->params >> 8;
+
+		if (bv_pred->vlen != 1 || !bv_sz || bit >= bv_sz)
+			return -EINVAL;
+		return check_bv_arg(env, bv_pred->args[0], bv_sz);
+	}
+
+	if (bv_pred->vlen != 2 || bv_pred->params & 0xFF00)
+		return -EINVAL;
+
+	err = check_bv_arg(env, bv_pred->args[0], bv_sz);
+	err = err ?: check_bv_arg(env, bv_pred->args[1], bv_sz);
+	return err;
+}
+
+static int check_pred_arg(struct bcf_checker_env *env, u32 arg)
+{
+	struct bcf_expr *expr;
+
+	if (!valid_idx(env, arg))
+		return -EINVAL;
+
+	expr = env->exprs + arg;
+	if (!pred_expr(expr))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int check_bool_pred(struct bcf_checker_env *env,
+			   struct bcf_expr *pred_ext)
+{
+	u8 op = BPF_OP(pred_ext->code);
+	u8 vlen = pred_ext->vlen;
+	u16 params = pred_ext->params;
+	u32 *args = pred_ext->args;
+	int i, err;
+
+	pr_debug("%s: %x %d %x\n", __func__, pred_ext->code, pred_ext->vlen,
+		 pred_ext->params);
+	switch (op) {
+	case BCF_NOT:
+		if (vlen != 1)
+			return -EINVAL;
+		break;
+	case BCF_IMPLIES:
+	case BCF_EQUIV:
+		/* TODO equiv is overloaded, needs type check */
+		if (vlen != 2)
+			return -EINVAL;
+		return 0;
+	case BCF_ITE: {
+		if (vlen != 3)
+			return -EINVAL;
+
+		err = check_pred_arg(env, args[0]);
+		if (err)
+			return err;
+
+		if (!pred_ext->params) {
+			err = check_pred_arg(env, args[1]);
+			err = err ?: check_pred_arg(env, args[2]);
+			return err;
+		}
+
+		err = check_bv_arg(env, args[1], params);
+		err = err ?: check_bv_arg(env, args[2], params);
+		return err;
+	}
+	case BCF_CONJ:
+	case BCF_DISJ:
+	case BCF_XOR:
+		if (vlen < 2)
+			return -EINVAL;
+		break;
+	case BCF_BOOL_VAL:
+		if (vlen)
+			return -EINVAL;
+		if (params != BCF_BOOL_TRUE && params != BCF_BOOL_FALSE)
+			return -EINVAL;
+		break;
+	case BCF_BOOL_VAR:
+		if (vlen)
+			return -EINVAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (pred_ext->params && op != BCF_BOOL_VAL)
+		return -EINVAL;
+
+	for (i = 0; i < pred_ext->vlen; i++) {
+		err = check_pred_arg(env, args[i]);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int check_builtin_expr(struct bcf_checker_env *env,
+			      struct bcf_expr *expr)
+{
+	u8 op = BPF_OP(expr->code);
+	int i, err;
+
+	if (op != BCF_ARG_LIST)
+		return -EINVAL;
+
+	if (expr->params || !expr->vlen)
+		return -EINVAL;
+
+	for (i = 0; i < expr->vlen; i++) {
+		err = check_pred_arg(env, expr->args[i]);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int check_exprs(struct bcf_checker_env *env, struct bcf_expr *exprs,
+		       u32 expr_cnt)
+{
+	u32 idx = 0;
+	int err = 0;
+
+	env->bitmap_size = expr_cnt;
+	env->expr_idx_bitmap = kvmalloc(bitmap_size(expr_cnt), GFP_KERNEL);
+	if (!env->expr_idx_bitmap)
+		return -ENOMEM;
+	bitmap_zero(env->expr_idx_bitmap, expr_cnt);
+
+	BUILD_BUG_ON(sizeof(*exprs) != sizeof(*exprs->args));
+
+	pr_debug("checking exprs...\n");
+	while (idx < expr_cnt) {
+		struct bcf_expr *expr = exprs + idx;
+		u8 class = BPF_CLASS(expr->code);
+		u32 sz = expr->vlen + 1;
+
+		pr_debug("expr#%d: %x\n", idx, expr->code);
+
+		if (idx + sz > expr_cnt) {
+			pr_debug("expr too big: %d\n", sz);
+			return -EINVAL;
+		}
+
+		if (!bcf_code_intable(expr->code)) {
+			pr_debug("invalid code\n");
+			return -EINVAL;
+		}
+
+		if (class == BCF_BV_ALU && BPF_SRC(expr->code) == BCF_EXT)
+			err = check_bv_ext(env, expr);
+		else if (class == BCF_BV_ALU)
+			err = check_bv(env, expr);
+		else if (class == BCF_BV_PRED)
+			err = check_bv_pred(env, expr);
+		else if (class == BCF_BOOL_PRED)
+			err = check_bool_pred(env, expr);
+		else if (class == BCF_BUILTIN)
+			err = check_builtin_expr(env, expr);
+		else
+			err = -EINVAL;
+
+		if (err)
+			return err;
+
+		set_bit(idx, env->expr_idx_bitmap);
+		idx += sz;
+	}
+
+	return err;
+}
+
+static int set_step_fact(struct bcf_checker_env *env, int fact)
+{
+	if (fact < 0)
+		return fact;
+
+	env->step_facts[env->cur_step] = fact;
+	return 0;
+}
+
+static struct bcf_expr *get_premise(struct bcf_checker_env *env, u32 step)
+{
+	if (step >= env->cur_step)
+		return NULL;
+	return env->exprs + env->step_facts[step];
+}
+
+static struct bcf_expr *get_pred_arg(struct bcf_checker_env *env, u32 arg)
+{
+	int err;
+
+	err = check_pred_arg(env, arg);
+	if (err)
+		return NULL;
+	return env->exprs + arg;
+}
+
+static struct bcf_expr *__get_arg(struct bcf_checker_env *env, u32 idx, u8 code)
+{
+	struct bcf_expr *expr;
+
+	if (!valid_idx(env, idx))
+		return NULL;
+
+	expr = env->exprs + idx;
+	if (expr->code != code)
+		return NULL;
+	return expr;
+}
+
+static struct bcf_expr *get_bv_val_arg(struct bcf_checker_env *env, u32 arg)
+{
+	return __get_arg(env, arg, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL);
+}
+
+static struct bcf_expr *get_list_arg(struct bcf_checker_env *env, u32 arg)
+{
+	return __get_arg(env, arg, BCF_BUILTIN | BCF_ARG_LIST);
+}
+
+static struct bcf_expr *get_ite_arg(struct bcf_checker_env *env, u32 arg)
+{
+	return __get_arg(env, arg, BCF_BOOL_PRED | BCF_ITE);
+}
+
+static struct bcf_expr *get_expr_buf(struct bcf_checker_env *env)
+{
+	env->expr_buf.code = 0;
+	env->expr_buf.vlen = 0;
+	env->expr_buf.params = 0;
+	return (struct bcf_expr *)&env->expr_buf;
+}
+
+static struct bcf_expr *reserve_expr_buf(struct bcf_checker_env *env, u32 arg_n)
+{
+	if (arg_n > EXPR_BUF_LEN)
+		return NULL;
+
+	return get_expr_buf(env);
+}
+
+static int add_expr(struct bcf_checker_env *env, struct bcf_expr *expr)
+{
+	u32 cnt = expr->vlen + 1;
+	int ret;
+
+	if (cnt + env->expr_cnt > env->expr_size) {
+		u32 size = env->expr_size;
+		struct bcf_expr *exprs;
+
+		/* two slots for each of the rest steps */
+		size += cnt * (env->step_cnt - env->cur_step);
+		exprs = kvrealloc(env->exprs, size * sizeof(*expr), GFP_KERNEL);
+		if (!exprs) {
+			kvfree(env->exprs);
+			env->exprs = NULL;
+			return -ENOMEM;
+		}
+		env->exprs = exprs;
+		env->expr_size = size;
+	}
+
+	memcpy(env->exprs + env->expr_cnt, expr, sizeof(*expr) * cnt);
+	ret = env->expr_cnt;
+	env->expr_cnt += cnt;
+	return ret;
+}
+
+static int add_not_expr(struct bcf_checker_env *env, u32 idx)
+{
+	struct bcf_expr_unary not_expr = { 0 };
+	struct bcf_expr *expr = (struct bcf_expr *)&not_expr;
+
+	expr->code = BCF_BOOL_PRED | BCF_NOT;
+	expr->args[expr->vlen++] = idx;
+	return add_expr(env, expr);
+}
+
+static int add_equiv(struct bcf_checker_env *env, u32 arg0, u32 arg1)
+{
+	struct bcf_expr_binary equiv = { 0 };
+	struct bcf_expr *expr = (struct bcf_expr *)&equiv;
+
+	expr->code = BCF_BOOL_PRED | BCF_EQUIV;
+	expr->vlen = 2;
+	expr->args[0] = arg0;
+	expr->args[1] = arg1;
+	return add_expr(env, expr);
+}
+
+static int add_disj(struct bcf_checker_env *env, u32 arg0, u32 arg1)
+{
+	struct bcf_expr_binary disj = { 0 };
+	struct bcf_expr *expr = (struct bcf_expr *)&disj;
+
+	expr->code = BCF_BOOL_PRED | BCF_DISJ;
+	expr->vlen = 2;
+	expr->args[0] = arg0;
+	expr->args[1] = arg1;
+	return add_expr(env, expr);
+}
+
+static int add_disj3(struct bcf_checker_env *env, u32 arg0, u32 arg1, u32 arg2)
+{
+	struct bcf_expr_ternary disj = { 0 };
+	struct bcf_expr *expr = (struct bcf_expr *)&disj;
+
+	expr->code = BCF_BOOL_PRED | BCF_DISJ;
+	expr->vlen = 3;
+	expr->args[0] = arg0;
+	expr->args[1] = arg1;
+	expr->args[2] = arg2;
+	return add_expr(env, expr);
+}
+
+static int add_ite(struct bcf_checker_env *env, u32 cond, u32 f0, u32 f1)
+{
+	struct bcf_expr_ternary ite = { 0 };
+	struct bcf_expr *expr = (struct bcf_expr *)&ite;
+
+	expr->code = BCF_BOOL_PRED | BCF_ITE;
+	expr->vlen = 3;
+	expr->args[0] = cond;
+	expr->args[1] = f0;
+	expr->args[2] = f1;
+	return add_expr(env, expr);
+}
+
+/* Expression node level comparison without considering children */
+static bool expr_node_equiv(struct bcf_expr *e0, struct bcf_expr *e1)
+{
+	/* FIXME unify equiv */
+	if (is_equiv(e0->code) && is_equiv(e1->code))
+		return true;
+	if (e0->code != e1->code || e0->vlen != e1->vlen ||
+	    e0->params != e1->params)
+		return false;
+
+	if (is_bv_val(e0->code)) {
+		int i = 0;
+
+		for (; i < e0->vlen && e0->args[i] == e1->args[i]; i++)
+			;
+
+		return i == e0->vlen;
+	}
+
+	return true;
+}
+
+#define BCF_VAR_IDX_MAP_SIZE 128
+struct bcf_var_map {
+	struct bcf_idx_pair {
+		u32 idx0;
+		u32 idx1;
+	} pair[BCF_VAR_IDX_MAP_SIZE];
+	u32 cnt;
+};
+
+static bool var_equiv(struct bcf_var_map *map, u32 v0, u32 v1)
+{
+	int i;
+
+	if (!map)
+		return false;
+
+	for (i = 0; i < map->cnt; i++) {
+		if (map->pair[i].idx0 == v0)
+			return map->pair[i].idx1 == v1;
+		if (map->pair[i].idx1 == v1)
+			return false;
+	}
+
+	if (map->cnt < BCF_VAR_IDX_MAP_SIZE) {
+		map->pair[map->cnt].idx0 = v0;
+		map->pair[map->cnt].idx1 = v1;
+		map->cnt++;
+		return true;
+	}
+	return false;
+}
+
+static int ___expr_equiv(struct bcf_checker_env *env, struct bcf_expr *exprs0,
+			 struct bcf_expr *e0, struct bcf_expr *exprs1,
+			 struct bcf_expr *e1, struct bcf_var_map *map)
+{
+	struct expr_cmp_state *cmp_stack = env->cmp_stack;
+	u32 stack_size;
+
+	if (!expr_node_equiv(e0, e1))
+		return 0;
+
+	cmp_stack[0] = (struct expr_cmp_state){ e0, e1, 0 };
+	stack_size = 1;
+
+	while (stack_size) {
+		struct expr_cmp_state *cmp = &cmp_stack[stack_size - 1];
+
+		e0 = cmp->e0;
+		e1 = cmp->e1;
+		if (cmp->cur_arg >= e0->vlen || is_bv_val(e0->code)) {
+			stack_size--;
+			continue;
+		}
+
+		for (; cmp->cur_arg < e0->vlen; cmp->cur_arg++) {
+			u32 arg0 = e0->args[cmp->cur_arg];
+			u32 arg1 = e1->args[cmp->cur_arg];
+			struct bcf_expr *a0, *a1;
+
+			/* When expr0 is the same as expr1, the same bv
+			 * variable must always share same idx.
+			 */
+			if (exprs0 == exprs1 && arg0 == arg1)
+				continue;
+
+			a0 = exprs0 + arg0;
+			a1 = exprs1 + arg1;
+			if (!expr_node_equiv(a0, a1))
+				return 0;
+
+			if (is_bv_val(a0->code))
+				continue;
+
+			if (is_bv_var(a0->code)) {
+				if (var_equiv(map, arg0, arg1))
+					continue;
+				return false;
+			}
+
+			if (stack_size == CMP_STACK_SIZE)
+				return -E2BIG;
+			cmp_stack[stack_size++] =
+				(struct expr_cmp_state){ a0, a1, 0 };
+			cmp->cur_arg++; /* skip cur arg */
+			break;
+		}
+	}
+
+	return 1;
+}
+
+static int __expr_equiv(struct bcf_checker_env *env, struct bcf_expr *e0,
+			struct bcf_expr *e1)
+{
+	return ___expr_equiv(env, env->exprs, e0, env->exprs, e1, NULL);
+}
+
+static int expr_equiv(struct bcf_checker_env *env, u32 idx0, u32 idx1)
+{
+	struct bcf_expr *e0, *e1;
+
+	if (idx0 == idx1)
+		return 1;
+
+	e0 = env->exprs + idx0;
+	e1 = env->exprs + idx1;
+	return __expr_equiv(env, e0, e1);
+}
+
+static void dump_expr(struct bcf_expr *expr, char *name)
+{
+	int i;
+
+	pr_debug("\t >> %s (%x, %d, %x):", name, expr->code, expr->vlen,
+		 expr->params);
+	for (i = 0; i < expr->vlen; i++)
+		pr_debug(" %d", expr->args[i]);
+	pr_debug("\n");
+}
+
+static void dump_step(struct bcf_proof_step *step, const char *name)
+{
+	int i;
+
+	pr_debug("\t> %s (%d, %d, %x):", name, BCF_STEP_RULE(step->rule),
+		 step->vlen, step->params);
+	for (i = 0; i < step->vlen; i++)
+		pr_debug(" %d", step->args[i]);
+	pr_debug("\n");
+}
+
+static int check_builtin_step(struct bcf_checker_env *env,
+			      struct bcf_proof_step *step, u16 rule)
+{
+	u32 arg;
+	int err;
+
+	dump_step(step, rule == BCF_RULE_ASSUME ? "ASSUME" : "REWRITE");
+
+	if (rule != BCF_RULE_ASSUME && rule != BCF_RULE_REWRITE)
+		return -EINVAL;
+
+	if (step->vlen != 1 || step->params)
+		return -EINVAL;
+
+	arg = step->args[0];
+	err = check_pred_arg(env, arg);
+	if (err)
+		return err;
+
+	if (rule == BCF_RULE_REWRITE) {
+		struct bcf_expr *eq_expr;
+
+		eq_expr = env->exprs + arg;
+		if (!is_equiv(eq_expr->code))
+			return -EINVAL;
+		return set_step_fact(env, arg);
+	}
+
+	/* multiple assume steps */
+	if (env->goal >= 0)
+		return -ENOTSUPP;
+	env->goal = arg;
+	return set_step_fact(env, arg);
+}
+
+static int check_bv_step(struct bcf_checker_env *env,
+			 struct bcf_proof_step *step, u16 rule)
+{
+	struct bcf_expr *eq_expr;
+	u32 arg;
+	int err;
+
+	dump_step(step, "BV_BITBLAST");
+
+	if (rule != BCF_RULE_BITBLAST || step->vlen != 1 || step->params)
+		return -EINVAL;
+
+	arg = step->args[0];
+	err = check_pred_arg(env, arg);
+	if (err)
+		return err;
+	eq_expr = env->exprs + arg;
+	if (!is_equiv(eq_expr->code))
+		return -EINVAL;
+
+	/* TODO Handle bitblast */
+	return set_step_fact(env, arg);
+}
+
+static int elim_pivot(struct bcf_checker_env *env, struct bcf_expr *expr_buf,
+		      u32 pm_idx, struct bcf_expr *pivot)
+{
+	u32 *expr_args = expr_buf->args + expr_buf->vlen;
+	struct bcf_expr *pm = env->exprs + pm_idx;
+	u32 *pm_args = pm->args;
+	bool eliminated = false;
+	int i, err;
+
+	err = __expr_equiv(env, pm, pivot);
+	if (err)
+		return err < 0 ? err : 0;
+
+	if (!is_disj(pm->code)) {
+		*expr_args = pm_idx;
+		expr_buf->vlen++;
+		return 0;
+	}
+
+	for (i = 0; i < pm->vlen; i++) {
+		struct bcf_expr *pm_arg = env->exprs + pm_args[i];
+
+		if (eliminated) {
+			*expr_args++ = pm_args[i];
+			expr_buf->vlen++;
+			continue;
+		}
+
+		err = __expr_equiv(env, pm_arg, pivot);
+		if (err < 0)
+			return err;
+		if (!err) {
+			*expr_args++ = pm_args[i];
+			expr_buf->vlen++;
+			continue;
+		}
+
+		eliminated = true;
+	}
+
+	return 0;
+}
+
+static bool polarity_of(u32 *pols, u32 idx)
+{
+	u32 bits_per_u32 = BITS_PER_BYTE * sizeof(u32);
+	u32 i = idx % bits_per_u32;
+
+	return pols[idx / bits_per_u32] & (1 << i);
+}
+
+static int copy_clauses(struct bcf_checker_env *env, struct bcf_expr *expr_buf,
+			u32 step, u32 pivot_idx, bool polarity)
+{
+	struct bcf_expr *pm, *pivot;
+	struct bcf_expr_unary not_pivot;
+	int err;
+
+	pm = get_premise(env, step);
+	pivot = get_pred_arg(env, pivot_idx);
+	if (!pm || !pivot)
+		return -EINVAL;
+
+	not_pivot = BCF_PRED_NOT(pivot_idx);
+	if (!polarity)
+		pivot = (struct bcf_expr *)&not_pivot;
+
+	if (!is_disj(pm->code)) {
+		*expr_buf->args = env->step_facts[step];
+		expr_buf->vlen++;
+		return 0;
+	}
+
+	err = __expr_equiv(env, pm, pivot);
+	if (err)
+		return err < 0 ? err : 0;
+
+	memcpy(expr_buf->args, pm->args, sizeof(*pm->args) * pm->vlen);
+	expr_buf->vlen += pm->vlen;
+	return 0;
+}
+
+static int resolution_inplace(struct bcf_checker_env *env,
+			      struct bcf_expr *expr_buf, u32 step_rhs,
+			      u32 pivot, bool polarity)
+{
+	struct bcf_expr_unary not_pivot = BCF_PRED_NOT(pivot);
+	struct bcf_expr *rhs, *pivots[2];
+	int i, ret;
+
+	rhs = get_premise(env, step_rhs);
+	pivots[0] = get_pred_arg(env, pivot);
+	if (!rhs || !pivots[0])
+		return -EINVAL;
+
+	pivots[1] = (struct bcf_expr *)&not_pivot;
+	if (!polarity)
+		swap(pivots[0], pivots[1]);
+
+	/* eliminate pivots[0] in lhs */
+	for (i = 0; i < expr_buf->vlen; i++) {
+		struct bcf_expr *arg = env->exprs + expr_buf->args[i];
+		u32 left;
+
+		ret = __expr_equiv(env, arg, pivots[0]);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			continue;
+
+		left = expr_buf->vlen - (i + 1);
+		if (left)
+			memmove(expr_buf->args + i, expr_buf->args + i + 1,
+				sizeof(*expr_buf->args) * left);
+		expr_buf->vlen--;
+		break;
+	}
+
+	if ((u32)rhs->vlen + expr_buf->vlen > EXPR_BUF_LEN)
+		return -E2BIG;
+	return elim_pivot(env, expr_buf, env->step_facts[step_rhs], pivots[1]);
+}
+
+static int build_resolution_fact(struct bcf_checker_env *env,
+				 struct bcf_expr *expr)
+{
+	int fact;
+
+	if (expr->vlen == 0) {
+		fact = add_expr(env, &BCF_PRED_FALSE);
+	} else if (expr->vlen == 1) {
+		fact = expr->args[0];
+	} else {
+		expr->code = BCF_BOOL_PRED | BCF_DISJ;
+		expr->params = 0;
+		fact = add_expr(env, expr);
+	}
+	return set_step_fact(env, fact);
+}
+
+static int check_boolean_step(struct bcf_checker_env *env,
+			      struct bcf_proof_step *step, u16 rule)
+{
+	u8 vlen = step->vlen, params = step->params;
+	struct bcf_expr *expr_buf;
+	u32 *args = step->args;
+	int err, i, fact;
+
+	if (rule >= __MAX_BCF_BOOLEAN_RULES)
+		return -EINVAL;
+
+#define BCF_RULE(RULE_NAME) BCF_RULE_##RULE_NAME
+	// clang-format off
+#define BCF_BOOLEAN_RULES(MAPPER)	\
+	MAPPER(RESOLUTION),		\
+	MAPPER(CHAIN_RESOLUTION),	\
+	MAPPER(FACTORING),		\
+	MAPPER(REORDERING),		\
+	MAPPER(SPLIT),			\
+	MAPPER(EQ_RESOLVE),		\
+	MAPPER(MODUS_PONENS),		\
+	MAPPER(NOT_NOT_ELIM),		\
+	MAPPER(CONTRA),			\
+	MAPPER(AND_ELIM),		\
+	MAPPER(AND_INTRO),		\
+	MAPPER(NOT_OR_ELIM),		\
+	MAPPER(IMPLIES_ELIM),		\
+	MAPPER(NOT_IMPLIES_ELIM),	\
+	MAPPER(EQUIV_ELIM),		\
+	MAPPER(NOT_EQUIV_ELIM),		\
+	MAPPER(XOR_ELIM),		\
+	MAPPER(NOT_XOR_ELIM),		\
+	MAPPER(ITE_ELIM),		\
+	MAPPER(NOT_ITE_ELIM),		\
+	MAPPER(NOT_AND),		\
+	MAPPER(CNF_AND_POS),		\
+	MAPPER(CNF_AND_NEG),		\
+	MAPPER(CNF_OR_POS),		\
+	MAPPER(CNF_OR_NEG),		\
+	MAPPER(CNF_IMPLIES_POS),	\
+	MAPPER(CNF_IMPLIES_NEG),	\
+	MAPPER(CNF_EQUIV_POS),		\
+	MAPPER(CNF_EQUIV_NEG),		\
+	MAPPER(CNF_XOR_POS),		\
+	MAPPER(CNF_XOR_NEG),		\
+	MAPPER(CNF_ITE_POS),		\
+	MAPPER(CNF_ITE_NEG),		\
+	MAPPER(ITE_EQ)
+
+// clang-format on
+#define RULE_LABEL(RULE_NAME) [BCF_RULE(RULE_NAME)] = &&RULE_NAME
+	static const void *const
+		jumptable[__MAX_BCF_BOOLEAN_RULES] __annotate_jump_table = {
+			[0 ... __MAX_BCF_BOOLEAN_RULES - 1] = &&err_bad_rule,
+			BCF_BOOLEAN_RULES(RULE_LABEL),
+		};
+#undef RULE_LABEL
+#define RULE_STR(RULE_NAME) [BCF_RULE(RULE_NAME)] = __stringify(RULE_NAME)
+	static const char *const rule_name[__MAX_BCF_BOOLEAN_RULES] = {
+		[0 ... __MAX_BCF_BOOLEAN_RULES - 1] = "unknown rule",
+		BCF_BOOLEAN_RULES(RULE_STR),
+	};
+#undef RULE_STR
+#undef BCF_BOOLEAN_RULES
+#undef BCF_RULE
+
+	dump_step(step, rule_name[rule]);
+	goto *jumptable[rule];
+
+RESOLUTION: {
+	struct bcf_expr *pivots[2], *pms[2];
+	struct bcf_expr_unary not_arg;
+	bool polarity = params;
+
+	if (vlen != 3 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	pms[0] = get_premise(env, args[0]);
+	pms[1] = get_premise(env, args[1]);
+	pivots[0] = get_pred_arg(env, args[2]);
+	if (!pms[0] || !pms[1] || !pivots[0])
+		return -EINVAL;
+
+	not_arg = BCF_PRED_NOT(args[2]);
+	pivots[1] = (struct bcf_expr *)&not_arg;
+	if (!polarity)
+		swap(pivots[0], pivots[1]);
+
+	expr_buf = reserve_expr_buf(env, pms[0]->vlen + pms[1]->vlen);
+	if (!expr_buf)
+		return -E2BIG;
+
+	err = elim_pivot(env, expr_buf, env->step_facts[args[0]], pivots[0]);
+	// clang-format off
+	err = err ?: elim_pivot(env, expr_buf, env->step_facts[args[1]],
+				     pivots[1]);
+	// clang-format on
+	if (err < 0)
+		return err;
+	return build_resolution_fact(env, expr_buf);
+}
+
+CHAIN_RESOLUTION: {
+	struct bcf_expr *pol_expr, *pivot_expr;
+	u32 premise_cnt, pol_idx, pivot_list;
+	u32 *pols;
+	bool polarity;
+
+	/* chain resolution has at least three premises, and two args */
+	if (vlen < 4 || params)
+		return -EINVAL;
+
+	premise_cnt = vlen - 2;
+	pol_idx = args[vlen - 2];
+	pol_expr = get_bv_val_arg(env, pol_idx);
+	pivot_list = args[vlen - 1];
+	pivot_expr = get_list_arg(env, pivot_list);
+	if (!pol_expr || !pivot_expr)
+		return -EINVAL;
+
+	if (BCF_BV_BITSZ(pol_expr->params) != pivot_expr->vlen ||
+	    pivot_expr->vlen + 1 != premise_cnt)
+		return -EINVAL;
+
+	pols = pol_expr->args;
+	expr_buf = get_expr_buf(env);
+	polarity = polarity_of(pols, 0);
+	err = copy_clauses(env, expr_buf, args[0], pivot_expr->args[0],
+			   polarity);
+	if (err)
+		return err;
+
+	for (i = 0; i < pivot_expr->vlen; i++) {
+		u32 pm_idx = args[i + 1];
+		u32 pivot = pivot_expr->args[i];
+
+		polarity = polarity_of(pols, i);
+		err = resolution_inplace(env, expr_buf, pm_idx, pivot,
+					 polarity);
+		if (err)
+			return err;
+	}
+	return build_resolution_fact(env, expr_buf);
+}
+
+FACTORING: {
+	if (vlen != 1 || params)
+		return -EINVAL;
+	err = check_pred_arg(env, args[0]);
+	if (err < 0)
+		return err;
+
+	return set_step_fact(env, args[0]);
+}
+
+REORDERING: {
+	if (vlen != 1 || params)
+		return -EINVAL;
+	err = check_pred_arg(env, args[0]);
+	if (err < 0)
+		return err;
+
+	return set_step_fact(env, args[0]);
+}
+
+SPLIT: {
+	int not_arg, disj;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	err = check_pred_arg(env, args[0]);
+	if (err)
+		return err;
+
+	not_arg = add_not_expr(env, args[0]);
+	disj = add_disj(env, args[0], not_arg);
+	if (not_arg < 0 || disj < 0)
+		return -ENOMEM;
+	return set_step_fact(env, disj);
+}
+
+EQ_RESOLVE: {
+	struct bcf_expr *pm, *pm_eq;
+	u32 idx0, idx1;
+
+	if (vlen != 2 || params)
+		return -EINVAL;
+
+	pm = get_premise(env, args[0]);
+	pm_eq = get_premise(env, args[1]);
+	if (!pm || !pm_eq) {
+		pr_debug("invalid premises: %d %d\n", args[0], args[1]);
+		return -EINVAL;
+	}
+	if (!is_equiv(pm_eq->code)) {
+		dump_expr(pm_eq, "pm1 not eq expr");
+		return -EINVAL;
+	}
+
+	idx0 = env->step_facts[args[0]];
+	idx1 = pm_eq->args[0];
+	err = expr_equiv(env, idx0, idx1);
+	if (err < 0)
+		return err;
+	if (!err) {
+		struct bcf_expr *pm_lhs = env->exprs + idx1;
+
+		pr_debug("\t>> pm not equiv:");
+		dump_expr(pm, "pm0");
+		dump_expr(pm_lhs, "pm1[0]");
+		return -EINVAL;
+	}
+	return set_step_fact(env, pm_eq->args[1]);
+}
+
+MODUS_PONENS: {
+	struct bcf_expr *pm, *pm_implies;
+
+	if (vlen != 2 || params)
+		return -EINVAL;
+
+	pm = get_premise(env, args[0]);
+	pm_implies = get_premise(env, args[1]);
+	if (!pm || !pm_implies || !is_implies(pm_implies->code))
+		return -EINVAL;
+
+	err = expr_equiv(env, env->step_facts[args[0]], pm_implies->args[0]);
+	if (err < 0)
+		return err;
+	if (!err)
+		return -EINVAL;
+	return set_step_fact(env, pm_implies->args[1]);
+}
+
+NOT_NOT_ELIM: {
+	struct bcf_expr *not_expr;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	not_expr = get_premise(env, args[0]);
+	if (!not_expr || !is_pred_not(not_expr->code))
+		return -EINVAL;
+
+	not_expr = env->exprs + not_expr->args[0];
+	if (!is_pred_not(not_expr->code))
+		return -EINVAL;
+
+	return set_step_fact(env, not_expr->args[0]);
+}
+
+CONTRA: {
+	struct bcf_expr *pm, *pm_not;
+
+	if (vlen != 2 || params)
+		return -EINVAL;
+
+	pm = get_premise(env, args[0]);
+	pm_not = get_premise(env, args[1]);
+	if (!pm || !pm_not || !is_pred_not(pm_not->code))
+		return -EINVAL;
+
+	err = expr_equiv(env, env->step_facts[args[0]], pm_not->args[0]);
+	if (err < 0)
+		return err;
+	if (!err)
+		return -EINVAL;
+
+	return set_step_fact(env, add_expr(env, &BCF_PRED_FALSE));
+}
+
+AND_ELIM: {
+	struct bcf_expr *and;
+	u32 idx = params;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	and = get_premise(env, args[0]);
+	if (!and || !is_conj(and->code) || idx >= and->vlen)
+		return -EINVAL;
+	return set_step_fact(env, and->args[idx]);
+}
+
+AND_INTRO: {
+	if (!vlen || params)
+		return -EINVAL;
+
+	if (vlen == 1) {
+		if (!get_premise(env, args[0]))
+			return -EINVAL;
+		return set_step_fact(env, env->step_facts[args[0]]);
+	}
+
+	expr_buf = get_expr_buf(env);
+	expr_buf->code = BCF_BOOL_PRED | BCF_CONJ;
+	expr_buf->vlen = vlen;
+	for (i = 0; i < vlen; i++) {
+		if (!get_premise(env, args[i]))
+			return -EINVAL;
+		expr_buf->args[i] = env->step_facts[args[i]];
+	}
+	return set_step_fact(env, add_expr(env, expr_buf));
+}
+
+NOT_OR_ELIM: {
+	struct bcf_expr *not_disj;
+	u32 idx = params;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	not_disj = get_premise(env, args[0]);
+	if (!not_disj || !is_pred_not(not_disj->code))
+		return -EINVAL;
+
+	not_disj = env->exprs + not_disj->args[0];
+	if (!is_disj(not_disj->code) || idx >= not_disj->vlen)
+		return -EINVAL;
+
+	fact = add_not_expr(env, not_disj->args[idx]);
+	return set_step_fact(env, fact);
+}
+
+IMPLIES_ELIM: {
+	struct bcf_expr *implies;
+	int not, disj;
+	u32 arg0, arg1;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	implies = get_premise(env, args[0]);
+	if (!implies || !is_implies(implies->code))
+		return -EINVAL;
+
+	arg0 = implies->args[0];
+	arg1 = implies->args[1];
+	not = add_not_expr(env, arg0);
+	disj = add_disj(env, not, arg1);
+	if (not < 0 || disj < 0)
+		return -ENOMEM;
+	return set_step_fact(env, disj);
+}
+
+NOT_IMPLIES_ELIM: {
+	struct bcf_expr *not_implies;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	not_implies = get_premise(env, args[0]);
+	if (!not_implies || !is_pred_not(not_implies->code))
+		return -EINVAL;
+
+	not_implies = env->exprs + not_implies->args[0];
+	if (!is_implies(not_implies->code))
+		return -EINVAL;
+
+	fact = not_implies->args[0];
+	if (params)
+		fact = add_not_expr(env, not_implies->args[1]);
+	return set_step_fact(env, fact);
+}
+
+EQUIV_ELIM: {
+	struct bcf_expr *equiv;
+	int arg0, arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	equiv = get_premise(env, args[0]);
+	if (!equiv || !is_equiv(equiv->code))
+		return -EINVAL;
+
+	arg0 = equiv->args[0];
+	arg1 = equiv->args[1];
+	if (!params)
+		arg0 = add_not_expr(env, arg0);
+	else
+		arg1 = add_not_expr(env, arg1);
+	if (arg0 < 0 || arg1 < 0)
+		return -ENOMEM;
+
+	return set_step_fact(env, add_disj(env, arg0, arg1));
+}
+
+NOT_EQUIV_ELIM: {
+	struct bcf_expr *not_equiv;
+	int arg0, arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	not_equiv = get_premise(env, args[0]);
+	if (!not_equiv || !is_pred_not(not_equiv->code))
+		return -EINVAL;
+	not_equiv = env->exprs + not_equiv->args[0];
+	if (!is_equiv(not_equiv->code))
+		return -EINVAL;
+
+	arg0 = not_equiv->args[0];
+	arg1 = not_equiv->args[1];
+	if (params) {
+		arg0 = add_not_expr(env, arg0);
+		arg1 = add_not_expr(env, arg1);
+	}
+	if (arg0 < 0 || arg1 < 0)
+		return -ENOMEM;
+	return set_step_fact(env, add_disj(env, arg0, arg1));
+}
+
+XOR_ELIM: {
+	struct bcf_expr *xor;
+	int arg0, arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	xor = get_premise(env, args[0]);
+	if (!xor || !is_xor(xor->code))
+		return -EINVAL;
+
+	arg0 = xor->args[0];
+	arg1 = xor->args[1];
+	if (params) {
+		arg0 = add_not_expr(env, arg0);
+		arg1 = add_not_expr(env, arg1);
+	}
+	if (arg0 < 0 || arg1 < 0)
+		return -ENOMEM;
+	return set_step_fact(env, add_disj(env, arg0, arg1));
+}
+
+NOT_XOR_ELIM: {
+	struct bcf_expr *not_xor;
+	int arg0, arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	not_xor = get_premise(env, args[0]);
+	if (!not_xor || !is_pred_not(not_xor->code))
+		return -EINVAL;
+	not_xor = env->exprs + not_xor->args[0];
+	if (!is_xor(not_xor->code))
+		return -EINVAL;
+
+	arg0 = not_xor->args[0];
+	arg1 = not_xor->args[1];
+	if (params)
+		arg0 = add_not_expr(env, arg0);
+	else
+		arg1 = add_not_expr(env, arg1);
+	if (arg0 < 0 || arg1 < 0)
+		return -ENOMEM;
+	return set_step_fact(env, add_disj(env, arg0, arg1));
+}
+
+ITE_ELIM: {
+	struct bcf_expr *ite;
+	int cond, f0, f1;
+	int arg0, arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	ite = get_premise(env, args[0]);
+	if (!ite || !is_ite(ite->code))
+		return -EINVAL;
+
+	cond = ite->args[0];
+	f0 = ite->args[1];
+	f1 = ite->args[2];
+	if (!params) {
+		arg0 = add_not_expr(env, cond);
+		arg1 = f0;
+	} else {
+		arg0 = cond;
+		arg1 = f1;
+	}
+	if (arg0 < 0)
+		return -ENOMEM;
+
+	return set_step_fact(env, add_disj(env, arg0, arg1));
+}
+
+NOT_ITE_ELIM: {
+	struct bcf_expr *not_ite, *ite;
+	int cond, f0, f1;
+	int arg0, arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	not_ite = get_premise(env, args[0]);
+	if (!not_ite || !is_pred_not(not_ite->code))
+		return -EINVAL;
+	ite = env->exprs + not_ite->args[0];
+	if (!is_ite(ite->code))
+		return -EINVAL;
+
+	cond = ite->args[0];
+	f0 = ite->args[1];
+	f1 = ite->args[2];
+	if (!params) {
+		arg0 = add_not_expr(env, cond);
+		arg1 = add_not_expr(env, f0);
+	} else {
+		arg0 = cond;
+		arg1 = add_not_expr(env, f1);
+	}
+	if (arg0 < 0 || arg1 < 0)
+		return -ENOMEM;
+
+	return set_step_fact(env, add_disj(env, arg0, arg1));
+}
+
+NOT_AND: {
+	struct bcf_expr *not_and, *and;
+	int not;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	not_and = get_premise(env, args[0]);
+	if (!not_and || !is_pred_not(not_and->code))
+		return -EINVAL;
+	and = env->exprs + not_and->args[0];
+	if (!is_conj(and->code))
+		return -EINVAL;
+
+	expr_buf = get_expr_buf(env);
+	expr_buf->code = BCF_BOOL_PRED | BCF_DISJ;
+	for (i = 0; i < and->vlen; i++) {
+		not = add_not_expr(env, and->args[i]);
+		if (not < 0)
+			return not;
+		expr_buf->args[expr_buf->vlen++] = not;
+	}
+
+	return set_step_fact(env, add_expr(env, expr_buf));
+}
+
+CNF_AND_POS: {
+	struct bcf_expr *and;
+	u32 idx = params;
+	int not_and;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	and = get_pred_arg(env, args[0]);
+	if (!and || !is_conj(and->code) || idx >= and->vlen)
+		return -EINVAL;
+
+	not_and = add_not_expr(env, args[0]);
+	if (not_and < 0)
+		return not_and;
+
+	and = env->exprs + args[0];
+	return set_step_fact(env, add_disj(env, not_and, and->args[idx]));
+}
+
+CNF_AND_NEG: {
+	struct bcf_expr *and;
+	int not_arg;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	and = get_pred_arg(env, args[0]);
+	if (!and || !is_conj(and->code))
+		return -EINVAL;
+
+	expr_buf = reserve_expr_buf(env, and->vlen + 1);
+	if (!expr_buf)
+		return -E2BIG;
+
+	expr_buf->code = BCF_BOOL_PRED | BCF_DISJ;
+	expr_buf->args[expr_buf->vlen++] = args[0];
+	for (i = 0; i < and->vlen; i++) {
+		not_arg = add_not_expr(env, and->args[i]);
+		if (not_arg < 0)
+			return not_arg;
+		expr_buf->args[expr_buf->vlen++] = not_arg;
+		and = env->exprs + args[0];
+	}
+	return set_step_fact(env, add_expr(env, expr_buf));
+}
+
+CNF_OR_POS: {
+	struct bcf_expr *disj;
+	int not_arg;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	disj = get_pred_arg(env, args[0]);
+	if (!disj || !is_disj(disj->code))
+		return -EINVAL;
+
+	expr_buf = reserve_expr_buf(env, disj->vlen + 1);
+	if (!expr_buf)
+		return -E2BIG;
+
+	not_arg = add_not_expr(env, args[0]);
+	if (not_arg < 0)
+		return not_arg;
+
+	expr_buf->code = BCF_BOOL_PRED | BCF_DISJ;
+	expr_buf->args[expr_buf->vlen++] = not_arg;
+	for (i = 0; i < disj->vlen; i++)
+		expr_buf->args[expr_buf->vlen++] = disj->args[i];
+	return set_step_fact(env, add_expr(env, expr_buf));
+}
+
+CNF_OR_NEG: {
+	struct bcf_expr *disj;
+	u32 idx = params;
+	int not_arg;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	disj = get_pred_arg(env, args[0]);
+	if (!disj || !is_disj(disj->code) || idx >= disj->vlen)
+		return -EINVAL;
+
+	not_arg = add_not_expr(env, disj->args[idx]);
+	if (not_arg < 0)
+		return not_arg;
+	return set_step_fact(env, add_disj(env, args[0], not_arg));
+}
+
+CNF_IMPLIES_POS: {
+	struct bcf_expr *implies;
+	int not_implies, not_f0;
+	u32 arg0, arg1;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	implies = get_pred_arg(env, args[0]);
+	if (!implies || !is_implies(implies->code))
+		return -EINVAL;
+
+	arg0 = implies->args[0];
+	arg1 = implies->args[1];
+	not_implies = add_not_expr(env, args[0]);
+	not_f0 = add_not_expr(env, arg0);
+	if (not_implies < 0 || not_f0 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, not_implies, not_f0, arg1);
+	return set_step_fact(env, fact);
+}
+
+CNF_IMPLIES_NEG: {
+	struct bcf_expr *implies;
+	int arg1;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	implies = get_pred_arg(env, args[0]);
+	if (!implies || !is_implies(implies->code))
+		return -EINVAL;
+
+	arg1 = implies->args[0];
+	if (params)
+		arg1 = add_not_expr(env, implies->args[1]);
+	if (arg1 < 0)
+		return arg1;
+	return set_step_fact(env, add_disj(env, args[0], arg1));
+}
+
+CNF_EQUIV_POS: {
+	struct bcf_expr *equiv;
+	int not_equiv, arg1, arg2;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	equiv = get_pred_arg(env, args[0]);
+	if (!equiv || !is_equiv(equiv->code))
+		return -EINVAL;
+
+	arg1 = equiv->args[0];
+	arg2 = equiv->args[1];
+	not_equiv = add_not_expr(env, args[0]);
+	if (!params)
+		arg1 = add_not_expr(env, arg1);
+	else
+		arg2 = add_not_expr(env, arg2);
+	if (not_equiv < 0 || arg1 < 0 || arg2 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, not_equiv, arg1, arg2);
+	return set_step_fact(env, fact);
+}
+
+CNF_EQUIV_NEG: {
+	struct bcf_expr *equiv;
+	int arg1, arg2;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	equiv = get_pred_arg(env, args[0]);
+	if (!equiv || !is_equiv(equiv->code))
+		return -EINVAL;
+
+	arg1 = equiv->args[0];
+	arg2 = equiv->args[1];
+	if (params) {
+		arg1 = add_not_expr(env, arg1);
+		arg2 = add_not_expr(env, arg2);
+	}
+	if (arg1 < 0 || arg2 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, args[0], arg1, arg2);
+	return set_step_fact(env, fact);
+}
+
+CNF_XOR_POS: {
+	struct bcf_expr *xor_expr;
+	int not_xor, arg1, arg2;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	xor_expr = get_pred_arg(env, args[0]);
+	if (!xor_expr || !is_xor(xor_expr->code))
+		return -EINVAL;
+
+	arg1 = xor_expr->args[0];
+	arg2 = xor_expr->args[1];
+	not_xor = add_not_expr(env, args[0]);
+	if (params) {
+		arg1 = add_not_expr(env, arg1);
+		arg2 = add_not_expr(env, arg2);
+	}
+	if (arg1 < 0 || arg2 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, not_xor, arg1, arg2);
+	return set_step_fact(env, fact);
+}
+
+CNF_XOR_NEG: {
+	struct bcf_expr *xor_expr;
+	int arg1, arg2;
+
+	if (vlen != 1 || (params != 0 && params != 1))
+		return -EINVAL;
+
+	xor_expr = get_pred_arg(env, args[0]);
+	if (!xor_expr || !is_xor(xor_expr->code))
+		return -EINVAL;
+
+	arg1 = xor_expr->args[0];
+	arg2 = xor_expr->args[1];
+	if (!params)
+		arg1 = add_not_expr(env, arg1);
+	else
+		arg2 = add_not_expr(env, arg2);
+	if (arg1 < 0 || arg2 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, args[0], arg1, arg2);
+	return set_step_fact(env, fact);
+}
+
+CNF_ITE_POS: {
+	struct bcf_expr *ite;
+	int not_ite, arg1, arg2, f0, f1, cond;
+
+	if (vlen != 1 || (params != 0 && params != 1 && params != 2))
+		return -EINVAL;
+
+	ite = get_ite_arg(env, args[0]);
+	if (!ite)
+		return -EINVAL;
+
+	cond = ite->args[0];
+	f0 = ite->args[1];
+	f1 = ite->args[2];
+	not_ite = add_not_expr(env, args[0]);
+	if (!params) {
+		arg1 = add_not_expr(env, cond);
+		arg2 = f0;
+	} else if (params == 1) {
+		arg1 = cond;
+		arg2 = f1;
+	} else {
+		arg1 = f0;
+		arg2 = f1;
+	}
+	if (not_ite < 0 || arg1 < 0 || arg2 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, not_ite, arg1, arg2);
+	return set_step_fact(env, fact);
+}
+
+CNF_ITE_NEG: {
+	struct bcf_expr *ite;
+	int arg1, arg2, f0, f1, cond;
+
+	if (vlen != 1 || (params != 0 && params != 1 && params != 2))
+		return -EINVAL;
+
+	ite = get_ite_arg(env, args[0]);
+	if (!ite)
+		return -EINVAL;
+
+	cond = ite->args[0];
+	f0 = ite->args[1];
+	f1 = ite->args[2];
+	if (!params) {
+		arg1 = add_not_expr(env, cond);
+		arg2 = add_not_expr(env, f0);
+	} else if (params == 1) {
+		arg1 = cond;
+		arg2 = add_not_expr(env, f1);
+	} else {
+		arg1 = add_not_expr(env, f0);
+		arg2 = add_not_expr(env, f1);
+	}
+	if (arg1 < 0 || arg2 < 0)
+		return -ENOMEM;
+
+	fact = add_disj3(env, args[0], arg1, arg2);
+	return set_step_fact(env, fact);
+}
+
+ITE_EQ: {
+	struct bcf_expr *ite;
+	int f0, f1, cond, eq0, eq1;
+
+	if (vlen != 1 || params)
+		return -EINVAL;
+
+	ite = get_ite_arg(env, args[0]);
+	if (!ite)
+		return -EINVAL;
+
+	cond = ite->args[0];
+	f0 = ite->args[1];
+	f1 = ite->args[2];
+	eq0 = add_equiv(env, args[0], f0);
+	eq1 = add_equiv(env, args[0], f1);
+	if (eq0 < 0 || eq1 < 0)
+		return -ENOMEM;
+
+	fact = add_ite(env, cond, eq0, eq1);
+	return set_step_fact(env, fact);
+}
+
+err_bad_rule:
+	pr_warn("BCF proof checker: unknown rule %04x\n", rule);
+	BUG_ON(1);
+	return -EFAULT;
+}
+
+static int check_equality_step(struct bcf_checker_env *env,
+			       struct bcf_proof_step *step, u16 rule)
+{
+	u8 vlen = step->vlen, params = step->params;
+	struct bcf_expr *expr_buf, *arg;
+	u32 *args = step->args;
+	int err, i, fact;
+
+	if (rule >= __MAX_BCF_EQUALITY_RULES)
+		return -EINVAL;
+
+	// clang-format off
+#define BCF_EQUALITY_RULES(MAPPER)	\
+	MAPPER(REFL),			\
+	MAPPER(SYMM),			\
+	MAPPER(TRANS),			\
+	MAPPER(CONG),			\
+	MAPPER(TRUE_INTRO),		\
+	MAPPER(TRUE_ELIM),		\
+	MAPPER(FALSE_INTRO),		\
+	MAPPER(FALSE_ELIM)
+
+// clang-format on
+#define BCF_RULE(RULE_NAME) BCF_RULE_##RULE_NAME
+#define RULE_LABEL(RULE_NAME) [BCF_RULE(RULE_NAME)] = &&RULE_NAME
+	static const void *const
+		jumptable[__MAX_BCF_EQUALITY_RULES] __annotate_jump_table = {
+			[0 ... __MAX_BCF_EQUALITY_RULES - 1] = &&err_bad_rule,
+			BCF_EQUALITY_RULES(RULE_LABEL),
+		};
+#undef RULE_LABEL
+#define RULE_STR(RULE_NAME) [BCF_RULE(RULE_NAME)] = __stringify(RULE_NAME)
+	static const char *const rule_name[__MAX_BCF_EQUALITY_RULES] = {
+		[0 ... __MAX_BCF_EQUALITY_RULES - 1] = "unknown rule",
+		BCF_EQUALITY_RULES(RULE_STR),
+	};
+#undef RULE_STR
+#undef BCF_RULE
+#undef BCF_EQUALITY_RULES
+
+	dump_step(step, rule_name[rule]);
+	if (params)
+		return -EINVAL;
+
+	expr_buf = get_expr_buf(env);
+	goto *jumptable[rule];
+
+REFL: {
+	if (vlen != 1 || !valid_idx(env, args[0]))
+		return -EINVAL;
+	fact = add_equiv(env, args[0], args[0]);
+	return set_step_fact(env, fact);
+}
+SYMM: {
+	struct bcf_expr *eq;
+	int symm;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	arg = get_premise(env, args[0]);
+	if (!arg)
+		return -EINVAL;
+	eq = arg;
+	if (is_pred_not(eq->code))
+		eq = env->exprs + eq->args[0];
+	if (!is_equiv(eq->code))
+		return -EINVAL;
+
+	symm = add_equiv(env, eq->args[1], eq->args[0]);
+	arg = get_premise(env, args[0]);
+	if (symm >= 0 && is_pred_not(arg->code))
+		symm = add_not_expr(env, symm);
+	return set_step_fact(env, symm);
+}
+TRANS: {
+	struct bcf_expr *eq;
+	int first = -1;
+	u32 curr;
+
+	if (!vlen)
+		return -EINVAL;
+
+	for (i = 0; i < vlen; i++) {
+		eq = get_premise(env, args[i]);
+		if (!eq || !is_equiv(eq->code))
+			return -EINVAL;
+
+		if (first < 0) {
+			first = eq->args[0];
+			curr = eq->args[1];
+			continue;
+		}
+
+		err = expr_equiv(env, curr, eq->args[0]);
+		if (err < 0) {
+			pr_debug("\t>> equiv failed: %d\n", err);
+			return err;
+		}
+		if (!err) {
+			pr_debug("\t>> expr not equiv:");
+			dump_expr(env->exprs + curr, "cur");
+			dump_expr(env->exprs + eq->args[0], "eq[0]");
+			return -EINVAL;
+		}
+		curr = eq->args[1];
+	}
+
+	if (vlen == 1)
+		fact = env->step_facts[args[0]];
+	else
+		fact = add_equiv(env, first, curr);
+	return set_step_fact(env, fact);
+}
+CONG: {
+	struct bcf_expr *eq;
+	int lhs, rhs;
+	u32 op;
+
+	if (vlen < 2)
+		return -EINVAL;
+
+	op = args[vlen - 1];
+	expr_buf->code = op;
+	expr_buf->vlen = op >> 8;
+	expr_buf->params = op >> 16;
+	/* TODO use check_expr */
+	if (!bcf_code_intable(expr_buf->code) || expr_buf->vlen + 1 != vlen)
+		return -EINVAL;
+
+	for (i = 0; i < expr_buf->vlen; i++) {
+		eq = get_premise(env, args[i]);
+		if (!eq || !is_equiv(eq->code))
+			return -EINVAL;
+
+		expr_buf->args[i] = eq->args[0];
+	}
+	lhs = add_expr(env, expr_buf);
+	if (lhs < 0)
+		return lhs;
+
+	for (i = 0; i < expr_buf->vlen; i++) {
+		eq = env->exprs + env->step_facts[args[i]];
+		expr_buf->args[i] = eq->args[1];
+	}
+	rhs = add_expr(env, expr_buf);
+	if (rhs < 0)
+		return rhs;
+
+	fact = add_equiv(env, lhs, rhs);
+	return set_step_fact(env, fact);
+}
+TRUE_INTRO: {
+	int true_expr;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	if (!get_premise(env, args[0]))
+		return -EINVAL;
+
+	true_expr = add_expr(env, &BCF_PRED_TRUE);
+	if (true_expr < 0)
+		return true_expr;
+	fact = add_equiv(env, env->step_facts[args[0]], true_expr);
+	return set_step_fact(env, fact);
+}
+TRUE_ELIM: {
+	struct bcf_expr *eq_true, *true_expr;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	eq_true = get_premise(env, args[0]);
+	if (!eq_true || !is_equiv(eq_true->code))
+		return -EINVAL;
+	true_expr = env->exprs + eq_true->args[1];
+	if (!is_pred_true(true_expr))
+		return -EINVAL;
+
+	return set_step_fact(env, eq_true->args[0]);
+}
+FALSE_INTRO: {
+	struct bcf_expr *not_expr;
+	int false_expr;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	not_expr = get_premise(env, args[0]);
+	if (!not_expr || !is_pred_not(not_expr->code))
+		return -EINVAL;
+
+	false_expr = add_expr(env, &BCF_PRED_FALSE);
+	if (false_expr < 0)
+		return false_expr;
+	fact = add_equiv(env, not_expr->args[0], false_expr);
+	return set_step_fact(env, fact);
+}
+FALSE_ELIM: {
+	struct bcf_expr *eq_false, *false_expr;
+
+	if (vlen != 1)
+		return -EINVAL;
+
+	eq_false = get_premise(env, args[0]);
+	if (!eq_false || !is_equiv(eq_false->code))
+		return -EINVAL;
+	false_expr = env->exprs + eq_false->args[1];
+	if (!is_pred_false(false_expr))
+		return -EINVAL;
+	fact = add_not_expr(env, eq_false->args[0]);
+	return set_step_fact(env, fact);
+}
+err_bad_rule:
+	pr_warn("BCF proof checker: unknown rule %04x\n", rule);
+	BUG_ON(1);
+	return -EFAULT;
+}
+
+static int check_proof(struct bcf_checker_env *env,
+		       struct bcf_proof_step *steps, u32 step_cnt)
+{
+	u32 idx = 0, last_step;
+	struct bcf_expr *expr;
+	int err = 0;
+
+	env->goal = -1;
+	env->cur_step = 0;
+	env->step_facts =
+		kvmalloc_array(step_cnt, sizeof(*env->step_facts), GFP_KERNEL);
+	if (!env->step_facts)
+		return -ENOMEM;
+
+	BUILD_BUG_ON(sizeof(*steps) != sizeof(*steps->args));
+
+	pr_debug("checking proof...\n");
+	while (idx < step_cnt) {
+		struct bcf_proof_step *step = steps + idx;
+		u16 class = BCF_STEP_CLASS(step->rule);
+		u16 rule = BCF_STEP_RULE(step->rule);
+		u32 sz = step->vlen + 1;
+
+		err = -EAGAIN;
+		if (signal_pending(current))
+			goto err_free;
+
+		if (need_resched())
+			cond_resched();
+
+		pr_debug("step#%d at %d...", env->cur_step, idx);
+
+		err = -EINVAL;
+		if (!step->vlen || idx + sz > step_cnt)
+			goto err_free;
+
+		if (class == BCF_RULE_BUILTIN)
+			err = check_builtin_step(env, step, rule);
+		else if (class == BCF_RULE_BOOLEAN)
+			err = check_boolean_step(env, step, rule);
+		else if (class == BCF_RULE_EQUALITY)
+			err = check_equality_step(env, step, rule);
+		else if (class == BCF_RULE_BV)
+			err = check_bv_step(env, step, rule);
+		else
+			err = -EINVAL;
+
+		if (err)
+			goto err_free;
+
+		idx += sz;
+		env->cur_step++;
+	}
+
+	last_step = env->cur_step - 1;
+	expr = env->exprs + env->step_facts[last_step];
+	/* false indicates a contradiction, hence the goal does not hold,
+	 * but its negation holds.
+	 */
+	err = env->goal >= 0 && is_pred_false(expr) ? 0 : -EINVAL;
+err_free:
+	kvfree(env->step_facts);
+	return err;
+}
+
+#if defined(__KERNEL__)
+#define IN_KERNEL 1
+#else
+#define IN_KERNEL 0
+#endif
+
+static int check_goal(struct bcf_checker_env *env, int goal_idx)
+{
+	struct bcf_expr *goal, *proved;
+	struct bpf_verifier_env *venv;
+	struct bcf_expr *exprs0, *exprs1;
+	struct bcf_var_map map = { 0 };
+	int err;
+
+	if (!IN_KERNEL)
+		return 0;
+
+	pr_debug("checking goal\n");
+	if (goal_idx < 0)
+		return -EINVAL;
+
+	venv = env->verifier_env;
+	exprs0 = venv->bcf.exprs;
+	goal = exprs0 + goal_idx;
+
+	exprs1 = env->exprs;
+	proved = exprs1 + env->goal;
+
+	map.cnt = 0;
+	err = ___expr_equiv(env, exprs0, goal, exprs1, proved, &map);
+	if (err < 0)
+		return err;
+	pr_debug("goal: %s\n", err == 1 ? "proved" : "not proved");
+
+	return err == 1 ? 0 : -EINVAL;
+}
+
+static int check_hdr(struct bcf_proof_header *hdr, union bpf_attr *attr,
+		     bpfptr_t bcf_buf)
+{
+	u32 proof_size = attr->bcf_buf_true_size, proof_sz_u32;
+	u32 expr_size, step_size;
+
+	pr_debug("checking hdr...\n");
+
+	if (proof_size > attr->bcf_buf_size ||
+	    proof_size > MAX_BCF_PROOF_SIZE || proof_size <= sizeof(*hdr) ||
+	    proof_size % sizeof(u32))
+		return -EINVAL;
+
+	if (copy_from_bpfptr(hdr, bcf_buf, sizeof(*hdr)))
+		return -EFAULT;
+	if (hdr->magic != BCF_MAGIC)
+		return -EINVAL;
+
+	proof_sz_u32 = (proof_size - sizeof(*hdr)) / sizeof(u32);
+	if (!hdr->expr_cnt || hdr->expr_cnt >= proof_sz_u32 || !hdr->step_cnt ||
+	    hdr->step_cnt >= proof_sz_u32)
+		return -EINVAL;
+
+	expr_size = hdr->expr_cnt * sizeof(struct bcf_expr);
+	step_size = hdr->step_cnt * sizeof(struct bcf_expr);
+	if (proof_size != sizeof(*hdr) + expr_size + step_size)
+		return -EINVAL;
+
+	return 0;
+}
+
+int bcf_check_proof(struct bpf_verifier_env *verifier_env, union bpf_attr *attr,
+		    bpfptr_t uattr)
+{
+	bpfptr_t bcf_buf = make_bpfptr(attr->bcf_buf, uattr.is_kernel);
+	struct bcf_checker_env *bcf_env;
+	struct bcf_proof_header hdr;
+	u32 expr_size, step_size;
+	int err;
+
+	err = check_hdr(&hdr, attr, bcf_buf);
+	if (err < 0)
+		return err;
+
+	bcf_env = kzalloc(sizeof(*bcf_env), GFP_KERNEL);
+	if (!bcf_env)
+		return -ENOMEM;
+	bcf_env->verifier_env = verifier_env;
+
+	/* each step produce at least one expr */
+	bcf_env->expr_size = hdr.expr_cnt + hdr.step_cnt;
+	bcf_env->expr_cnt = hdr.expr_cnt;
+	bcf_env->exprs = kvmalloc_array(bcf_env->expr_size,
+					sizeof(*bcf_env->exprs), GFP_KERNEL);
+	err = -ENOMEM;
+	if (!bcf_env->exprs)
+		goto err_free;
+	err = -EFAULT;
+	expr_size = hdr.expr_cnt * sizeof(*bcf_env->exprs);
+	if (copy_from_bpfptr_offset(bcf_env->exprs, bcf_buf, sizeof(hdr),
+				    expr_size))
+		goto err_free;
+
+	err = check_exprs(bcf_env, bcf_env->exprs, bcf_env->expr_cnt);
+	if (err)
+		goto err_free;
+
+	err = -ENOMEM;
+	bcf_env->step_cnt = hdr.step_cnt;
+	bcf_env->steps = kvmalloc_array(bcf_env->step_cnt,
+					sizeof(*bcf_env->steps), GFP_KERNEL);
+	if (!bcf_env->steps)
+		goto err_free;
+	err = -EFAULT;
+	step_size = hdr.step_cnt * sizeof(*bcf_env->steps);
+	if (copy_from_bpfptr_offset(bcf_env->steps, bcf_buf,
+				    sizeof(hdr) + expr_size, step_size))
+		goto err_free;
+
+	err = check_proof(bcf_env, bcf_env->steps, bcf_env->step_cnt);
+	if (err)
+		goto err_free;
+
+	if (attr->bcf_flags & BCF_F_PROOF_PATH_UNREACHABLE) {
+		pr_debug("BCF: checking proof for unreachable\n");
+		err = check_goal(bcf_env, verifier_env->bcf.path_cond);
+	} else {
+		pr_debug("BCF: checking proof for refinement\n");
+		err = check_goal(bcf_env, verifier_env->bcf.refine_cond);
+	}
+
+err_free:
+	kvfree(bcf_env->expr_idx_bitmap);
+	kvfree(bcf_env->exprs);
+	kvfree(bcf_env->steps);
+	kfree(bcf_env);
+	return err;
+}

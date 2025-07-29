@@ -1,0 +1,133 @@
+From c5948f0d270ac63d6cbbce739238807e019bd264 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Wed, 27 Nov 2024 10:34:53 +0100
+Subject: [PATCH 01/13] afl_printer: Make print letList channel specific
+
+We will add BCF channel in the following patches, which require letList
+as part of proof. So make printLetList Channel specific.
+
+Currently, only the out channel handles this. So add a virtual function
+in the most base class and make the default doing nothing, and then, in
+the out channel, override it. This function will be overrided by the BCF
+channel as well.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ src/proof/alf/alf_print_channel.cpp | 16 ++++++++++++++++
+ src/proof/alf/alf_print_channel.h   |  2 ++
+ src/proof/alf/alf_printer.cpp       | 22 ++--------------------
+ src/proof/alf/alf_printer.h         |  2 --
+ 4 files changed, 20 insertions(+), 22 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 8136f68561..1cef40eb42 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -172,6 +172,22 @@ void AlfPrintChannelOut::printTrustStep(ProofRule r,
+   printStepInternal("trust", n, i, premises, {nc}, false, true);
+ }
+ 
++void AlfPrintChannelOut::printLetList(LetBinding& lbind)
++{
++  std::vector<Node> letList;
++  lbind.letify(letList);
++  std::map<Node, size_t>::const_iterator it;
++  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
++  {
++    Node n = letList[i];
++    // use define command which does not invoke type checking
++    d_out << "(define " << d_termLetPrefix << lbind.getId(n);
++    d_out << " () ";
++    Printer::getPrinter(d_out)->toStream(d_out, n, &lbind, false);
++    d_out << ")" << std::endl;
++  }
++}
++
+ void AlfPrintChannelOut::printNodeInternal(std::ostream& out, Node n)
+ {
+   if (d_lbind)
+diff --git a/src/proof/alf/alf_print_channel.h b/src/proof/alf/alf_print_channel.h
+index 33af4df150..dd097df718 100644
+--- a/src/proof/alf/alf_print_channel.h
++++ b/src/proof/alf/alf_print_channel.h
+@@ -67,6 +67,7 @@ class AlfPrintChannel
+                               const std::vector<size_t>& premises,
+                               const std::vector<Node>& args,
+                               TNode conc) = 0;
++  virtual void printLetList(LetBinding& lbind) {};
+ };
+ 
+ /** Prints the proof to output stream d_out */
+@@ -92,6 +93,7 @@ class AlfPrintChannelOut : public AlfPrintChannel
+                       const std::vector<size_t>& premises,
+                       const std::vector<Node>& args,
+                       TNode conc) override;
++  void printLetList(LetBinding& lbind) override;
+ 
+   /**
+    * Print node to stream in the expected format of ALF.
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index 7a38281a37..d0b5a1a277 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -615,22 +615,6 @@ void AlfPrinter::printDslRule(std::ostream& out, ProofRewriteRule r)
+ 
+ LetBinding* AlfPrinter::getLetBinding() { return d_lbindUse; }
+ 
+-void AlfPrinter::printLetList(std::ostream& out, LetBinding& lbind)
+-{
+-  std::vector<Node> letList;
+-  lbind.letify(letList);
+-  std::map<Node, size_t>::const_iterator it;
+-  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
+-  {
+-    Node n = letList[i];
+-    // use define command which does not invoke type checking
+-    out << "(define " << d_termLetPrefix << lbind.getId(n);
+-    out << " () ";
+-    Printer::getPrinter(out)->toStream(out, n, &lbind, false);
+-    out << ")" << std::endl;
+-  }
+-}
+-
+ void AlfPrinter::print(std::ostream& out,
+                        std::shared_ptr<ProofNode> pfn,
+                        ProofScopeMode psm)
+@@ -709,7 +693,7 @@ void AlfPrinter::print(AlfPrintChannelOut& aout,
+         out << outDef.str();
+       }
+       // [3] print proof-level term bindings
+-      printLetList(out, d_lbind);
++      ao->printLetList(d_lbind);
+     }
+     // [4] print (unique) assumptions, including definitions
+     std::unordered_set<Node> processed;
+@@ -753,11 +737,9 @@ void AlfPrinter::printNext(AlfPrintChannelOut& aout,
+   const ProofNode* pnBody = pfn.get();
+   // print with letification
+   printProofInternal(&d_aletify, pnBody, false);
+-  // print the new let bindings
+-  std::ostream& out = aout.getOStream();
+   // Print new terms from the let binding. note that this should print only
+   // the terms we have yet to see so far.
+-  printLetList(out, d_lbind);
++  aout.printLetList(d_lbind);
+   // print the proof
+   printProofInternal(&aout, pnBody, true);
+ }
+diff --git a/src/proof/alf/alf_printer.h b/src/proof/alf/alf_printer.h
+index 03421d605d..bf474596fb 100644
+--- a/src/proof/alf/alf_printer.h
++++ b/src/proof/alf/alf_printer.h
+@@ -160,8 +160,6 @@ class AlfPrinter : protected EnvObj
+    * Allocate (if necessary) the identifier for step
+    */
+   size_t allocateProofId(const ProofNode* pn, bool& wasAlloc);
+-  /** Print let list to output stream out */
+-  void printLetList(std::ostream& out, LetBinding& lbind);
+   /** Reference to the term processor */
+   BaseAlfNodeConverter& d_tproc;
+   /** Assume id counter */
+-- 
+2.34.1
+

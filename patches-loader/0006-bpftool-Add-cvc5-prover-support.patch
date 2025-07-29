@@ -1,0 +1,421 @@
+From 013611f53265970277d45c45664d3ff0e375fb4d Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 19:33:08 +0100
+Subject: [PATCH 6/6] bpftool: Add cvc5 prover support
+
+If cvc5 is available, teach bpftool to register it into libbpf,
+and interact with the solver to generate proofs.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ tools/bpf/bpftool/Makefile |   9 +
+ tools/bpf/bpftool/bcf.c    | 327 +++++++++++++++++++++++++++++++++++++
+ tools/bpf/bpftool/bcf.h    |   8 +
+ tools/bpf/bpftool/prog.c   |   2 +
+ 4 files changed, 346 insertions(+)
+ create mode 100644 tools/bpf/bpftool/bcf.c
+ create mode 100644 tools/bpf/bpftool/bcf.h
+
+diff --git a/tools/bpf/bpftool/Makefile b/tools/bpf/bpftool/Makefile
+index a4263dfb5e03..576d2bcb8854 100644
+--- a/tools/bpf/bpftool/Makefile
++++ b/tools/bpf/bpftool/Makefile
+@@ -106,6 +106,7 @@ FEATURE_TESTS += libbfd-liberty
+ FEATURE_TESTS += libbfd-liberty-z
+ FEATURE_TESTS += disassembler-four-args
+ FEATURE_TESTS += disassembler-init-styled
++FEATURE_TESTS += cvc5_prover
+
+ FEATURE_DISPLAY := clang-bpf-co-re
+ FEATURE_DISPLAY += llvm
+@@ -113,6 +114,7 @@ FEATURE_DISPLAY += libcap
+ FEATURE_DISPLAY += libbfd
+ FEATURE_DISPLAY += libbfd-liberty
+ FEATURE_DISPLAY += libbfd-liberty-z
++FEATURE_DISPLAY += cvc5_prover
+
+ check_feat := 1
+ NON_CHECK_FEAT_TARGETS := clean uninstall doc doc-clean doc-install doc-uninstall
+@@ -137,6 +139,13 @@ CFLAGS += -DUSE_LIBCAP
+ LIBS += -lcap
+ endif
+
++ifeq ($(feature-cvc5_prover), 1)
++CFLAGS += -DUSE_CVC5_PROVER
++CFLAGS += -I{REPLACE_INC}
++LDFLAGS += -L{REPLACE_LIB}
++LIBS += -lcvc5
++endif
++
+ include $(wildcard $(OUTPUT)*.d)
+
+ all: $(OUTPUT)bpftool
+diff --git a/tools/bpf/bpftool/bcf.c b/tools/bpf/bpftool/bcf.c
+new file mode 100644
+index 000000000000..66e31041ce14
+--- /dev/null
++++ b/tools/bpf/bpftool/bcf.c
+@@ -0,0 +1,327 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++#include "bcf.h"
++
++#ifdef USE_CVC5_PROVER
++
++#include <assert.h>
++#include <malloc.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <errno.h>
++#include <linux/bpf.h>
++#include <linux/bcf.h>
++
++#include <bpf/libbpf.h>
++#include <cvc5/c/cvc5.h>
++
++struct bcf_expr_unary {
++	__u8 code;
++	__u8 vlen;
++	__u16 params;
++	__u32 arg0;
++};
++
++struct bcf_expr_binary {
++	__u8 code;
++	__u8 vlen;
++	__u16 params;
++	__u32 arg0;
++	__u32 arg1;
++};
++
++static const Cvc5Kind alu_op[16] = {
++	[0 ... 15] = CVC5_KIND_UNDEFINED_KIND,
++	// BPF_SDIV BPF_SMOD, BPF_MOV, BPF_END not contained
++	[BPF_ADD >> 4] = CVC5_KIND_BITVECTOR_ADD,
++	[BPF_SUB >> 4] = CVC5_KIND_BITVECTOR_SUB,
++	[BPF_MUL >> 4] = CVC5_KIND_BITVECTOR_MULT,
++	[BPF_DIV >> 4] = CVC5_KIND_BITVECTOR_UDIV,
++	[BPF_OR >> 4] = CVC5_KIND_BITVECTOR_OR,
++	[BPF_AND >> 4] = CVC5_KIND_BITVECTOR_AND,
++	[BPF_LSH >> 4] = CVC5_KIND_BITVECTOR_SHL,
++	[BPF_RSH >> 4] = CVC5_KIND_BITVECTOR_LSHR,
++	[BPF_NEG >> 4] = CVC5_KIND_BITVECTOR_NEG,
++	[BPF_MOD >> 4] = CVC5_KIND_BITVECTOR_UREM,
++	[BPF_XOR >> 4] = CVC5_KIND_BITVECTOR_XOR,
++	[BPF_ARSH >> 4] = CVC5_KIND_BITVECTOR_ASHR,
++};
++
++static const Cvc5Kind jmp_op[16] = {
++	[0 ... 15] = CVC5_KIND_UNDEFINED_KIND,
++	// BPF_JA BPF_CALL BPF_JSET
++	[BPF_JEQ >> 4] = CVC5_KIND_EQUAL,
++	[BPF_JGT >> 4] = CVC5_KIND_BITVECTOR_UGT,
++	[BPF_JGE >> 4] = CVC5_KIND_BITVECTOR_UGE,
++	[BPF_JNE >> 4] = CVC5_KIND_DISTINCT,
++	[BPF_JSGT >> 4] = CVC5_KIND_BITVECTOR_SGT,
++	[BPF_JSGE >> 4] = CVC5_KIND_BITVECTOR_SGE,
++	[BPF_JLT >> 4] = CVC5_KIND_BITVECTOR_ULT,
++	[BPF_JLE >> 4] = CVC5_KIND_BITVECTOR_ULE,
++	[BPF_JSLT >> 4] = CVC5_KIND_BITVECTOR_SLT,
++	[BPF_JSLE >> 4] = CVC5_KIND_BITVECTOR_SLE,
++	[BCF_BITOF >> 4] = CVC5_KIND_BITVECTOR_BIT,
++};
++
++static const Cvc5Kind bool_op[16] = {
++	[0 ... 15] = CVC5_KIND_UNDEFINED_KIND,
++
++	[BCF_CONJ >> 4] = CVC5_KIND_AND,	[BCF_DISJ >> 4] = CVC5_KIND_OR,
++	[BCF_IMPLIES >> 4] = CVC5_KIND_IMPLIES, [BCF_XOR >> 4] = CVC5_KIND_XOR,
++	[BCF_ITE >> 4] = CVC5_KIND_ITE,		[BCF_NOT >> 4] = CVC5_KIND_NOT,
++	[BCF_EQUIV >> 4] = CVC5_KIND_EQUAL,
++};
++
++static const Cvc5Kind bv_op[16] = {
++	[0 ... 15] = CVC5_KIND_UNDEFINED_KIND,
++	// BBT VAR VAL
++	[BCF_EXTRACT >> 4] = CVC5_KIND_BITVECTOR_EXTRACT,
++	[BCF_SIGN_EXTEND >> 4] = CVC5_KIND_BITVECTOR_SIGN_EXTEND,
++	[BCF_ZERO_EXTEND >> 4] = CVC5_KIND_BITVECTOR_ZERO_EXTEND,
++};
++
++struct bcf_context {
++	Cvc5TermManager *tm;
++	struct bcf_expr *exprs;
++	Cvc5Term *term_map;
++
++	Cvc5Sort bv32;
++	Cvc5Sort bv64;
++};
++
++static Cvc5Term to_cvc5_term(struct bcf_context *ctx, __u32 idx);
++
++static Cvc5Term mk_binary(struct bcf_context *ctx, Cvc5Kind op,
++			  struct bcf_expr_binary *expr)
++{
++	Cvc5Term args[2];
++
++	args[0] = to_cvc5_term(ctx, expr->arg0);
++	args[1] = to_cvc5_term(ctx, expr->arg1);
++	return cvc5_mk_term(ctx->tm, op, 2, args);
++}
++
++#define DEBUGF printf
++#define ABORT printf
++
++static Cvc5Term to_cvc5_term(struct bcf_context *ctx, __u32 idx)
++{
++	struct bcf_expr *expr = &ctx->exprs[idx];
++	struct bcf_expr_unary *unary = (void *)expr;
++	struct bcf_expr_binary *binary = (void *)expr;
++	Cvc5TermManager *tm = ctx->tm;
++	int class = BPF_CLASS(expr->code);
++	int op = BPF_OP(expr->code);
++	Cvc5Kind kind;
++	Cvc5Term ret;
++
++	if (ctx->term_map[idx])
++		return ctx->term_map[idx];
++
++	switch (class) {
++	case BCF_BV_PRED: {
++		kind = jmp_op[op >> 4];
++		ret = mk_binary(ctx, kind, binary);
++		break;
++	}
++
++	case BCF_BV_ALU: {
++		__u32 op_idx[2];
++		Cvc5Op cvc5_op;
++		Cvc5Term t0;
++
++		if (BPF_SRC(expr->code) != BCF_EXT) {
++			kind = alu_op[op >> 4];
++			if (op == BPF_NEG || op == BPF_END)
++				return NULL;
++			ret = mk_binary(ctx, kind, binary);
++		} else if (op == BCF_BV_VAR) {
++			ret = cvc5_mk_const(tm,
++					    (__u8)expr->params == 32 ?
++						    ctx->bv32 :
++						    ctx->bv64,
++					    NULL);
++		} else if (op == BCF_BV_VAL) {
++			u64 val;
++
++			if (expr->vlen == 1)
++				val = unary->arg0;
++			else if (expr->vlen == 2) {
++				val = binary->arg0;
++				val |= (u64)binary->arg1 << 32;
++			} else
++				return NULL;
++
++			ret = cvc5_mk_bv_uint64(tm, (__u8)expr->params, val);
++
++		} else if (op == BCF_EXTRACT) {
++			kind = bv_op[op >> 4];
++			op_idx[0] = expr->params >> 8;
++			op_idx[1] = (__u8)expr->params;
++
++			cvc5_op = cvc5_mk_op(tm, kind, 2, op_idx);
++			t0 = to_cvc5_term(ctx, unary->arg0);
++			ret = cvc5_mk_term_from_op(tm, cvc5_op, 1, &t0);
++
++		} else if (op == BCF_SIGN_EXTEND || op == BCF_ZERO_EXTEND) {
++			kind = bv_op[op >> 4];
++			op_idx[0] = expr->params >> 8;
++
++			cvc5_op = cvc5_mk_op(tm, kind, 1, op_idx);
++			t0 = to_cvc5_term(ctx, unary->arg0);
++			ret = cvc5_mk_term_from_op(tm, cvc5_op, 1, &t0);
++		} else
++			return NULL;
++		break;
++	}
++
++	case BCF_BOOL_PRED: {
++		Cvc5Term *vargs;
++		int i;
++
++		kind = bool_op[op >> 4];
++		if (op != BCF_CONJ && op != BCF_DISJ)
++			return NULL;
++
++		vargs = malloc(sizeof(Cvc5Term) * expr->vlen);
++		if (!vargs)
++			return NULL;
++
++		for (i = 0; i < expr->vlen; i++)
++			vargs[i] = to_cvc5_term(ctx, expr->args[i]);
++
++		ret = cvc5_mk_term(tm, kind, expr->vlen, vargs);
++		free(vargs);
++
++		break;
++	}
++
++	default:
++		return NULL;
++	}
++
++	ctx->term_map[idx] = ret;
++	return ret;
++}
++
++static int prove_cond(__u32 *bcf_buf, __u32 bcf_buf_size,
++		      __u32 *bcf_buf_true_size, __u32 root_idx)
++{
++	Cvc5TermManager *tm = cvc5_term_manager_new();
++	Cvc5 *slv = cvc5_new(tm);
++	struct bcf_expr *exprs = (void *)bcf_buf;
++	struct bcf_proof_header bcf_hdr;
++	size_t expr_size, step_size;
++	struct bcf_context ctx;
++	const Cvc5Proof *proof;
++	const __u32 *proof_data;
++	size_t proof_size;
++	__u32 expr_cnt;
++	Cvc5Result result;
++	Cvc5Term cond;
++	int ret;
++
++	cvc5_set_logic(slv, "QF_BV");
++	cvc5_set_option(slv, "produce-proofs", "true");
++	cvc5_set_option(slv, "proof-granularity", "dsl-rewrite");
++	cvc5_set_option(slv, "bv-print-consts-as-indexed-symbols", "true");
++
++	expr_cnt = *bcf_buf_true_size / sizeof(struct bcf_expr);
++	ctx.tm = tm;
++	ctx.exprs = exprs;
++	ctx.term_map = malloc(expr_cnt * sizeof(Cvc5Term));
++	if (!ctx.term_map)
++		return -ENOMEM;
++	memset(ctx.term_map, 0, (expr_cnt * sizeof(Cvc5Term)));
++	ctx.bv32 = cvc5_mk_bv_sort(tm, 32);
++	ctx.bv64 = cvc5_mk_bv_sort(tm, 64);
++
++	ret = -EFAULT;
++	cond = to_cvc5_term(&ctx, root_idx);
++	if (!cond)
++		goto err_free;
++	DEBUGF("term: %s\n", cvc5_term_to_string(cond));
++
++	cvc5_assert_formula(slv, cond);
++	result = cvc5_check_sat(slv);
++
++	DEBUGF("result: %s\n", cvc5_result_to_string(result));
++
++	ret = -EINVAL;
++	if (!cvc5_result_is_unsat(result))
++		goto err_free;
++
++	ret = -EFAULT;
++	proof = cvc5_get_proof(slv, CVC5_PROOF_COMPONENT_FULL, &proof_size);
++	if (!proof || proof_size == 0)
++		goto err_free;
++
++	proof_data = cvc5_proof_to_bcf(slv, *proof, &expr_size, &step_size);
++	if (!expr_size || !step_size || !proof_data)
++		goto err_free;
++
++	proof_size = (expr_size + step_size) * sizeof(__u32);
++	*bcf_buf_true_size = proof_size + sizeof(bcf_hdr);
++	if (*bcf_buf_true_size > bcf_buf_size)
++		return -E2BIG;
++
++	bcf_hdr.magic = BCF_MAGIC;
++	bcf_hdr.expr_cnt = expr_size;
++	bcf_hdr.step_cnt = step_size;
++	memcpy(bcf_buf, &bcf_hdr, sizeof(bcf_hdr));
++	memcpy((char *)bcf_buf + sizeof(bcf_hdr), proof_data, proof_size);
++	ret = 0;
++
++err_free:
++	free(ctx.term_map);
++	cvc5_delete(slv);
++	cvc5_term_manager_delete(tm);
++	return ret;
++}
++
++static int cvc5_prover(__u32 *bcf_buf, __u32 bcf_buf_size,
++		       __u32 *bcf_buf_true_size, __u32 *bcf_flags)
++{
++	__u32 expr_size = *bcf_buf_true_size / sizeof(struct bcf_expr);
++	__s32 path_cond, refine_cond;
++	int err;
++
++	refine_cond = bcf_buf[expr_size - 1];
++	path_cond = bcf_buf[expr_size - 2];
++	if (refine_cond < 0 && path_cond < 0)
++		return -EINVAL;
++
++	if (refine_cond >= 0) {
++		err = prove_cond(bcf_buf, bcf_buf_size, bcf_buf_true_size,
++				 refine_cond);
++
++		if (!err) {
++			*bcf_flags = 0;
++			return 0;
++		}
++	}
++
++	if (path_cond >= 0) {
++		err = prove_cond(bcf_buf, bcf_buf_size, bcf_buf_true_size,
++				 path_cond);
++		if (!err) {
++			*bcf_flags = BCF_F_PROOF_PATH_UNREACHABLE;
++			return 0;
++		}
++	}
++
++	return err;
++}
++
++void bcf_set_prover(void)
++{
++	libbpf_set_prover(cvc5_prover);
++}
++
++#else
++
++void bcf_set_prover(void)
++{
++	return;
++}
++
++#endif
+diff --git a/tools/bpf/bpftool/bcf.h b/tools/bpf/bpftool/bcf.h
+new file mode 100644
+index 000000000000..c20c93e98987
+--- /dev/null
++++ b/tools/bpf/bpftool/bcf.h
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++
++#ifndef __BPF_TOOL_BCF_H
++#define __BPF_TOOL_BCF_H
++
++void bcf_set_prover(void);
++
++#endif /* __BPF_TOOL_CFG_H */
+diff --git a/tools/bpf/bpftool/prog.c b/tools/bpf/bpftool/prog.c
+index e71be67f1d86..e35844dff581 100644
+--- a/tools/bpf/bpftool/prog.c
++++ b/tools/bpf/bpftool/prog.c
+@@ -34,6 +34,7 @@
+ #include "cfg.h"
+ #include "main.h"
+ #include "xlated_dumper.h"
++#include "bcf.h"
+
+ #define BPF_METADATA_PREFIX "bpf_metadata_"
+ #define BPF_METADATA_PREFIX_LEN (sizeof(BPF_METADATA_PREFIX) - 1)
+@@ -2529,5 +2530,6 @@ static const struct cmd cmds[] = {
+
+ int do_prog(int argc, char **argv)
+ {
++	bcf_set_prover();
+ 	return cmd_select(cmds, argc, argv, do_help);
+ }
+--
+2.34.1
+

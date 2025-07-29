@@ -1,0 +1,120 @@
+From 096821a53cba6e02c97980e377dcb9183eacf3a8 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 15:00:10 +0100
+Subject: [PATCH 23/32] bpf: Perform proof check before resuming env
+
+Perform the actual proof check before resuming the verifier env. This ensures
+the refinement is sound, and continuing the analysis is safe.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  2 ++
+ kernel/bpf/bcf.c             |  8 ++++----
+ kernel/bpf/verifier.c        | 31 +++++++++++++++++++++++++++++++
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index b9bc4cbb6f79..b4c8950753df 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -718,6 +718,8 @@ struct bcf_state {
+ 	u32 cur_jmp_entry;	/* the current jump history entry followed */
+ 	bool available;		/* if bcf buf is provided */
+ 	atomic_t in_use;	/* the current env is in use */
++
++	bool path_unreachable;	/* the current path proved to be unreachable */
+ };
+
+ /* single container for all structs
+diff --git a/kernel/bpf/bcf.c b/kernel/bpf/bcf.c
+index ff83d7b1db42..41020787d278 100644
+--- a/kernel/bpf/bcf.c
++++ b/kernel/bpf/bcf.c
+@@ -2215,6 +2215,9 @@ static int check_goal(struct bcf_checker_env *env, int goal_idx)
+ 	int err;
+
+ 	pr_debug("checking goal\n");
++	if (goal_idx < 0)
++		return -EINVAL;
++
+ 	venv = env->verifier_env;
+ 	exprs0 = venv->bcf.exprs;
+ 	goal = exprs0 + goal_idx;
+@@ -2226,6 +2229,7 @@ static int check_goal(struct bcf_checker_env *env, int goal_idx)
+ 	err = ___expr_equiv(env, exprs0, goal, exprs1, proved, &map);
+ 	if (err < 0)
+ 		return err;
++	pr_debug("goal: %s\n", err == 1 ? "proved" : "not proved");
+
+ 	return err == 1 ? 0 : -EINVAL;
+ }
+@@ -2270,10 +2274,6 @@ int bcf_check_proof(struct bpf_verifier_env *verifier_env, union bpf_attr *attr,
+ 	u32 expr_size, step_size;
+ 	int err;
+
+-	if ((attr->bcf_flags & BCF_F_PROOF_PATH_UNREACHABLE) &&
+-	    verifier_env->bcf.path_cond < 0)
+-		return -EINVAL;
+-
+ 	err = check_hdr(&hdr, attr, bcf_buf);
+ 	if (err < 0)
+ 		return err;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 7823d90a79e2..d66fef8f5d70 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19244,6 +19244,11 @@ static int do_check(struct bpf_verifier_env *env)
+ 				return err;
+ 		}
+
++		if (env->bcf.path_unreachable) {
++			env->bcf.path_unreachable = false;
++			goto process_bpf_exit;
++		}
++
+ 		if (bcf_requested(env)) {
+ 			int path = bcf_match_path(env);
+
+@@ -22861,6 +22866,27 @@ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ 	return err;
+ }
+
++static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
++		      bpfptr_t uattr)
++{
++	int err;
++
++	err = bcf_check_proof(env, attr, uattr);
++	if (err)
++		return err;
++
++	unmark_bcf_requested(env);
++	if (attr->bcf_flags & BCF_F_PROOF_PATH_UNREACHABLE) {
++		env->bcf.path_unreachable = true;
++	}
++
++	/* drop the last history entry */
++	if (is_jmp_point(env, env->insn_idx))
++		env->cur_state->insn_hist_end--;
++
++	return 0;
++}
++
+ /* release the verifier env */
+ static int bcf_release(struct inode *inode, struct file *filp)
+ {
+@@ -23771,6 +23797,11 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	if (ret < 0)
+ 		goto skip_full_check;
+ verifier_check:
++	if (resume) {
++		ret = resume_env(env, attr, uattr);
++		if (ret)
++			goto skip_full_check;
++	}
+ 	ret = do_check_main(env);
+ 	ret = ret ?: do_check_subprogs(env);
+
+--
+2.34.1
+

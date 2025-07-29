@@ -1,0 +1,61 @@
+From b305a887abffe0dc2ac55e713d826328844bdf94 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 09:42:28 +0100
+Subject: [PATCH 16/32] bpf: Make do_check_subprogs() resumable
+
+Update `do_check_subprogs()` to support resuming verification from
+a previously saved `bpf_verifier_env`, allowing the verifier to
+continue checking subprograms starting from the last analyzed state.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  1 +
+ kernel/bpf/verifier.c        | 13 ++++++++++---
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index a0116c725bd8..6203a1e3a06e 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -802,6 +802,7 @@ struct bpf_verifier_env {
+ 	/* buffer used to temporary hold constants as scalar registers */
+ 	struct bpf_reg_state fake_reg[2];
+ 	struct bcf_state bcf;
++	u32 subprog;	/* subprog being verified */
+ 	/* buffer used to generate temporary string representations,
+ 	 * e.g., in reg_type_str() to generate reg_type string
+ 	 */
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index baefbe41987e..32d6091608a3 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -22891,7 +22891,11 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
+
+ again:
+ 	new_cnt = 0;
+-	for (i = 1; i < env->subprog_cnt; i++) {
++	/* If we have cur_state in env, we are resuming the last check,
++	 * starting from the recorded subprog in this case.
++	 */
++	i = env->cur_state ? env->subprog : 1;
++	for (; i < env->subprog_cnt; i++) {
+ 		if (!subprog_is_global(env, i))
+ 			continue;
+
+@@ -22899,8 +22903,11 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
+ 		if (!sub_aux->called || sub_aux->verified)
+ 			continue;
+
+-		env->insn_idx = env->subprog_info[i].start;
+-		WARN_ON_ONCE(env->insn_idx == 0);
++		if (!env->cur_state) {
++			env->insn_idx = env->subprog_info[i].start;
++			WARN_ON_ONCE(env->insn_idx == 0);
++		}
++		env->subprog = i;
+ 		ret = do_check_common(env, i);
+ 		if (ret) {
+ 			return ret;
+--
+2.34.1
+

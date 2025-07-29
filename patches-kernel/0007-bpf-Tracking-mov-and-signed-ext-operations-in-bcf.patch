@@ -1,0 +1,137 @@
+From 7b50c1d60dcc1f102c27a8d7d5fb06724b4f9c86 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 11:46:04 +0100
+Subject: [PATCH 07/32] bpf: Tracking mov and signed-ext operations
+
+Add routines to track mov and signed-ext operations in BCF. The bcf_sx()
+is used to track the signed-ext operation, and the bcf_mov32() is used
+to track the mov operation.
+
+Full BPF_MOV is not actually a computation, but partial moves are and they
+correspond to the extract operation of bitvec. The signed-ext is handled
+similarly, using BCF_BV_SEXT.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 74 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 1e8005e88b49..2cac69849642 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -4873,6 +4873,10 @@ static bool __is_pointer_value(bool allow_ptr_leaks,
+ static void assign_scalar_id_before_mov(struct bpf_verifier_env *env,
+ 					struct bpf_reg_state *src_reg)
+ {
++	/* bind a bcf expr to reg */
++	if (!tnum_is_const(src_reg->var_off))
++		bcf_reg_expr(env, src_reg, false);
++
+ 	if (src_reg->type != SCALAR_VALUE)
+ 		return;
+
+@@ -13395,6 +13399,58 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 	return 0;
+ }
+
++static int bcf_sx(struct bpf_verifier_env *env, struct bpf_reg_state *dst_reg,
++		  struct bpf_reg_state *src_reg, int sz, bool bit32)
++{
++	struct bcf_expr_unary ext;
++	struct bcf_expr *expr;
++	int src_expr, ext_sz;
++	bool expr32 = false;
++
++	if (!bcf_requested(env))
++		return 0;
++
++	src_expr = bcf_reg_expr(env, src_reg, false);
++	if (src_expr < 0)
++		return src_expr;
++	expr = env->bcf.exprs + src_expr;
++	if (is_zext_32_to_64(expr) || is_sext_32_to_64(expr)) {
++		src_expr = expr->args[0];
++		expr32 = true;
++	}
++
++	if (sz != 32 || !expr32) {
++		ext = BCF_BV_EXTRACT(sz, src_expr);
++		src_expr = bcf_add_expr_unary(env, ext);
++		if (src_expr < 0)
++			return src_expr;
++	}
++
++	if (sz != 32) {
++		ext_sz = 32 - sz;
++		ext = BCF_BV_SEXT(ext_sz, 32, src_expr);
++		dst_reg->bcf_expr = bcf_add_expr_unary(env, ext);
++	}
++
++	if (bit32)
++		bcf_zext_32_to_64(env, dst_reg);
++	else
++		bcf_sext_32_to_64(env, dst_reg);
++	return dst_reg->bcf_expr < 0 ? dst_reg->bcf_expr : 0;
++}
++
++static int bcf_mov32(struct bpf_verifier_env *env,
++		     struct bpf_reg_state *dst_reg,
++		     struct bpf_reg_state *src_reg)
++{
++	if (!bcf_requested(env))
++		return 0;
++
++	dst_reg->bcf_expr = bcf_reg_expr(env, src_reg, true);
++	bcf_zext_32_to_64(env, dst_reg);
++	return dst_reg->bcf_expr < 0 ? dst_reg->bcf_expr : 0;
++}
++
+ static bool check_reg_sane_offset(struct bpf_verifier_env *env,
+ 				  const struct bpf_reg_state *reg,
+ 				  enum bpf_reg_type type)
+@@ -14910,8 +14966,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 						if (no_sext)
+ 							assign_scalar_id_before_mov(env, src_reg);
+ 						copy_register_state(dst_reg, src_reg);
+-						if (!no_sext)
++						if (!no_sext) {
+ 							dst_reg->id = 0;
++							err = bcf_sx(env, dst_reg, src_reg, insn->off, false);
++							if (err)
++								return err;
++						}
+ 						coerce_reg_to_size_sx(dst_reg, insn->off >> 3);
+ 						dst_reg->live |= REG_LIVE_WRITTEN;
+ 						dst_reg->subreg_def = DEF_NOT_SUBREG;
+@@ -14937,8 +14997,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 						 * range otherwise dst_reg min/max could be incorrectly
+ 						 * propagated into src_reg by sync_linked_regs()
+ 						 */
+-						if (!is_src_reg_u32)
++						if (!is_src_reg_u32) {
+ 							dst_reg->id = 0;
++							err = bcf_mov32(env, dst_reg, src_reg);
++							if (err)
++								return err;
++						}
+ 						dst_reg->live |= REG_LIVE_WRITTEN;
+ 						dst_reg->subreg_def = env->insn_idx + 1;
+ 					} else {
+@@ -14948,8 +15012,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 						if (no_sext)
+ 							assign_scalar_id_before_mov(env, src_reg);
+ 						copy_register_state(dst_reg, src_reg);
+-						if (!no_sext)
++						if (!no_sext) {
+ 							dst_reg->id = 0;
++							err = bcf_sx(env, dst_reg, src_reg, insn->off, true);
++							if (err)
++								return err;
++						}
+ 						dst_reg->live |= REG_LIVE_WRITTEN;
+ 						dst_reg->subreg_def = env->insn_idx + 1;
+ 						coerce_subreg_to_size_sx(dst_reg, insn->off >> 3);
+--
+2.34.1
+

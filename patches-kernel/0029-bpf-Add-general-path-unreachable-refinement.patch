@@ -1,0 +1,153 @@
+From 77e00193e06d7010ca687c18d80e853ede43da49 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Thu, 27 Feb 2025 09:20:03 +0100
+Subject: [PATCH 29/32] bpf: Add general path unreachable refinement
+
+For other error locations, add a general path unreachable refinement routine.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 66 ++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 53 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 4fa4c6fa9cf3..43c133992623 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1803,6 +1803,18 @@ typedef int (*do_refine_state_fn)(struct bpf_verifier_env *env, void *ctx);
+ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ 		      do_refine_state_fn refine_cb, void *ctx);
+
++static void bcf_prove_unreachable(struct bpf_verifier_env *env)
++{
++	int err;
++
++	if (bcf_requested(env))
++		return;
++
++	err = bcf_refine(env, 0, NULL, NULL);
++	if (!err)
++		verbose(env, "bcf requested, try to prove the path unreachable\n");
++}
++
+ static int bcf_alloc_exprs(struct bpf_verifier_env *env, int cnt)
+ {
+ 	struct bcf_state *bcf = &env->bcf;
+@@ -3724,8 +3736,12 @@ static int check_reg_arg(struct bpf_verifier_env *env, u32 regno,
+ {
+ 	struct bpf_verifier_state *vstate = env->cur_state;
+ 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
++	int err;
+
+-	return __check_reg_arg(env, state->regs, regno, t);
++	err = __check_reg_arg(env, state->regs, regno, t);
++	if (err == -EACCES)
++		bcf_prove_unreachable(env);
++	return err;
+ }
+
+ static int insn_stack_access_flags(int frameno, int spi)
+@@ -5015,14 +5031,20 @@ static int bcf_refine_access_bound(struct bpf_verifier_env *env, int regno,
+ 	struct bpf_reg_state *regs = cur_regs(env);
+ 	struct bcf_state *bcf = &env->bcf;
+ 	u32 reg_masks = 0;
++	bool size_const, ptr_const;
+
+ 	ctx.ptr_reg = regs + regno;
+-	if (!tnum_is_const(ctx.ptr_reg->var_off))
++	ptr_const = tnum_is_const(ctx.ptr_reg->var_off);
++	size_const = true;
++	if (bcf->size_regno > 0)
++		size_const = tnum_is_const(regs[bcf->size_regno].var_off);
++	if (ptr_const && size_const)
++		return bcf_refine(env, 0, NULL, NULL); /* prove unreachable */
++
++	if (!ptr_const)
+ 		reg_masks |= 1 << regno;
+-	if (bcf->size_regno > 0) {
+-		if (!tnum_is_const(regs[bcf->size_regno].var_off))
+-			reg_masks |= 1 << bcf->size_regno;
+-	}
++	if (bcf->size_regno > 0)
++		reg_masks |= 1 << bcf->size_regno;
+
+ 	return bcf_refine(env, reg_masks, __bcf_refine_access_bound, &ctx);
+ }
+@@ -7616,7 +7638,7 @@ static bool get_func_retval_range(struct bpf_prog *prog,
+  * if t==write && value_regno==-1, some unknown value is stored into memory
+  * if t==read && value_regno==-1, don't care what we read from memory
+  */
+-static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regno,
++static int do_check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regno,
+ 			    int off, int bpf_size, enum bpf_access_type t,
+ 			    int value_regno, bool strict_alignment_once, bool is_ldsx)
+ {
+@@ -7864,6 +7886,20 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
+ 	return err;
+ }
+
++static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regno,
++	int off, int bpf_size, enum bpf_access_type t,
++	int value_regno, bool strict_alignment_once, bool is_ldsx)
++{
++	int err;
++
++	err = do_check_mem_access(env, insn_idx, regno, off, bpf_size, t, value_regno,
++			    strict_alignment_once, is_ldsx);
++	if (err == -EACCES)
++		bcf_prove_unreachable(env);
++
++	return err;
++}
++
+ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type type,
+ 			     bool allow_trust_mismatch);
+
+@@ -19442,6 +19478,11 @@ static int do_check(struct bpf_verifier_env *env)
+ 		insn = &insns[env->insn_idx];
+ 		class = BPF_CLASS(insn->code);
+
++		if (env->bcf.path_unreachable) {
++			env->bcf.path_unreachable = false;
++			goto process_bpf_exit;
++		}
++
+ 		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
+ 			verbose(env,
+ 				"BPF program is too large. Processed %d insn\n",
+@@ -19476,11 +19517,6 @@ static int do_check(struct bpf_verifier_env *env)
+ 				return err;
+ 		}
+
+-		if (env->bcf.path_unreachable) {
+-			env->bcf.path_unreachable = false;
+-			goto process_bpf_exit;
+-		}
+-
+ 		if (bcf_requested(env)) {
+ 			int path = bcf_match_path(env);
+
+@@ -19668,6 +19704,8 @@ static int do_check(struct bpf_verifier_env *env)
+ 				} else {
+ 					err = check_helper_call(env, insn, &env->insn_idx);
+ 				}
++				if (err == -EACCES)
++					bcf_prove_unreachable(env);
+ 				if (err)
+ 					return err;
+
+@@ -19732,8 +19770,10 @@ static int do_check(struct bpf_verifier_env *env)
+ 				}
+
+ 				err = check_return_code(env, BPF_REG_0, "R0");
+-				if (err)
++				if (err) {
++					bcf_prove_unreachable(env);
+ 					return err;
++				}
+ process_bpf_exit:
+ 				mark_verifier_state_scratched(env);
+ 				update_branch_counts(env, env->cur_state);
+--
+2.34.1
+

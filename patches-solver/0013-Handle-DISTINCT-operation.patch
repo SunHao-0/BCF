@@ -1,0 +1,84 @@
+From a3c937a63cfe53c0178912fb3d46bad42c27536d Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Thu, 27 Feb 2025 19:22:54 +0100
+Subject: [PATCH 13/13] Handle DISTINCT operation
+
+Handle DISTINCT operation.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ src/proof/alf/alf_print_channel.cpp | 29 +++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 0feeb97cda..059762ce9e 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -192,16 +192,16 @@ void AlfPrintChannelOut::printLetList(LetBinding& lbind)
+   bcf.printLetList(lbind);
+   std::vector<Node> letList;
+   lbind.letify(letList);
+-  std::map<Node, size_t>::const_iterator it;
+-  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
+-  {
+-    Node n = letList[i];
+-    // use define command which does not invoke type checking
+-    d_out << "(define " << d_termLetPrefix << lbind.getId(n);
+-    d_out << " () ";
+-    Printer::getPrinter(d_out)->toStream(d_out, n, &lbind, false);
+-    d_out << ")" << std::endl;
+-  }
++  // std::map<Node, size_t>::const_iterator it;
++  // for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
++  // {
++  //   Node n = letList[i];
++  //   // use define command which does not invoke type checking
++  //   d_out << "(define " << d_termLetPrefix << lbind.getId(n);
++  //   d_out << " () ";
++  //   Printer::getPrinter(d_out)->toStream(d_out, n, &lbind, false);
++  //   d_out << ")" << std::endl;
++  // }
+ }
+
+ std::ostream& AlfPrintChannelOut::getOStream() { return d_out; }
+@@ -437,6 +437,8 @@ void AlfPrintChannelBCF::encodeExpr(Node op,
+       {Kind::BITVECTOR_ULE, BCF_BV_PRED | BPF_JLE},
+       {Kind::BITVECTOR_SLT, BCF_BV_PRED | BPF_JSLT},
+       {Kind::BITVECTOR_SLE, BCF_BV_PRED | BPF_JSLE},
++      {Kind::DISTINCT, BCF_BV_PRED | BPF_JNE},
++
+       /* TODO not sure about the differences between this and bv constant */
+       {Kind::CONST_BITVECTOR_SYMBOLIC, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL},
+
+@@ -564,6 +566,7 @@ void AlfPrintChannelBCF::encodeExpr(Node op,
+     case Kind::BITVECTOR_ULE:
+     case Kind::BITVECTOR_SLT:
+     case Kind::BITVECTOR_SLE:
++    case Kind::DISTINCT:
+       Assert(expr->vlen == 2);
+       Assert(!expr->params);
+       Assert(args[0].getType().isBitVector());
+@@ -870,7 +873,8 @@ void AlfPrintChannelBCF::printStep(ProofRule r,
+   auto it = rule_table.find(r);
+   if (it == rule_table.end() || trust)
+   {
+-    if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
++    // if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
++    d_trusted.insert(r);
+     code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
+   } else {
+     code = it->second;
+@@ -896,7 +900,8 @@ void AlfPrintChannelBCF::printTrustStep(ProofRule r,
+
+   if (!d_ok) return;
+
+-  if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
++  // if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
++  d_trusted.insert(r);
+
+   encodeStep(code, r, n, i, premises, args, step);
+   addStep(step);
+--
+2.34.1
+

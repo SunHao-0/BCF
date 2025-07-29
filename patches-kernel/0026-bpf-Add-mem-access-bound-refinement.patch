@@ -1,0 +1,288 @@
+From 43ffae361b510f5ff4dd3491f91f8aba1ec68166 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 15:50:57 +0100
+Subject: [PATCH 26/32] bpf: Add mem access bound refinement
+
+Add the general mem access bound refinement routine. It refines the offset
+range based on the memory size, emits the refinement condition using the
+associated bcf_expr the refined range.
+
+The routine is applied to the stack access, and the stack pointer offset
+is refined based on the stack size.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |   4 +
+ kernel/bpf/verifier.c        | 219 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 219 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index ba98d75ff287..53224590d627 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -724,6 +724,10 @@ struct bcf_state {
+ 	atomic_t in_use;	/* the current env is in use */
+
+ 	bool path_unreachable;	/* the current path proved to be unreachable */
++	/* mem size reg refinement related */
++	u32 real_size;
++	u32 checked_regno;
++	int size_regno;
+ };
+
+ /* single container for all structs
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 4dfd8812b644..9e6204bf9b67 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -4828,6 +4828,205 @@ static int mark_chain_precision_batch(struct bpf_verifier_env *env)
+ 	return __mark_chain_precision(env, -1);
+ }
+
++struct bcf_mem_access_refine_ctx {
++	struct bpf_reg_state *ptr_reg;
++	s32 off;
++	s32 lower_bound;
++	s32 higher_bound;
++	u32 access_size;
++};
++
++/* Build the refinement condition for `access`, if the access is proved to be
++ * safe, refine size_reg or ptr_reg accordingly.
++ */
++static int __bcf_refine_access_bound(struct bpf_verifier_env *env, void *access)
++{
++	struct bcf_mem_access_refine_ctx *ctx = access;
++	struct bpf_reg_state *size_reg, tmp_reg = { 0 };
++	struct bpf_reg_state *ptr_reg = ctx->ptr_reg;
++	struct bpf_reg_state *regs = cur_regs(env);
++	struct bcf_state *bcf = &env->bcf;
++	int size_expr, off_expr, refine_cond;
++	int low_expr = -1, high_expr = -1;
++	bool ptr_const, size_const;
++	s32 off = ctx->off;
++	s64 min_off, max_off;
++	bool bit32 = false; /* 32bits optimization */
++
++	pr_info("refining mem access, size_reg %d, off %d, size %d, bound: [%d, %d)\n",
++		bcf->size_regno, off, ctx->access_size, ctx->lower_bound,
++		ctx->higher_bound);
++
++	__mark_reg_known(&tmp_reg, ctx->access_size);
++	tmp_reg.type = SCALAR_VALUE;
++	size_reg = &tmp_reg;
++	if (bcf->size_regno > 0)
++		size_reg = regs + bcf->size_regno;
++	if (size_reg->type != SCALAR_VALUE)
++		return -EFAULT;
++
++	/* If both are const, then no refine_cond, but only path_cond */
++	ptr_const = tnum_is_const(ptr_reg->var_off);
++	size_const = tnum_is_const(size_reg->var_off);
++	if (ptr_const && size_const)
++		return 0;
++
++	/* Over-approximation for lower bound means smaller size or offset,
++	 * hence, if off or off + umin_size already oob, then no refine_cond.
++	 */
++	min_off = off + ptr_reg->smin_value;
++	max_off = off + ptr_reg->smax_value;
++	pr_info("min_off: %lld, max_off: %lld, min_off_size: %lld\n", min_off,
++		max_off, min_off + size_reg->umin_value);
++	if (min_off >= ctx->higher_bound || max_off < ctx->lower_bound ||
++	    min_off + size_reg->smin_value > ctx->higher_bound)
++		return 0;
++
++	/* Safe bound, misuse */
++	if (max_off + size_reg->umax_value <= ctx->higher_bound &&
++	    min_off >= ctx->lower_bound)
++		return -EFAULT;
++
++	pr_info("Basic check okay\n");
++
++	off_expr = ptr_reg->bcf_expr;
++	size_expr = size_reg->bcf_expr;
++	if ((fit_u32(ptr_reg) || fit_s32(ptr_reg)) &&
++	    (fit_u32(size_reg) || fit_s32(size_reg))) {
++		off_expr = bcf_expr32(env, off_expr);
++		size_expr = bcf_expr32(env, size_expr);
++		bit32 = true;
++	}
++	pr_info("off expr %d, size expr %d, bits %s\n", off_expr, size_expr,
++		bit32 ? "32" : "64");
++
++	if (ptr_const) { /* refine the size range */
++		pr_info("off const\n");
++		if (size_expr < 0)
++			return -EFAULT;
++
++		/* prove `off + size > higher_bound` unsatisfiable */
++		off += ptr_reg->var_off.value;
++		bcf->refine_cond = bcf_add_pred(env, BPF_JGT, size_expr,
++					   ctx->higher_bound - off, bit32);
++		if (bcf->refine_cond < 0)
++			return bcf->refine_cond;
++
++		/* umax + off <= higher holds after proof */
++		size_reg->umax_value = ctx->higher_bound - off;
++		reg_bounds_sync(size_reg);
++
++	} else if (size_const) { /* refine the ptr off */
++		pr_info("size const\n");
++		if (off_expr < 0)
++			return -EFAULT;
++
++		high_expr = bcf_add_pred(
++			env, BPF_JSGT, off_expr,
++			ctx->higher_bound - ctx->access_size - off, bit32);
++		if (high_expr < 0)
++			return high_expr;
++
++		/* if the verifier already knows the lower bound is safe, then
++		 * don't emit this in the formula.
++		 */
++		refine_cond = high_expr;
++		if (min_off < ctx->lower_bound) {
++			struct bcf_expr_binary disj;
++
++			low_expr = bcf_add_pred(env, BPF_JSLT, off_expr,
++						ctx->lower_bound - off, bit32);
++			if (low_expr < 0)
++				return low_expr;
++
++			disj = BCF_BOOL_EXPR(BCF_DISJ, low_expr, high_expr);
++			refine_cond = bcf_add_expr(env, disj);
++			if (refine_cond < 0)
++				return refine_cond;
++		}
++		bcf->refine_cond = refine_cond;
++
++		/* refine the ptr reg */
++		if (min_off < ctx->lower_bound)
++			ptr_reg->smin_value = ctx->lower_bound - off;
++		if (max_off + ctx->access_size > ctx->higher_bound)
++			ptr_reg->smax_value =
++				ctx->higher_bound - off - ctx->access_size;
++		reg_bounds_sync(ptr_reg);
++
++	} else { /* prove var off with var size is safe */
++		struct bcf_expr_binary off_add;
++
++		pr_info("var off with var size\n");
++		if (off_expr < 0 || size_expr < 0)
++			return -EFAULT;
++
++		off_add = BCF_ALU(BPF_ADD, off_expr, size_expr, bit32 ? 32 : 64);
++		high_expr = bcf_add_expr(env, off_add);
++		high_expr = bcf_add_pred(env, BPF_JSGT, high_expr,
++					 ctx->higher_bound - off, bit32);
++		if (high_expr < 0)
++			return high_expr;
++
++		refine_cond = high_expr;
++		if (min_off < ctx->lower_bound) {
++			struct bcf_expr_binary disj;
++
++			low_expr = bcf_add_pred(env, BPF_JSLT, off_expr,
++						ctx->lower_bound - off, bit32);
++			if (low_expr < 0)
++				return low_expr;
++
++			disj = BCF_BOOL_EXPR(BCF_DISJ, low_expr, high_expr);
++			refine_cond = bcf_add_expr(env, disj);
++		}
++		bcf->refine_cond = refine_cond;
++
++		if (min_off < ctx->lower_bound)
++			ptr_reg->smin_value = ctx->lower_bound - off;
++		if (max_off > ctx->higher_bound)
++			ptr_reg->smax_value = ctx->higher_bound - off;
++		if (size_reg->umax_value > ctx->higher_bound - ctx->lower_bound)
++			size_reg->umax_value =
++				ctx->higher_bound - ctx->lower_bound;
++		reg_bounds_sync(ptr_reg);
++		reg_bounds_sync(size_reg);
++
++		max_off = ptr_reg->smax_value + off;
++		bcf->real_size = size_reg->umax_value;
++		if (max_off + size_reg->umax_value > ctx->higher_bound)
++			bcf->real_size = ctx->higher_bound - max_off;
++		bcf->checked_regno = bcf->size_regno;
++		env->cur_state->non_prunable = true;
++	}
++
++	return 0;
++}
++
++static int bcf_refine_access_bound(struct bpf_verifier_env *env, int regno,
++				   s32 off, s32 low, s32 high, u32 access_size)
++{
++	struct bcf_mem_access_refine_ctx ctx = {
++		.off = off,
++		.lower_bound = low,
++		.higher_bound = high,
++		.access_size = access_size,
++	};
++	struct bpf_reg_state *regs = cur_regs(env);
++	struct bcf_state *bcf = &env->bcf;
++	u32 reg_masks = 0;
++
++	ctx.ptr_reg = regs + regno;
++	if (!tnum_is_const(ctx.ptr_reg->var_off))
++		reg_masks |= 1 << regno;
++	if (bcf->size_regno > 0) {
++		if (!tnum_is_const(regs[bcf->size_regno].var_off))
++			reg_masks |= 1 << bcf->size_regno;
++	}
++
++	return bcf_refine(env, reg_masks, __bcf_refine_access_bound, &ctx);
++}
++
+ static bool is_spillable_regtype(enum bpf_reg_type type)
+ {
+ 	switch (base_type(type)) {
+@@ -7290,6 +7489,13 @@ static int stack_min_off(struct bpf_verifier_env *env, struct bpf_func_state *st
+ 		return -state->allocated_stack;
+ }
+
++static int bcf_refine_stack_access(struct bpf_verifier_env *env, int regno,
++				   int off, int access_size, int min_off)
++{
++	return bcf_refine_access_bound(env, regno, off, min_off, 0,
++				       access_size);
++}
++
+ /* Check that the stack access at the given offset is within bounds. The
+  * maximum valid offset is -1.
+  *
+@@ -7370,9 +7576,10 @@ static int check_stack_access_within_bounds(
+ 		}
+
+ 		if (err != -EFAULT) {
+-			int bcf_err;
++			int bcf_err, min_valid_off;
+
+-			bcf_err = bcf_refine(env, 0, NULL, NULL);
++			min_valid_off = stack_min_off(env, state, type);
++			bcf_err = bcf_refine_stack_access(env, regno, off, access_size, min_valid_off);
+ 			if (!bcf_err)
+ 				verbose(env, "bcf requested, try to refine R%d off\n", regno);
+ 		}
+@@ -22822,8 +23029,12 @@ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ 	if (!reg_masks) {
+ 		regs = cur_regs(env);
+ 		for (i = 0; i < BPF_REG_FP; i++) {
+-			if (regs[i].type != NOT_INIT)
+-				reg_masks |= 1 << i;
++			if (regs[i].type == NOT_INIT)
++				continue;
++			if (regs[i].type != SCALAR_VALUE &&
++			    tnum_is_const(regs[i].var_off))
++				continue;
++			reg_masks |= 1 << i;
+ 		}
+ 	}
+ 	base = backtrack_base_state(env, reg_masks);
+--
+2.34.1
+

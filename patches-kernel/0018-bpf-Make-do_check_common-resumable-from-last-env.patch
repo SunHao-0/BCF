@@ -1,0 +1,38 @@
+From 6ea707d07864fd8dc4f4b94fc1eb43314334afc4 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 09:48:16 +0100
+Subject: [PATCH 18/32] bpf: Make do_check_common() resumable from last env
+
+Make do_check_common() resumable from the last env. This is used for resuming
+the analysis from the last verifier state.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index a5a30512dd75..d4db6e184d4d 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -22414,6 +22414,9 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	struct bpf_reg_state *regs;
+ 	int ret, i;
+
++	if (env->cur_state)
++		goto skip_init;
++
+ 	env->prev_insn_idx = -1;
+ 	env->prev_linfo = NULL;
+ 	env->pass_cnt++;
+@@ -22518,6 +22521,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 		mark_reg_known_zero(env, regs, BPF_REG_1);
+ 	}
+
++skip_init:
+ 	ret = do_check(env);
+ 	if (bcf_requested(env))
+ 		return ret;
+--
+2.34.1
+

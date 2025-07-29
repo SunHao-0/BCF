@@ -1,4 +1,8 @@
-# eBPF Certificate Framework (BCF)
+<p align="center">
+  <img src="./scripts/BCF.png" alt="BCF Logo" width="240"><br>
+</p>
+<h2 align="center" style="margin-top: -20px;">eBPF Certificate Framework</h2>
+
 
 BCF is a framework that enhances the eBPF verifier's precision via proof-guided abstraction refinement. It enables the verifier to achieve high precision through user-space reasoning while maintaining soundness through formal proof checking. BCF addresses the precision limitations by:
 

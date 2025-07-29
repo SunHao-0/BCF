@@ -1,0 +1,1295 @@
+From 664cc02fdedd106d021063ce1782aa017c5673ac Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Thu, 28 Nov 2024 20:05:51 +0100
+Subject: [PATCH 05/13] bcf: Add proof to BCF format support
+
+Add proof to BCF format support.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ include/cvc5/c/cvc5.h               |   5 +
+ include/cvc5/cvc5.h                 |   3 +
+ src/api/c/cvc5.cpp                  |  14 +
+ src/api/cpp/cvc5.cpp                |   7 +
+ src/proof/alf/alf_print_channel.cpp | 623 ++++++++++++++++++++++------
+ src/proof/alf/alf_print_channel.h   | 116 +++---
+ src/proof/alf/alf_printer.cpp       |  45 +-
+ src/proof/alf/alf_printer.h         |   2 +
+ src/proof/alf/bcf.h                 |   1 +
+ src/smt/proof_manager.cpp           |   7 +
+ src/smt/proof_manager.h             |   2 +
+ src/smt/solver_engine.cpp           |   5 +
+ src/smt/solver_engine.h             |   2 +
+ 13 files changed, 625 insertions(+), 207 deletions(-)
+
+diff --git a/include/cvc5/c/cvc5.h b/include/cvc5/c/cvc5.h
+index e65c4bc2cb..1cf376e5d6 100644
+--- a/include/cvc5/c/cvc5.h
++++ b/include/cvc5/c/cvc5.h
+@@ -5569,6 +5569,11 @@ CVC5_EXPORT const char* cvc5_proof_to_string(Cvc5* cvc5,
+                                              size_t size,
+                                              const Cvc5Term assertions[],
+                                              const char* names[]);
++
++
++CVC5_EXPORT const uint32_t* cvc5_proof_to_bcf(Cvc5* cvc5,
++                                              Cvc5Proof proof,
++                                              size_t *size);
+ /** @} */
+
+ #if __cplusplus
+diff --git a/include/cvc5/cvc5.h b/include/cvc5/cvc5.h
+index 011fdd575c..50273e3524 100644
+--- a/include/cvc5/cvc5.h
++++ b/include/cvc5/cvc5.h
+@@ -6122,6 +6122,9 @@ class CVC5_EXPORT Solver
+       const std::map<cvc5::Term, std::string>& assertionNames =
+           std::map<cvc5::Term, std::string>()) const;
+
++  std::vector<uint32_t> proofToBCF(
++    Proof proof
++  ) const;
+   /**
+    * Get a list of learned literals that are entailed by the current set of
+    * assertions.
+diff --git a/src/api/c/cvc5.cpp b/src/api/c/cvc5.cpp
+index c8a00e22c4..13b6c2f4f6 100644
+--- a/src/api/c/cvc5.cpp
++++ b/src/api/c/cvc5.cpp
+@@ -5533,6 +5533,20 @@ const char* cvc5_proof_to_string(Cvc5* cvc5,
+   return str.c_str();
+ }
+
++const uint32_t* cvc5_proof_to_bcf(Cvc5* cvc5,
++                                 Cvc5Proof proof,
++                                 size_t *size)
++{
++  static thread_local std::vector<uint32_t> bcf;
++  CVC5_CAPI_TRY_CATCH_BEGIN;
++  CVC5_CAPI_CHECK_NOT_NULL(cvc5);
++  CVC5_CAPI_CHECK_PROOF(proof);
++  bcf = proof->d_cvc5->d_solver.proofToBCF(proof->d_proof);
++  *size = bcf.size();
++  CVC5_CAPI_TRY_CATCH_END;
++  return bcf.data();
++}
++
+ Cvc5Term cvc5_declare_sygus_var(Cvc5* cvc5, const char* symbol, Cvc5Sort sort)
+ {
+   Cvc5Term res = nullptr;
+diff --git a/src/api/cpp/cvc5.cpp b/src/api/cpp/cvc5.cpp
+index 0d82acbf81..5cc4a29497 100644
+--- a/src/api/cpp/cvc5.cpp
++++ b/src/api/cpp/cvc5.cpp
+@@ -7996,6 +7996,13 @@ std::vector<Proof> Solver::getProof(modes::ProofComponent c) const
+   CVC5_API_TRY_CATCH_END;
+ }
+
++std::vector<uint32_t> Solver::proofToBCF(Proof proof) const
++{
++  CVC5_API_TRY_CATCH_BEGIN;
++  return this->d_slv->printProofBCF(proof.d_proofNode);
++  CVC5_API_TRY_CATCH_END;
++}
++
+ std::string Solver::proofToString(
+     Proof proof,
+     modes::ProofFormat format,
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index faf018fa8c..1944986656 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -24,6 +24,8 @@
+ #include "proof/trust_id.h"
+ #include "rewriter/rewrite_db.h"
+ #include "util/bitvector.h"
++#include "util/divisible.h"
++#include "util/real_algebraic_number.h"
+
+ namespace cvc5::internal {
+ namespace proof {
+@@ -40,7 +42,8 @@ AlfPrintChannelOut::AlfPrintChannelOut(std::ostream& out,
+                                        const LetBinding* lbind,
+                                        const std::string& tprefix,
+                                        bool trackWarn)
+-    : d_out(out),
++    : bcf(lbind),
++      d_out(out),
+       d_lbind(lbind),
+       d_termLetPrefix(tprefix),
+       d_trackWarn(trackWarn)
+@@ -65,6 +68,7 @@ void AlfPrintChannelOut::printAssume(TNode n, size_t i, bool isPush)
+   d_out << "(" << (isPush ? "assume-push" : "assume") << " @p" << i;
+   printNode(n);
+   d_out << ")" << std::endl;
++  bcf.printAssume(n, i, isPush);
+ }
+
+ void AlfPrintChannelOut::printStep(ProofRule r,
+@@ -76,6 +80,7 @@ void AlfPrintChannelOut::printStep(ProofRule r,
+                                    bool isPop)
+ {
+   printStepInternal(rname, n, i, premises, args, isPop, false);
++  bcf.printStep(r, rname, n, i, premises, args, isPop);
+ }
+
+ void AlfPrintChannelOut::printStepInternal(const std::string& rname,
+@@ -140,6 +145,7 @@ void AlfPrintChannelOut::printTrustStep(ProofRule r,
+                                         const std::vector<Node>& args,
+                                         TNode nc)
+ {
++  bcf.printTrustStep(r, n, i, premises, args, nc);
+   Assert(!nc.isNull());
+   if (d_trackWarn)
+   {
+@@ -181,6 +187,7 @@ void AlfPrintChannelOut::printTrustStep(ProofRule r,
+
+ void AlfPrintChannelOut::printLetList(LetBinding& lbind)
+ {
++  bcf.printLetList(lbind);
+   std::vector<Node> letList;
+   lbind.letify(letList);
+   std::map<Node, size_t>::const_iterator it;
+@@ -275,11 +282,13 @@ void AlfPrintChannelPre::processInternal(const Node& n)
+ }
+
+ /* BCF Channel */
+-AlfPrintChannelBCF::AlfPrintChannelBCF(LetBinding* lbind) : d_lbind(lbind)
++AlfPrintChannelBCF::AlfPrintChannelBCF(const LetBinding* lbind) : d_lbind(lbind)
+ {
+   Assert(lbind);
+ }
+
++static_assert(sizeof(struct bcf_expr) == sizeof(u32));
++
+ u32 AlfPrintChannelBCF::addExpr(struct bcf_expr* expr)
+ {
+   u32 ret = d_exprs.size();
+@@ -288,6 +297,8 @@ u32 AlfPrintChannelBCF::addExpr(struct bcf_expr* expr)
+   return ret;
+ }
+
++static_assert(sizeof(struct bcf_proof_step) == sizeof(u32));
++
+ u32 AlfPrintChannelBCF::addStep(struct bcf_proof_step* step)
+ {
+   u32 ret = d_steps.size();
+@@ -296,9 +307,23 @@ u32 AlfPrintChannelBCF::addStep(struct bcf_proof_step* step)
+   return ret;
+ }
+
++struct bcf_expr_args
++{
++  u8 code;
++  u8 vlen;
++  u16 params;
++  u32 args[255];
++};
++
++static_assert(offsetof(struct bcf_expr_args, args)
++              == offsetof(struct bcf_expr, args));
++
+ u32 AlfPrintChannelBCF::addNode(Node node)
+ {
+-  if (!d_ok) return 0;
++  struct bcf_expr_args expr_buf = {0};
++  struct bcf_expr* expr = (struct bcf_expr*)&expr_buf;
++
++  Assert(d_lbind);
+
+   /* first, try to find in let id to idx map */
+   u32 l_id = d_lbind->getId(node);
+@@ -307,13 +332,16 @@ u32 AlfPrintChannelBCF::addNode(Node node)
+     auto it = d_letIdMap.find(l_id);
+     if (it != d_letIdMap.end()) return it->second;
+   }
++  else
++  {
++    /* try to find in node to idx map */
++    auto it = d_nodeIdxMap.find(node);
++    if (it != d_nodeIdxMap.end()) return it->second;
++  }
+
+-  /* try to find in node to idx map */
+-  auto it = d_nodeIdxMap.find(node);
+-  if (it != d_nodeIdxMap.end()) return it->second;
+-
+-  /* add node */
+-  u32 idx = encodeNode(node);
++  encodeExpr(node, expr, true);
++  if (!d_ok) return 0;
++  u32 idx = addExpr(expr);
+   if (l_id)
+     d_letIdMap[l_id] = idx;
+   else
+@@ -322,22 +350,12 @@ u32 AlfPrintChannelBCF::addNode(Node node)
+   return idx;
+ }
+
+-struct bcf_expr_args
+-{
+-  u8 code;
+-  u8 vlen;
+-  u16 params;
+-  u32 args[255];
+-};
+-
+-u32 AlfPrintChannelBCF::encodeNode(Node node)
++void AlfPrintChannelBCF::encodeExpr(Node node,
++                                    struct bcf_expr* expr,
++                                    bool handle_args)
+ {
+-  static const std::map<Kind, u8> kind_map = {
+-
+-      // [Kind::BITVECTOR_NOT] = 0,
+-      // Kind::BITVECTOR_SDIV = BCF_BV_ALU | BPF_SDIV,
+-      // Kind::BITVECTOR_SMOD = BCF_BV_ALU | BPF_SMOD,
+-      //  BCF_BV_ALU | BPF_END,
++  static const std::map<Kind, u8> kind_table = {
++      /* BV operations */
+       {Kind::BITVECTOR_ADD, BCF_BV_ALU | BPF_ADD},
+       {Kind::BITVECTOR_SUB, BCF_BV_ALU | BPF_SUB},
+       {Kind::BITVECTOR_MULT, BCF_BV_ALU | BPF_MUL},
+@@ -350,7 +368,16 @@ u32 AlfPrintChannelBCF::encodeNode(Node node)
+       {Kind::BITVECTOR_UDIV, BCF_BV_ALU | BPF_DIV},
+       {Kind::BITVECTOR_NEG, BCF_BV_ALU | BPF_NEG},
+       {Kind::BITVECTOR_UREM, BCF_BV_ALU | BPF_MOD},
+-
++      /* BV ext operations */
++      {Kind::BITVECTOR_EXTRACT, BCF_BV_EXT | BCF_EXTRACT},
++      {Kind::BITVECTOR_ZERO_EXTEND, BCF_BV_EXT | BCF_ZERO_EXTEND},
++      {Kind::BITVECTOR_SIGN_EXTEND, BCF_BV_EXT | BCF_SIGN_EXTEND},
++      {Kind::BITVECTOR_FROM_BOOLS, BCF_BV_EXT | BCF_BBT},
++      {Kind::BITVECTOR_CONCAT, BCF_BV_EXT | BCF_CONCAT},
++      {Kind::BITVECTOR_BIT, BCF_BV_PRED | BCF_BITOF},
++      {Kind::BITVECTOR_SIZE, BCF_BV_EXT | BCF_BVSIZE},
++      {Kind::CONST_BITVECTOR, BCF_BV_EXT | BCF_VAL},
++      /* BV predicate operations */
+       {Kind::BITVECTOR_UGT, BCF_BV_PRED | BPF_JGT},
+       {Kind::BITVECTOR_UGE, BCF_BV_PRED | BPF_JGE},
+       {Kind::BITVECTOR_SGT, BCF_BV_PRED | BPF_JSGT},
+@@ -359,51 +386,76 @@ u32 AlfPrintChannelBCF::encodeNode(Node node)
+       {Kind::BITVECTOR_ULE, BCF_BV_PRED | BPF_JLE},
+       {Kind::BITVECTOR_SLT, BCF_BV_PRED | BPF_JSLT},
+       {Kind::BITVECTOR_SLE, BCF_BV_PRED | BPF_JSLE},
+-      {Kind::BITVECTOR_BIT, BCF_BV_PRED | BCF_BITOF},
+-
+-      {Kind::BITVECTOR_EXTRACT, BCF_BV_EXT | BCF_EXTRACT},
+-      {Kind::BITVECTOR_ZERO_EXTEND, BCF_BV_EXT | BCF_ZERO_EXTEND},
+-      {Kind::BITVECTOR_SIGN_EXTEND, BCF_BV_EXT | BCF_SIGN_EXTEND},
+-      {Kind::BITVECTOR_FROM_BOOLS, BCF_BV_EXT | BCF_BBT},
+-      {Kind::BITVECTOR_CONCAT, BCF_BV_EXT | BCF_CONCAT},
+-
+-      {Kind::CONST_BITVECTOR, BCF_BV_EXT | BCF_VAL},
+-      {Kind::CONST_BOOLEAN, BCF_PRED_EXT | BCF_VAL},
+-
++      /* TODO not sure about the differences between this and bv constant */
++      {Kind::CONST_BITVECTOR_SYMBOLIC, BCF_BV_EXT | BCF_VAL},
++
++      /* TODO Treat int as bv, fix this later */
++      {Kind::ADD, BCF_BV_ALU | BPF_ADD},
++      {Kind::SUB, BCF_BV_ALU | BPF_SUB},
++      {Kind::MULT, BCF_BV_ALU | BPF_MUL},
++      {Kind::NEG, BCF_BV_ALU | BPF_NEG},
++      {Kind::CONST_INTEGER, BCF_BV_EXT | BCF_VAL},
++      {Kind::GT, BCF_BV_PRED | BPF_JSGT},
++      {Kind::GEQ, BCF_BV_PRED | BPF_JSGE},
++      {Kind::LT, BCF_BV_PRED | BPF_JSLT},
++      {Kind::LEQ, BCF_BV_PRED | BPF_JSLE},
++
++      /* Boolean operations */
+       {Kind::NOT, BCF_PRED_EXT | BCF_NOT},
+       {Kind::AND, BCF_PRED_EXT | BCF_CONJ},
+       {Kind::IMPLIES, BCF_PRED_EXT | BCF_IMPLIES},
+       {Kind::OR, BCF_PRED_EXT | BCF_DISJ},
+       {Kind::XOR, BCF_PRED_EXT | BCF_XOR},
+       {Kind::ITE, BCF_PRED_EXT | BCF_ITE},
++      {Kind::CONST_BOOLEAN, BCF_PRED_EXT | BCF_VAL},
+
+       /* overloaded, determine sort later */
+       {Kind::VARIABLE, BCF_BV_EXT | BCF_VAR},
+       /* overloaded, decide the code later */
+       {Kind::EQUAL, BCF_BV_PRED | BPF_JEQ},
+-      // [Kind::EQUAL] = BCF_PRED_EXT | BCF_EQUIV,
++
++      {Kind::SEXPR, BCF_BUILTIN | BCF_ARG_LIST},
++      {Kind::BOUND_VAR_LIST, BCF_BUILTIN | BCF_ARG_LIST},
+   };
+
+-  TypeNode ty = node.getType();
+   Kind kind = node.getKind();
+-  struct bcf_expr_args expr = {0};
+-  auto it = kind_map.find(kind);
+-  if (node.getNumChildren() > UINT8_MAX
+-      || (ty.isBitVector() && ty.getBitVectorSize() > UINT8_MAX)
+-      || it == kind_map.end())
+-    goto err_out;
++  TypeNode ty = node.getType();
++  Kind orig_kind = kind;
+
+-  expr.code = it->second;
+-  expr.vlen = node.getNumChildren();
+-  if (ty.isBitVector())
++  if (kind == Kind::APPLY_UF || kind == Kind::APPLY_INDEXED_SYMBOLIC
++      || kind == Kind::SKOLEM)
+   {
+-    expr.params = ty.getBitVectorSize();
++    std::cerr << kind;
++    if (node.getNumChildren()) std::cerr << ": " << node[0];
++    std::cerr << std::endl;
++    expr->code = BCF_PRED_EXT | BCF_VAL;
++    return;
+   }
+-  for (int i = 0; i < expr.vlen; i++)
++
++  auto it = kind_table.find(kind);
++  if (it == kind_table.end())
+   {
+-    expr.args[i] = addNode(node[i]);
+-    if (!d_ok) return 0;
++    std::cerr << "Unsupported kind: " << kind << std::endl;
++    goto err_out;
+   }
++  if (node.getNumChildren() > UINT8_MAX)
++  {
++    std::cerr << "too many children: " << node.getNumChildren() << std::endl;
++    goto err_out;
++  }
++  if (ty.isBitVector() && ty.getBitVectorSize() > UINT8_MAX)
++  {
++    std::cerr << "bv too big: " << ty.getBitVectorSize() << std::endl;
++    goto err_out;
++  }
++
++  expr->code = it->second;
++  expr->vlen = node.getNumChildren();
++  expr->params = 0;
++  if (ty.isBitVector())
++    expr->params = ty.getBitVectorSize();
++  else if (ty.isInteger())
++    expr->params = 64;
+
+   switch (kind)
+   {
+@@ -413,21 +465,23 @@ u32 AlfPrintChannelBCF::encodeNode(Node node)
+     case Kind::BITVECTOR_OR:
+     case Kind::BITVECTOR_AND:
+     case Kind::BITVECTOR_XOR:
+-    case Kind::BITVECTOR_CONCAT:
+     case Kind::BITVECTOR_FROM_BOOLS:
++      Assert(kind == orig_kind && node.getNumChildren() && expr->params);
++      break;
+     case Kind::BITVECTOR_SHL:
+     case Kind::BITVECTOR_LSHR:
+     case Kind::BITVECTOR_ASHR:
+     case Kind::BITVECTOR_UDIV:
+     case Kind::BITVECTOR_UREM:
++    case Kind::BITVECTOR_CONCAT:
++      Assert(kind == orig_kind && node.getNumChildren() == 2 && expr->params);
++      break;
+     case Kind::BITVECTOR_NEG:
+-
+-    case Kind::NOT:
+-    case Kind::AND:
+-    case Kind::IMPLIES:
+-    case Kind::OR:
+-    case Kind::XOR:
+-    case Kind::ITE: break;
++      Assert(kind == orig_kind && node.getNumChildren() == 1 && expr->params);
++      break;
++    case Kind::BITVECTOR_SIZE:
++      Assert(kind == orig_kind && expr->params == 64 && expr->vlen == 1);
++      break;
+
+     case Kind::BITVECTOR_UGT:
+     case Kind::BITVECTOR_UGE:
+@@ -437,91 +491,145 @@ u32 AlfPrintChannelBCF::encodeNode(Node node)
+     case Kind::BITVECTOR_ULE:
+     case Kind::BITVECTOR_SLT:
+     case Kind::BITVECTOR_SLE:
+-    {
+-      TypeNode cmp_ty = node[0].getType();
+-      Assert(expr.vlen == 2);
+-      expr.params = cmp_ty.getBitVectorSize();
+-      if (cmp_ty.getBitVectorSize() > UINT8_MAX) goto err_out;
++      Assert(kind == orig_kind && !expr->params && expr->vlen == 2);
++      expr->params = node[0].getType().getBitVectorSize();
++      break;
++
++    case Kind::ADD:
++    case Kind::SUB:
++    case Kind::MULT:
++    case Kind::NEG:
++    case Kind::GT:
++    case Kind::GEQ:
++    case Kind::LT:
++    case Kind::LEQ:
++      Assert(kind == orig_kind && expr->params == 64 && expr->vlen);
++      break;
++
++    case Kind::NOT:
++    case Kind::AND:
++    case Kind::IMPLIES:
++    case Kind::OR:
++    case Kind::XOR:
++    case Kind::ITE:
++      Assert(kind == orig_kind && !expr->params && expr->vlen);
+       break;
+-    }
+
+     case Kind::BITVECTOR_BIT:
+-      Assert(node.getNumChildren() == 1);
+-      expr.params = node.getOperator().getConst<BitVectorBit>().d_bitIndex;
++    {
++      Node op = kind == orig_kind ? node : node[0];
++      Node bv = kind == orig_kind ? node[0] : node[1];
++
++      expr->params = bv.getType().getBitVectorSize();
++      u16 bit = op.getOperator().getConst<BitVectorBit>().d_bitIndex;
++      Assert(bit < expr->params);
++      expr->params |= bit << 8;
+       break;
++    }
+
+     case Kind::BITVECTOR_EXTRACT:
+     {
+-      BitVectorExtract p = node.getConst<BitVectorExtract>();
+-      if (p.d_high > UINT8_MAX || p.d_low > UINT8_MAX) goto err_out;
+-      expr.params = p.d_low;
+-      expr.params |= (u16)p.d_high << 8;
++      Node op = kind == orig_kind ? node : node[0];
++
++      BitVectorExtract p = op.getConst<BitVectorExtract>();
++      expr->params = p.d_low;
++      expr->params |= (u16)p.d_high << 8;
+       break;
+     }
+
+     case Kind::BITVECTOR_ZERO_EXTEND:
+     {
+-      u32 ext = node.getConst<BitVectorZeroExtend>().d_zeroExtendAmount;
+-      if (ext > UINT8_MAX) goto err_out;
+-      expr.params |= (u16)ext << 8;
++      Node op = kind == orig_kind ? node : node[0];
++
++      u32 ext = op.getConst<BitVectorZeroExtend>().d_zeroExtendAmount;
++      expr->params |= (u16)ext << 8;
+       break;
+     }
+     case Kind::BITVECTOR_SIGN_EXTEND:
+     {
+-      u32 ext = node.getConst<BitVectorSignExtend>().d_signExtendAmount;
+-      if (ext > UINT8_MAX) goto err_out;
+-      expr.params |= (u16)ext << 8;
++      Node op = kind == orig_kind ? node : node[0];
++
++      u32 ext = op.getConst<BitVectorSignExtend>().d_signExtendAmount;
++      expr->params |= (u16)ext << 8;
+       break;
+     }
+
+     case Kind::CONST_BITVECTOR:
+     {
+       const BitVector& bv = node.getConst<BitVector>();
+-      if (bv.getSize() > 64) goto err_out;
++
++      Assert(kind == orig_kind && node.getNumChildren() == 0);
++
++      if (bv.getSize() > 64)
++      {
++        std::cerr << "bv const too big: " << bv.getSize() << std::endl;
++      }
++
+       u64 val = bv.getValue().getUnsigned64();
+-      expr.args[0] = val;
+-      expr.vlen = 1;
++      expr->args[0] = val;
++      expr->vlen = 1;
+       if (bv.getSize() > 32)
+       {
+-        expr.args[1] = val >> 32;
+-        expr.vlen++;
++        expr->args[1] = val >> 32;
++        expr->vlen++;
+       }
++
++      Assert(expr->params == bv.getSize());
+       break;
+     }
++
++    case Kind::CONST_INTEGER:
++    {
++      const Rational& r = node.getConst<Rational>();
++
++      Assert(kind == orig_kind && node.getNumChildren() == 0);
++      u64 val = r.getNumerator().getUnsigned64();
++      Assert(r.getDenominator() == 1);
++      expr->vlen = 2;
++      expr->args[0] = val;
++      expr->args[1] = val >> 32;
++      break;
++    }
++
+     case Kind::CONST_BOOLEAN:
+     {
+-      expr.code = BCF_PRED_EXT | BCF_VAL;
+-      expr.vlen = 0;
+-      expr.params = node.getConst<bool>() ? BCF_TRUE : BCF_FALSE;
++      Assert(kind == orig_kind && node.getNumChildren() == 0);
++      expr->vlen = 0;
++      expr->params = node.getConst<bool>() ? BCF_TRUE : BCF_FALSE;
+       break;
+     }
+
+-    /* overloaded, determine sort later */
++    /* TODO handle @bv correctly */
++    case Kind::CONST_BITVECTOR_SYMBOLIC:
+     case Kind::VARIABLE:
+-      expr.vlen = 0;
+-      if (ty.isBitVector())
+-        expr.code = BCF_BV_EXT | BCF_VAR;
++    {
++      Assert(kind == orig_kind);
++      expr->vlen = 0;
++      if (ty.isBitVector() || ty.isInteger())
++        expr->code = BCF_BV_EXT | BCF_VAR;
+       else if (ty.isBoolean())
+-        expr.code = BCF_PRED_EXT | BCF_VAR;
++        expr->code = BCF_PRED_EXT | BCF_VAR;
+       else
++      {
++        std::cerr << "Unsupported variable type: " << kind << std::endl;
+         goto err_out;
++      }
+       break;
++    }
+
+-    /* overloaded, decide the code later */
+     case Kind::EQUAL:
+     {
+-      TypeNode eq_ty = node[0].getType();
+-      Assert(expr.vlen == 2);
++      Assert(kind == orig_kind && expr.vlen == 2);
+
+-      if (eq_ty.isBitVector())
++      TypeNode eq_ty = node[0].getType();
++      if (eq_ty.isBitVector() || eq_ty.isInteger())
+       {
+-        expr.code = BCF_BV_ALU | BPF_JEQ;
+-        expr.params = eq_ty.getBitVectorSize();
+-        if (eq_ty.getBitVectorSize() > UINT8_MAX) goto err_out;
++        expr->code = BCF_BV_ALU | BPF_JEQ;
++        expr->params = eq_ty.isInteger() ? 64 : eq_ty.getBitVectorSize();
+       }
+       else if (eq_ty.isBoolean())
+       {
+-        expr.code = BCF_PRED_EXT | BCF_EQUIV;
++        expr->code = BCF_PRED_EXT | BCF_EQUIV;
+       }
+       else
+       {
+@@ -530,25 +638,52 @@ u32 AlfPrintChannelBCF::encodeNode(Node node)
+       break;
+     }
+
+-    /* TODO handle LIST */
+-    default: goto err_out;
++    /* handle special const list in chain_resolutoin */
++    case Kind::SEXPR:
++    case Kind::BOUND_VAR_LIST: Assert(kind == orig_kind && expr.vlen); break;
++
++    default: std::cerr << "unhandled kind: " << kind << std::endl; goto err_out;
+   }
+
+-  return addExpr((struct bcf_expr*)&expr);
++  if (handle_args)
++  {
++    size_t i = kind == orig_kind ? 0 : 1;
++    for (size_t j = 0; i < node.getNumChildren(); i++, j++)
++      expr->args[j] = addNode(node[i]);
++  }
++  return;
+
+ err_out:
+   d_ok = false;
+-  return 0;
++  return;
+ }
+
++struct bcf_proof_step_args
++{
++  __u16 rule;
++  __u8 vlen;
++  __u8 params;
++  __u32 args[255];
++};
++
++static_assert(offsetof(struct bcf_proof_step_args, args)
++              == offsetof(struct bcf_proof_step, args));
++
+ void AlfPrintChannelBCF::printAssume(TNode n, size_t i, bool isPush)
+ {
++  struct bcf_proof_step_args step_buf = {0};
++  struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++
+   if (isPush)
+   {
+     d_ok = false;
+     return;
+   }
+-  // TODO
++
++  step->rule = BCF_RULE_BUILTIN | BCF_RULE_ASSUME;
++  step->vlen = 1;
++  step->args[0] = addNode(n);
++  addStep(step);
+   return;
+ }
+
+@@ -559,37 +694,8 @@ void AlfPrintChannelBCF::printStep(ProofRule r,
+                                    const std::vector<size_t>& premises,
+                                    const std::vector<Node>& args,
+                                    bool isPop)
+-{
+-  // TODO
+-  return;
+-}
+-
+-void AlfPrintChannelBCF::printTrustStep(ProofRule r,
+-                                        TNode n,
+-                                        size_t i,
+-                                        const std::vector<size_t>& premises,
+-                                        const std::vector<Node>& args,
+-                                        TNode nc)
+-{
+-  // TODO
+-  return;
+-}
+-
+-void AlfPrintChannelBCF::printLetList(LetBinding& lbind)
+-{
+-  // TODO
+-  return;
+-}
+-
+-u32 AlfPrintChannelBCF::encodeStep(ProofRule rule,
+-                                   TNode conclusion,
+-                                   size_t step_id,
+-                                   const std::vector<size_t>& premises,
+-                                   const std::vector<Node>& args)
+ {
+   static const std::map<ProofRule, u16> rule_table = {
+-      {ProofRule::ASSUME, BCF_RULE_ASSUME | BCF_RULE_BUILTIN},
+-
+       {ProofRule::REFL, BCF_RULE_REFL | BCF_RULE_EQUALITY},
+       {ProofRule::SYMM, BCF_RULE_SYMM | BCF_RULE_EQUALITY},
+       {ProofRule::TRANS, BCF_RULE_TRANS | BCF_RULE_EQUALITY},
+@@ -658,8 +764,257 @@ u32 AlfPrintChannelBCF::encodeStep(ProofRule rule,
+
+       {ProofRule::BV_BITBLAST_STEP, BCF_RULE_BITBLAST | BCF_RULE_BV},
+   };
+-  // TODO
+-  return 0;
++
++  struct bcf_proof_step_args step_buf = {0};
++  struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++  u16 code;
++
++  if (!d_ok) return;
++
++  auto it = rule_table.find(r);
++  if (it != rule_table.end())
++    code = it->second;
++  else
++  {
++    std::cerr << "fallback to the trusted rewrite for " << r << std::endl;
++    code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
++  }
++
++  encodeStep(code, r, n, i, premises, args, step);
++  if (!d_ok) return;
++  addStep(step);
++
++  return;
++}
++
++void AlfPrintChannelBCF::printTrustStep(ProofRule r,
++                                        TNode n,
++                                        size_t i,
++                                        const std::vector<size_t>& premises,
++                                        const std::vector<Node>& args,
++                                        TNode nc)
++{
++  struct bcf_proof_step_args step_buf = {0};
++  struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++  u16 code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
++
++  if (!d_ok) return;
++
++  encodeStep(code, r, n, i, premises, args, step);
++  if (!d_ok) return;
++  addStep(step);
++
++  return;
++}
++
++void AlfPrintChannelBCF::printLetList(LetBinding& lbind)
++{
++  if (!d_ok) return;
++
++  std::vector<Node> letList;
++  lbind.letify(letList);
++  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
++  {
++    Node n = letList[i];
++    addNode(n);
++    if (!d_ok) break;
++  }
++  return;
++}
++
++static u64 getUInt32(TNode n)
++{
++  Assert(n.getKind() == Kind::CONST_INTEGER
++         && n.getConst<Rational>().sgn() >= 0);
++  return n.getConst<Rational>().getNumerator().getUnsigned64();
++}
++
++void AlfPrintChannelBCF::encodeStep(u16 code,
++                                    ProofRule orig_rule,
++                                    TNode conclusion,
++                                    size_t step_id,
++                                    const std::vector<size_t>& premises,
++                                    const std::vector<Node>& args,
++                                    struct bcf_proof_step* step)
++{
++  struct bcf_expr_args expr_buf = {0};
++  struct bcf_expr* expr = (struct bcf_expr*)&expr_buf;
++
++  step->rule = code;
++  step->vlen = 0;
++  step->params = 0;
++  if (premises.size() + args.size() > UINT8_MAX)
++  {
++    std::cerr << "too many premises/args: " << premises.size() + args.size()
++              << std::endl;
++    goto err_out;
++  }
++
++  if (code == (BCF_RULE_BUILTIN | BCF_RULE_REWRITE)
++      || code == (BCF_RULE_BV | BCF_RULE_BITBLAST)
++      || code == (BCF_RULE_BOOLEAN | BCF_RULE_FACTORING)
++      || code == (BCF_RULE_BOOLEAN | BCF_RULE_REORDERING))
++  {
++    u32 idx = addNode(conclusion);
++    step->args[step->vlen++] = idx;
++    return;
++  }
++
++  for (size_t i = 0; i < premises.size(); i++)
++    step->args[step->vlen++] = premises[i];
++
++  switch (code)
++  {
++    case BCF_RULE_REFL | BCF_RULE_EQUALITY:
++    case BCF_RULE_SYMM | BCF_RULE_EQUALITY:
++    case BCF_RULE_TRANS | BCF_RULE_EQUALITY:
++    case BCF_RULE_TRUE_INTRO | BCF_RULE_EQUALITY:
++    case BCF_RULE_TRUE_ELIM | BCF_RULE_EQUALITY:
++    case BCF_RULE_FALSE_INTRO | BCF_RULE_EQUALITY:
++    case BCF_RULE_FALSE_ELIM | BCF_RULE_EQUALITY: break;
++
++    case BCF_RULE_CONG | BCF_RULE_EQUALITY:
++    {
++      Assert(conclusion.getNumChildren() == 2);
++      encodeExpr(conclusion[0], expr, false);
++      u32 code_encoding = expr->code;
++      code_encoding |= (u32)expr->vlen << 16;
++      code_encoding |= (u32)expr->params << 24;
++      step->args[step->vlen++] = code_encoding;
++      return;
++    }
++
++    case BCF_RULE_RESOLUTION | BCF_RULE_BOOLEAN:
++    {
++      Assert(args.size() == 2);
++      step->params = args[0].getConst<bool>() ? BCF_TRUE : BCF_FALSE;
++      step->args[step->vlen++] = addNode(args[1]);
++      return;
++    }
++
++    case BCF_RULE_CHAIN_RESOLUTION | BCF_RULE_BOOLEAN:
++    {
++      Assert(args.size() == 2);
++      Node pols = args[0];
++      expr->code = BCF_BV_EXT | BCF_VAL;
++      expr->vlen = (pols.getNumChildren() + 31) / 32;
++      expr->params = pols.getNumChildren();
++      u32* expr_args = expr->args;
++      for (size_t i = 0; i < pols.getNumChildren(); i++)
++      {
++        u32 v = pols[i].getConst<bool>() ? 1 : 0;
++        expr_args[i / 32] |= (v << (i % 32));
++      }
++      u32 pol_idx = addExpr(expr);
++      u32 pivot_idx = addNode(args[1]);
++      step->args[step->vlen++] = pol_idx;
++      step->args[step->vlen++] = pivot_idx;
++      return;
++    }
++
++    case BCF_RULE_SPLIT | BCF_RULE_BOOLEAN:
++    case BCF_RULE_EQ_RESOLVE | BCF_RULE_BOOLEAN:
++    case BCF_RULE_MODUS_PONENS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_NOT_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CONTRA | BCF_RULE_BOOLEAN:
++    case BCF_RULE_AND_INTRO | BCF_RULE_BOOLEAN:
++    case BCF_RULE_IMPLIES_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_AND | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_AND_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_OR_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_IMPLIES_POS | BCF_RULE_BOOLEAN: break;
++
++    case BCF_RULE_AND_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_OR_ELIM | BCF_RULE_BOOLEAN:
++      step->params = getUInt32(args[0]);
++      return;
++
++    case BCF_RULE_CNF_AND_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_OR_NEG | BCF_RULE_BOOLEAN:
++      step->args[step->vlen++] = addNode(args[0]);
++      step->params = getUInt32(args[1]);
++      return;
++
++    case BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_EQUIV_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_EQUIV_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_XOR_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_XOR_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_ITE_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_ITE_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_IMPLIES_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_EQUIV_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_EQUIV_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_XOR_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_XOR_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOLEAN:
++      switch (orig_rule)
++      {
++        case ProofRule::NOT_IMPLIES_ELIM1:
++        case ProofRule::EQUIV_ELIM1:
++        case ProofRule::NOT_EQUIV_ELIM1:
++        case ProofRule::XOR_ELIM1:
++        case ProofRule::NOT_XOR_ELIM1:
++        case ProofRule::ITE_ELIM1:
++        case ProofRule::NOT_ITE_ELIM1:
++        case ProofRule::CNF_IMPLIES_NEG1:
++        case ProofRule::CNF_EQUIV_POS1:
++        case ProofRule::CNF_EQUIV_NEG1:
++        case ProofRule::CNF_XOR_POS1:
++        case ProofRule::CNF_XOR_NEG1:
++        case ProofRule::CNF_ITE_POS1:
++        case ProofRule::CNF_ITE_NEG1: step->params = 0; break;
++        case ProofRule::NOT_IMPLIES_ELIM2:
++        case ProofRule::EQUIV_ELIM2:
++        case ProofRule::NOT_EQUIV_ELIM2:
++        case ProofRule::XOR_ELIM2:
++        case ProofRule::NOT_XOR_ELIM2:
++        case ProofRule::ITE_ELIM2:
++        case ProofRule::NOT_ITE_ELIM2:
++        case ProofRule::CNF_IMPLIES_NEG2:
++        case ProofRule::CNF_EQUIV_POS2:
++        case ProofRule::CNF_EQUIV_NEG2:
++        case ProofRule::CNF_XOR_POS2:
++        case ProofRule::CNF_XOR_NEG2:
++        case ProofRule::CNF_ITE_POS2:
++        case ProofRule::CNF_ITE_NEG2: step->params = 1; break;
++        case ProofRule::CNF_ITE_POS3:
++        case ProofRule::CNF_ITE_NEG3: step->params = 0; break;
++        default:
++          std::cerr << "unsupported rule: " << orig_rule << std::endl;
++          goto err_out;
++      }
++      break;
++
++    default:
++      std::cerr << "unsupported rule: " << orig_rule << std::endl;
++      goto err_out;
++  }
++
++  for (size_t i = 0; i < args.size(); i++)
++  {
++    u32 idx = addNode(args[i]);
++    if (!d_ok) return;
++    step->args[step->vlen++] = idx;
++  }
++  return;
++
++err_out:
++  d_ok = false;
++  return;
++}
++
++std::vector<u32> AlfPrintChannelBCF::getEncodedProof()
++{
++  std::vector<uint32_t> result;
++
++  if (!d_ok) return result;
++
++  result.reserve(d_exprs.size() + d_steps.size());
++  result.insert(result.end(), d_exprs.begin(), d_exprs.end());
++  result.insert(result.end(), d_steps.begin(), d_steps.end());
++  return result;
+ }
+
+ }  // namespace proof
+diff --git a/src/proof/alf/alf_print_channel.h b/src/proof/alf/alf_print_channel.h
+index 854b885d0c..e18e68ab60 100644
+--- a/src/proof/alf/alf_print_channel.h
++++ b/src/proof/alf/alf_print_channel.h
+@@ -21,10 +21,10 @@
+ #include <iostream>
+ #include <map>
+
++#include "bcf.h"
+ #include "expr/node.h"
+ #include "printer/let_binding.h"
+ #include "proof/proof_node.h"
+-#include "bcf.h"
+
+ namespace cvc5::internal {
+ namespace proof {
+@@ -73,6 +73,64 @@ class AlfPrintChannel
+   virtual std::ostream& getOStream();
+ };
+
++/** Prints the proof in BCF format */
++class AlfPrintChannelBCF : public AlfPrintChannel
++{
++ public:
++  typedef uint32_t u32;
++
++  AlfPrintChannelBCF(const LetBinding* lbind);
++
++  /* don't care */
++  void printNode(TNode n) override{};
++  void printTypeNode(TypeNode tn) override{};
++
++  /* encode the assume step, isPush must be false */
++  void printAssume(TNode n, size_t i, bool isPush) override;
++  void printStep(ProofRule r,
++                 const std::string& rname,
++                 TNode n,
++                 size_t i,
++                 const std::vector<size_t>& premises,
++                 const std::vector<Node>& args,
++                 bool isPop = false) override;
++  void printTrustStep(ProofRule r,
++                      TNode n,
++                      size_t i,
++                      const std::vector<size_t>& premises,
++                      const std::vector<Node>& args,
++                      TNode conc) override;
++  void printLetList(LetBinding& lbind) override;
++
++  std::vector<u32> getEncodedProof();
++
++ private:
++  void encodeExpr(Node n, struct bcf_expr* expr, bool handle_args = true);
++  void encodeStep(u16 code,
++                  ProofRule orig_rule,
++                  TNode conclusion,
++                  size_t step_id,
++                  const std::vector<size_t>& premises,
++                  const std::vector<Node>& args,
++                  struct bcf_proof_step* step);
++
++  u32 addExpr(struct bcf_expr* expr);
++  u32 addStep(struct bcf_proof_step* step);
++  u32 addNode(Node node);
++
++  /** The let binding */
++  const LetBinding* d_lbind;
++  /* From let expr id to idx in d_exprs */
++  std::map<u32, u32> d_letIdMap;
++  /* From node to idx in d_exprs */
++  std::map<Node, u32> d_nodeIdxMap;
++  std::vector<u32> d_exprs;
++  std::vector<u32> d_steps;
++  bool d_ok = true;
++
++  // AlfPrintChannelOut d_alfOut;
++};
++
+ /** Prints the proof to output stream d_out */
+ class AlfPrintChannelOut : public AlfPrintChannel
+ {
+@@ -108,6 +166,7 @@ class AlfPrintChannelOut : public AlfPrintChannel
+    * Print type node to stream in the expected format of ALF.
+    */
+   void printTypeNodeInternal(std::ostream& out, TypeNode tn);
++  AlfPrintChannelBCF bcf;
+
+  private:
+   /**
+@@ -170,61 +229,6 @@ class AlfPrintChannelPre : public AlfPrintChannel
+   /** Process that we will print node n in the final proof */
+   void processInternal(const Node& n);
+ };
+-
+-/** Prints the proof in BCF format */
+-class AlfPrintChannelBCF : public AlfPrintChannel
+-{
+- public:
+-  typedef uint32_t u32;
+-
+-  AlfPrintChannelBCF(LetBinding* lbind);
+-
+-  /* don't care */
+-  void printNode(TNode n) override {};
+-  void printTypeNode(TypeNode tn) override {};
+-
+-  /* encode the assume step, isPush must be false */
+-  void printAssume(TNode n, size_t i, bool isPush) override;
+-  void printStep(ProofRule r,
+-                 const std::string& rname,
+-                 TNode n,
+-                 size_t i,
+-                 const std::vector<size_t>& premises,
+-                 const std::vector<Node>& args,
+-                 bool isPop = false) override;
+-  void printTrustStep(ProofRule r,
+-                      TNode n,
+-                      size_t i,
+-                      const std::vector<size_t>& premises,
+-                      const std::vector<Node>& args,
+-                      TNode conc) override;
+-  void printLetList(LetBinding& lbind) override;
+-
+-  bool getEncodedProof(u32 &proof, u32 &size);
+-
+- private:
+-  u32 encodeNode(Node n);
+-  u32 encodeStep(ProofRule rule,
+-                 TNode conclusion,
+-                 size_t step_id,
+-                 const std::vector<size_t>& premises,
+-                 const std::vector<Node>& args);
+-
+-  u32 addExpr(struct bcf_expr *expr);
+-  u32 addStep(struct bcf_proof_step *step);
+-  u32 addNode(Node node);
+-
+-  /** The let binding */
+-  LetBinding* d_lbind;
+-  /* From let expr id to idx in d_exprs */
+-  std::map<u32, u32> d_letIdMap;
+-  /* From node to idx in d_exprs */
+-  std::map<Node, u32> d_nodeIdxMap;
+-  std::vector<u32> d_exprs;
+-  std::vector<u32> d_steps;
+-  bool d_ok = true;
+-};
+-
+ }  // namespace proof
+ }  // namespace cvc5::internal
+
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index 44f9dcdfa5..2e6daf24f8 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -65,7 +65,9 @@ AlfPrinter::AlfPrinter(Env& env,
+   d_false = nodeManager()->mkConst(false);
+ }
+
+-bool AlfPrinter::isHandled(const Options& opts, const ProofNode* pfn, bool bcfFormat)
++bool AlfPrinter::isHandled(const Options& opts,
++                           const ProofNode* pfn,
++                           bool bcfFormat)
+ {
+   const std::vector<Node> pargs = pfn->getArguments();
+   switch (pfn->getRule())
+@@ -130,15 +132,14 @@ bool AlfPrinter::isHandled(const Options& opts, const ProofNode* pfn, bool bcfFo
+     case ProofRule::FACTORING:
+     case ProofRule::REORDERING:
+     case ProofRule::RESOLUTION:
+-    case ProofRule::CHAIN_RESOLUTION:
+-      return true;
++    case ProofRule::CHAIN_RESOLUTION: return true;
+     default:
+-      if (bcfFormat)
+-        return false;
++      if (bcfFormat) return false;
+       break;
+   }
+
+-  switch (pfn->getRule()) {
++  switch (pfn->getRule())
++  {
+     case ProofRule::SCOPE:
+     case ProofRule::ARRAYS_READ_OVER_WRITE:
+     case ProofRule::ARRAYS_READ_OVER_WRITE_CONTRA:
+@@ -234,12 +235,11 @@ bool AlfPrinter::isHandled(const Options& opts, const ProofNode* pfn, bool bcfFo
+         case Kind::STRING_REPLACE:
+         case Kind::STRING_STOI:
+         case Kind::STRING_ITOS:
+-        case Kind::SEQ_NTH:
+-          return true;
+-        default:
+-          break;
++        case Kind::SEQ_NTH: return true;
++        default: break;
+       }
+-      Trace("alf-printer-debug") << "Cannot STRING_REDUCTION " << k << std::endl;
++      Trace("alf-printer-debug")
++          << "Cannot STRING_REDUCTION " << k << std::endl;
+       return false;
+     }
+     break;
+@@ -636,6 +636,16 @@ void AlfPrinter::print(std::ostream& out,
+   // allocate a print channel
+   AlfPrintChannelOut aprint(out, d_lbindUse, d_termLetPrefix, true);
+   print(aprint, pfn, psm);
++  std::cout << "binary proof size: "
++            << aprint.bcf.getEncodedProof().size() * sizeof(uint32_t)
++            << std::endl;
++}
++
++std::vector<uint32_t> AlfPrinter::printBCF(std::shared_ptr<ProofNode> pfn)
++{
++  AlfPrintChannelBCF bcfOut(d_lbindUse);
++  print(bcfOut, pfn, ProofScopeMode::DEFINITIONS_AND_ASSERTIONS);
++  return bcfOut.getEncodedProof();
+ }
+
+ void AlfPrinter::print(AlfPrintChannel& aout,
+@@ -948,7 +958,8 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+   TNode conclusion = d_tproc.convert(pn->getResult());
+   TNode conclusionPrint;
+   // print conclusion only if option is set, or this is false
+-  if (options().proof.proofPrintConclusion || conclusion == d_false || d_bcfFormat)
++  if (options().proof.proofPrintConclusion || conclusion == d_false
++      || d_bcfFormat)
+   {
+     conclusionPrint = conclusion;
+   }
+@@ -956,7 +967,7 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+   std::vector<std::shared_ptr<ProofNode>> children;
+   getChildrenFromProofRule(pn, children);
+   std::vector<Node> args;
+-  bool handled = isHandled(options(), pn);
++  bool handled = isHandled(options(), pn, d_bcfFormat);
+   if (handled)
+   {
+     getArgsFromProofRule(pn, args);
+@@ -1028,16 +1039,16 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+     }
+     else
+     {
+-      // Assuming the body of the scope has identifier id_0, the following prints:
+-      // (step-pop id_1 :rule scope :premises (id_0))
++      // Assuming the body of the scope has identifier id_0, the following
++      // prints: (step-pop id_1 :rule scope :premises (id_0))
+       // ...
+       // (step-pop id_n :rule scope :premises (id_{n-1}))
+       // (step id :rule process_scope :premises (id_n) :args (C))
+       size_t tmpId;
+       for (size_t i = 0, nargs = args.size(); i < nargs; i++)
+       {
+-        // Manually increment proof id counter and premises. Note they will only be
+-        // used locally here to chain together the pops mentioned above.
++        // Manually increment proof id counter and premises. Note they will only
++        // be used locally here to chain together the pops mentioned above.
+         tmpId = d_pfIdCounter;
+         d_pfIdCounter++;
+         out->printStep(r, rname, Node::null(), tmpId, premises, {}, true);
+diff --git a/src/proof/alf/alf_printer.h b/src/proof/alf/alf_printer.h
+index a1c0f24394..dac3ed230f 100644
+--- a/src/proof/alf/alf_printer.h
++++ b/src/proof/alf/alf_printer.h
+@@ -67,6 +67,8 @@ class AlfPrinter : protected EnvObj
+   void print(AlfPrintChannel& out,
+              std::shared_ptr<ProofNode> pfn,
+              ProofScopeMode psm = ProofScopeMode::DEFINITIONS_AND_ASSERTIONS);
++
++  std::vector<uint32_t> printBCF(std::shared_ptr<ProofNode> pfn);
+   /**
+    * Print the proof, assuming that previous proofs have been printed on this
+    * printer that have (partially) given the definition of subterms and
+diff --git a/src/proof/alf/bcf.h b/src/proof/alf/bcf.h
+index b9c6f20fe1..3a09b06db9 100644
+--- a/src/proof/alf/bcf.h
++++ b/src/proof/alf/bcf.h
+@@ -22,6 +22,7 @@
+ #define BCF_SIGN_EXTEND 0x40
+ #define BCF_ZERO_EXTEND 0x50
+ #define BCF_CONCAT 0x60
++#define BCF_BVSIZE 0x70
+
+ /* BCF bitvec predicate (BCF_BV_PRED) */
+ #define BCF_BITOF 0x00
+diff --git a/src/smt/proof_manager.cpp b/src/smt/proof_manager.cpp
+index 7878ae52f3..66937dfdb8 100644
+--- a/src/smt/proof_manager.cpp
++++ b/src/smt/proof_manager.cpp
+@@ -267,6 +267,13 @@ std::shared_ptr<ProofNode> PfManager::connectProofToAssertions(
+   }
+ }
+
++std::vector<uint32_t> PfManager::printProofBCF(std::shared_ptr<ProofNode> fp)
++{
++    proof::AlfNodeConverter atp(nodeManager());
++    proof::AlfPrinter alfp(d_env, atp, d_rewriteDb.get(), 1, true);
++    return alfp.printBCF(fp);
++}
++
+ void PfManager::printProof(std::ostream& out,
+                            std::shared_ptr<ProofNode> fp,
+                            options::ProofFormatMode mode,
+diff --git a/src/smt/proof_manager.h b/src/smt/proof_manager.h
+index 4db96d2d3a..3cc0a58a45 100644
+--- a/src/smt/proof_manager.h
++++ b/src/smt/proof_manager.h
+@@ -104,6 +104,8 @@ class PfManager : protected EnvObj
+                   ProofScopeMode scopeMode,
+                   const std::map<Node, std::string>& assertionNames =
+                       std::map<Node, std::string>());
++
++  std::vector<uint32_t> printProofBCF(std::shared_ptr<ProofNode> fp);
+
+   /**
+    * Translate difficulty map. This takes a mapping dmap from preprocessed
+diff --git a/src/smt/solver_engine.cpp b/src/smt/solver_engine.cpp
+index c5c129be71..3e191f6335 100644
+--- a/src/smt/solver_engine.cpp
++++ b/src/smt/solver_engine.cpp
+@@ -1431,6 +1431,11 @@ void SolverEngine::ensureWellFormedTerms(const std::vector<Node>& ns,
+   }
+ }
+
++std::vector<uint32_t> SolverEngine::printProofBCF(std::shared_ptr<ProofNode> fp)
++{
++    return d_pfManager->printProofBCF(fp);
++}
++
+ void SolverEngine::printProof(std::ostream& out,
+                               std::shared_ptr<ProofNode> fp,
+                               modes::ProofFormat proofFormat,
+diff --git a/src/smt/solver_engine.h b/src/smt/solver_engine.h
+index 47a564e831..4416ad8be9 100644
+--- a/src/smt/solver_engine.h
++++ b/src/smt/solver_engine.h
+@@ -1061,6 +1061,8 @@ class CVC5_EXPORT SolverEngine
+                   modes::ProofFormat proofFormat,
+                   const std::map<Node, std::string>& assertionNames);
+
++  std::vector<uint32_t> printProofBCF(std::shared_ptr<ProofNode> fp);
++
+   /* Members -------------------------------------------------------------- */
+
+   /** Solver instance that owns this SolverEngine instance. */
+--
+2.34.1
+

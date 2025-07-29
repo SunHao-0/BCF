@@ -1,0 +1,52 @@
+From d7ed0560c813d9f17d206c1bdb9ed8fdd0ec7b93 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 15:57:01 +0100
+Subject: [PATCH 27/32] bpf: Add refinement in check_mem_region_access()
+
+Add pointer offset refinement for other memory accesses.
+
+Signed-of-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 9e6204bf9b67..7b16fe63a897 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5852,7 +5852,7 @@ static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
+ 	if (err) {
+ 		verbose(env, "R%d min value is outside of the allowed memory range\n",
+ 			regno);
+-		return err;
++		goto out;
+ 	}
+
+ 	/* If we haven't set a max value then we need to bail since we can't be
+@@ -5866,13 +5866,19 @@ static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
+ 	}
+ 	err = __check_mem_access(env, regno, reg->umax_value + off, size,
+ 				 mem_size, zero_size_allowed);
+-	if (err) {
++	if (err)
+ 		verbose(env, "R%d max value is outside of the allowed memory range\n",
+ 			regno);
+-		return err;
+-	}
+
+-	return 0;
++out:
++	if (err) {
++		int bcf_err;
++
++		bcf_err = bcf_refine_access_bound(env, regno, off, 0, mem_size, size);
++		if (!bcf_err)
++			verbose(env, "bcf requested, try to refine R%d off\n", regno);
++	}
++	return err;
+ }
+
+ static int __check_ptr_off_reg(struct bpf_verifier_env *env,
+--
+2.34.1
+

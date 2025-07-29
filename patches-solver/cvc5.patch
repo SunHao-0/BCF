@@ -1,0 +1,4603 @@
+diff --git a/include/cvc5/c/cvc5.h b/include/cvc5/c/cvc5.h
+index e65c4bc2cb..b93802113a 100644
+--- a/include/cvc5/c/cvc5.h
++++ b/include/cvc5/c/cvc5.h
+@@ -5569,6 +5569,12 @@ CVC5_EXPORT const char* cvc5_proof_to_string(Cvc5* cvc5,
+                                              size_t size,
+                                              const Cvc5Term assertions[],
+                                              const char* names[]);
++
++
++CVC5_EXPORT const uint32_t* cvc5_proof_to_bcf(Cvc5* cvc5,
++                                              Cvc5Proof proof,
++                                              size_t *expr_size,
++                                              size_t *step_size);
+ /** @} */
+ 
+ #if __cplusplus
+diff --git a/include/cvc5/cvc5.h b/include/cvc5/cvc5.h
+index 011fdd575c..4a6e7048d6 100644
+--- a/include/cvc5/cvc5.h
++++ b/include/cvc5/cvc5.h
+@@ -6122,6 +6122,9 @@ class CVC5_EXPORT Solver
+       const std::map<cvc5::Term, std::string>& assertionNames =
+           std::map<cvc5::Term, std::string>()) const;
+ 
++  std::pair<std::vector<uint32_t>, std::vector<uint32_t>> proofToBCF(
++    Proof proof
++  ) const;
+   /**
+    * Get a list of learned literals that are entailed by the current set of
+    * assertions.
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 2d02c302bd..cba536a6c3 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -158,6 +158,9 @@ libcvc5_add_sources(
+   proof/alf/alf_print_channel.h
+   proof/alf/alf_printer.cpp
+   proof/alf/alf_printer.h
++  proof/alf/bcf.h
++  proof/alf/bcf_stubs.h
++  proof/alf/bcf.c
+   proof/assumption_proof_generator.cpp
+   proof/assumption_proof_generator.h
+   proof/buffered_proof_generator.cpp
+diff --git a/src/api/c/cvc5.cpp b/src/api/c/cvc5.cpp
+index c8a00e22c4..ab5e148732 100644
+--- a/src/api/c/cvc5.cpp
++++ b/src/api/c/cvc5.cpp
+@@ -5533,6 +5533,26 @@ const char* cvc5_proof_to_string(Cvc5* cvc5,
+   return str.c_str();
+ }
+ 
++const uint32_t* cvc5_proof_to_bcf(Cvc5* cvc5,
++                                 Cvc5Proof proof,
++                                 size_t *expr_size,
++                                 size_t *step_size)
++{
++  static thread_local std::vector<uint32_t> bcf;
++  CVC5_CAPI_TRY_CATCH_BEGIN;
++  CVC5_CAPI_CHECK_NOT_NULL(cvc5);
++  CVC5_CAPI_CHECK_PROOF(proof);
++  auto p = proof->d_cvc5->d_solver.proofToBCF(proof->d_proof);
++  bcf.clear();
++  bcf.reserve(p.first.size() + p.second.size());
++  bcf.insert(bcf.end(), p.first.begin(), p.first.end());
++  bcf.insert(bcf.end(), p.second.begin(), p.second.end());
++  *expr_size = p.first.size();
++  *step_size = p.second.size();
++  CVC5_CAPI_TRY_CATCH_END;
++  return bcf.data();
++}
++
+ Cvc5Term cvc5_declare_sygus_var(Cvc5* cvc5, const char* symbol, Cvc5Sort sort)
+ {
+   Cvc5Term res = nullptr;
+diff --git a/src/api/cpp/cvc5.cpp b/src/api/cpp/cvc5.cpp
+index 0d82acbf81..0fad6d81e4 100644
+--- a/src/api/cpp/cvc5.cpp
++++ b/src/api/cpp/cvc5.cpp
+@@ -7996,6 +7996,14 @@ std::vector<Proof> Solver::getProof(modes::ProofComponent c) const
+   CVC5_API_TRY_CATCH_END;
+ }
+ 
++std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
++Solver::proofToBCF(Proof proof) const
++{
++  CVC5_API_TRY_CATCH_BEGIN;
++  return this->d_slv->printProofBCF(proof.d_proofNode);
++  CVC5_API_TRY_CATCH_END;
++}
++
+ std::string Solver::proofToString(
+     Proof proof,
+     modes::ProofFormat format,
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 8136f68561..0feeb97cda 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -17,11 +17,16 @@
+ 
+ #include <sstream>
+ 
++#include "bcf.h"
+ #include "expr/node_algorithm.h"
+ #include "expr/skolem_manager.h"
+ #include "printer/printer.h"
+ #include "proof/trust_id.h"
+ #include "rewriter/rewrite_db.h"
++#include "theory/builtin/generic_op.h"
++#include "util/bitvector.h"
++#include "util/divisible.h"
++#include "util/real_algebraic_number.h"
+ 
+ namespace cvc5::internal {
+ namespace proof {
+@@ -30,15 +35,21 @@ AlfPrintChannel::AlfPrintChannel() {}
+ 
+ AlfPrintChannel::~AlfPrintChannel() {}
+ 
++void AlfPrintChannel::printLetList(LetBinding& lbind) {}
++
++std::ostream& AlfPrintChannel::getOStream() { return std::cout; }
++
+ AlfPrintChannelOut::AlfPrintChannelOut(std::ostream& out,
+                                        const LetBinding* lbind,
+                                        const std::string& tprefix,
+                                        bool trackWarn)
+-    : d_out(out),
++    : bcf(lbind),
++      d_out(out),
+       d_lbind(lbind),
+       d_termLetPrefix(tprefix),
+       d_trackWarn(trackWarn)
+ {
++  bcf.d_ok = false;
+ }
+ 
+ void AlfPrintChannelOut::printNode(TNode n)
+@@ -59,15 +70,18 @@ void AlfPrintChannelOut::printAssume(TNode n, size_t i, bool isPush)
+   d_out << "(" << (isPush ? "assume-push" : "assume") << " @p" << i;
+   printNode(n);
+   d_out << ")" << std::endl;
++  bcf.printAssume(n, i, isPush);
+ }
+ 
+-void AlfPrintChannelOut::printStep(const std::string& rname,
++void AlfPrintChannelOut::printStep(ProofRule r,
++                                   const std::string& rname,
+                                    TNode n,
+                                    size_t i,
+                                    const std::vector<size_t>& premises,
+                                    const std::vector<Node>& args,
+                                    bool isPop)
+ {
++  bcf.printStep(r, rname, n, i, premises, args, isPop);
+   printStepInternal(rname, n, i, premises, args, isPop, false);
+ }
+ 
+@@ -133,6 +147,7 @@ void AlfPrintChannelOut::printTrustStep(ProofRule r,
+                                         const std::vector<Node>& args,
+                                         TNode nc)
+ {
++  bcf.printTrustStep(r, n, i, premises, args, nc);
+   Assert(!nc.isNull());
+   if (d_trackWarn)
+   {
+@@ -172,6 +187,25 @@ void AlfPrintChannelOut::printTrustStep(ProofRule r,
+   printStepInternal("trust", n, i, premises, {nc}, false, true);
+ }
+ 
++void AlfPrintChannelOut::printLetList(LetBinding& lbind)
++{
++  bcf.printLetList(lbind);
++  std::vector<Node> letList;
++  lbind.letify(letList);
++  std::map<Node, size_t>::const_iterator it;
++  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
++  {
++    Node n = letList[i];
++    // use define command which does not invoke type checking
++    d_out << "(define " << d_termLetPrefix << lbind.getId(n);
++    d_out << " () ";
++    Printer::getPrinter(d_out)->toStream(d_out, n, &lbind, false);
++    d_out << ")" << std::endl;
++  }
++}
++
++std::ostream& AlfPrintChannelOut::getOStream() { return d_out; }
++
+ void AlfPrintChannelOut::printNodeInternal(std::ostream& out, Node n)
+ {
+   if (d_lbind)
+@@ -211,7 +245,8 @@ void AlfPrintChannelPre::printAssume(TNode n, size_t i, bool isPush)
+   processInternal(n);
+ }
+ 
+-void AlfPrintChannelPre::printStep(const std::string& rname,
++void AlfPrintChannelPre::printStep(ProofRule r,
++                                   const std::string& rname,
+                                    TNode n,
+                                    size_t i,
+                                    const std::vector<size_t>& premises,
+@@ -248,5 +283,822 @@ void AlfPrintChannelPre::processInternal(const Node& n)
+   d_keep.insert(n);  // probably not necessary
+ }
+ 
++/* BCF Channel */
++AlfPrintChannelBCF::AlfPrintChannelBCF(const LetBinding* lbind) : d_lbind(lbind)
++{
++  Assert(lbind);
++}
++
++static_assert(sizeof(struct bcf_expr) == sizeof(u32));
++
++u32 AlfPrintChannelBCF::addExpr(struct bcf_expr* expr)
++{
++  u32 ret = d_exprs.size();
++  d_exprs.push_back(*(u32*)expr);
++  for (int i = 0; i < expr->vlen; i++) d_exprs.push_back(expr->args[i]);
++  return ret;
++}
++
++static_assert(sizeof(struct bcf_proof_step) == sizeof(u32));
++
++u32 AlfPrintChannelBCF::addStep(struct bcf_proof_step* step)
++{
++  u32 ret = d_steps.size();
++  d_steps.push_back(*(u32*)step);
++  for (int i = 0; i < step->vlen; i++) d_steps.push_back(step->args[i]);
++  return ret;
++}
++
++struct bcf_expr_args
++{
++  u8 code;
++  u8 vlen;
++  u16 params;
++  u32 args[255];
++};
++
++static_assert(offsetof(struct bcf_expr_args, args)
++              == offsetof(struct bcf_expr, args));
++
++u32 AlfPrintChannelBCF::addNode(Node node)
++{
++  struct bcf_expr_args expr_buf = {0};
++  struct bcf_expr* expr = (struct bcf_expr*)&expr_buf;
++
++  Assert(d_lbind);
++  if (!d_ok) return 0;
++
++  if (node.getKind() == Kind::APPLY_UF)
++  {
++    Node op = node.getOperator();
++    if (op.getName() == "@purify")
++    {
++      Assert(node.getNumChildren() == 1);
++      node = node[0];
++    }
++  }
++
++  if (node.getKind() == Kind::SKOLEM)
++  {
++    node = SkolemManager::getUnpurifiedForm(node);
++    if (node.getKind() == Kind::SKOLEM)
++    {
++      NodeManager* nm = NodeManager::currentNM();
++      SkolemManager* sm = nm->getSkolemManager();
++      SkolemId id;
++      Node cacheVal;
++
++      sm->isSkolemFunction(node, id, cacheVal);
++      std::cerr << "unsupported skolem id(" << id << "): " << node << std::endl;
++      d_ok = false;
++      return 0;
++    }
++  }
++
++  /* first, try to find in let id to idx map */
++  u32 l_id = d_lbind->getId(node);
++  if (l_id)
++  {
++    auto it = d_letIdMap.find(l_id);
++    if (it != d_letIdMap.end()) return it->second;
++  }
++  else
++  {
++    /* try to find in node to idx map */
++    auto it = d_nodeIdxMap.find(node);
++    if (it != d_nodeIdxMap.end()) return it->second;
++  }
++
++  encodeExpr(node, expr, true);
++  if (!d_ok) return 0;
++  u32 idx = addExpr(expr);
++  if (std::getenv("BCF_DEBUG")) std::cerr << idx << ": " << node << std::endl;
++  if (l_id)
++    d_letIdMap[l_id] = idx;
++  else
++    d_nodeIdxMap[node] = idx;
++
++  return idx;
++}
++
++static u64 getUInt64(TNode n)
++{
++  Assert(n.getKind() == Kind::CONST_INTEGER
++         && n.getConst<Rational>().sgn() >= 0);
++
++  u64 val = n.getConst<Rational>().getNumerator().getUnsigned64();
++  Assert(Rational(val) == n.getConst<Rational>());
++
++  return val;
++}
++
++void AlfPrintChannelBCF::encodeExpr(Node node,
++                                    struct bcf_expr* expr,
++                                    bool handle_args)
++{
++  std::vector<Node> args(node.begin(), node.end());
++  return encodeExpr(node, args, expr, handle_args);
++}
++
++void AlfPrintChannelBCF::encodeExpr(Node op,
++                                    std::vector<Node> args,
++                                    struct bcf_expr* expr,
++                                    bool handle_args)
++{
++  static const std::map<Kind, u8> kind_table = {
++      /* BV operations */
++      {Kind::BITVECTOR_ADD, BCF_BV_ALU | BPF_ADD},
++      {Kind::BITVECTOR_SUB, BCF_BV_ALU | BPF_SUB},
++      {Kind::BITVECTOR_MULT, BCF_BV_ALU | BPF_MUL},
++      {Kind::BITVECTOR_OR, BCF_BV_ALU | BPF_OR},
++      {Kind::BITVECTOR_AND, BCF_BV_ALU | BPF_AND},
++      {Kind::BITVECTOR_SHL, BCF_BV_ALU | BPF_LSH},
++      {Kind::BITVECTOR_LSHR, BCF_BV_ALU | BPF_RSH},
++      {Kind::BITVECTOR_ASHR, BCF_BV_ALU | BPF_ARSH},
++      {Kind::BITVECTOR_XOR, BCF_BV_ALU | BPF_XOR},
++      {Kind::BITVECTOR_UDIV, BCF_BV_ALU | BPF_DIV},
++      {Kind::BITVECTOR_NEG, BCF_BV_ALU | BPF_NEG},
++      {Kind::BITVECTOR_UREM, BCF_BV_ALU | BPF_MOD},
++      /* BV ext operations */
++      {Kind::BITVECTOR_EXTRACT, BCF_BV_ALU | BCF_EXT | BCF_EXTRACT},
++      {Kind::BITVECTOR_ZERO_EXTEND, BCF_BV_ALU | BCF_EXT | BCF_ZERO_EXTEND},
++      {Kind::BITVECTOR_SIGN_EXTEND, BCF_BV_ALU | BCF_EXT | BCF_SIGN_EXTEND},
++      {Kind::BITVECTOR_FROM_BOOLS, BCF_BV_ALU | BCF_EXT | BCF_BBT},
++      {Kind::BITVECTOR_CONCAT, BCF_BV_ALU | BCF_EXT | BCF_CONCAT},
++      {Kind::BITVECTOR_BIT, BCF_BV_PRED | BCF_BITOF},
++      {Kind::BITVECTOR_SIZE, BCF_BV_ALU | BCF_EXT | BCF_BVSIZE},
++      {Kind::CONST_BITVECTOR, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL},
++      /* BV predicate operations */
++      {Kind::BITVECTOR_UGT, BCF_BV_PRED | BPF_JGT},
++      {Kind::BITVECTOR_UGE, BCF_BV_PRED | BPF_JGE},
++      {Kind::BITVECTOR_SGT, BCF_BV_PRED | BPF_JSGT},
++      {Kind::BITVECTOR_SGE, BCF_BV_PRED | BPF_JSGE},
++      {Kind::BITVECTOR_ULT, BCF_BV_PRED | BPF_JLT},
++      {Kind::BITVECTOR_ULE, BCF_BV_PRED | BPF_JLE},
++      {Kind::BITVECTOR_SLT, BCF_BV_PRED | BPF_JSLT},
++      {Kind::BITVECTOR_SLE, BCF_BV_PRED | BPF_JSLE},
++      /* TODO not sure about the differences between this and bv constant */
++      {Kind::CONST_BITVECTOR_SYMBOLIC, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL},
++
++      /* TODO Treat int as bv, fix this later */
++      {Kind::ADD, BCF_BV_ALU | BPF_ADD},
++      {Kind::SUB, BCF_BV_ALU | BPF_SUB},
++      {Kind::MULT, BCF_BV_ALU | BPF_MUL},
++      {Kind::NEG, BCF_BV_ALU | BPF_NEG},
++      {Kind::CONST_INTEGER, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL},
++      {Kind::POW2, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL},
++      {Kind::GT, BCF_BV_PRED | BPF_JSGT},
++      {Kind::GEQ, BCF_BV_PRED | BPF_JSGE},
++      {Kind::LT, BCF_BV_PRED | BPF_JSLT},
++      {Kind::LEQ, BCF_BV_PRED | BPF_JSLE},
++
++      /* Boolean operations */
++      {Kind::NOT, BCF_BOOL_PRED | BCF_NOT},
++      {Kind::AND, BCF_BOOL_PRED | BCF_CONJ},
++      {Kind::IMPLIES, BCF_BOOL_PRED | BCF_IMPLIES},
++      {Kind::OR, BCF_BOOL_PRED | BCF_DISJ},
++      {Kind::XOR, BCF_BOOL_PRED | BCF_XOR},
++      {Kind::ITE, BCF_BOOL_PRED | BCF_ITE},
++      {Kind::CONST_BOOLEAN, BCF_BOOL_PRED | BCF_BOOL_VAL},
++      {Kind::EQUAL, BCF_BOOL_PRED | BCF_EQUIV},
++
++      /* overloaded, determine sort later */
++      {Kind::VARIABLE, BCF_BV_ALU | BCF_EXT | BCF_BV_VAR},
++
++      {Kind::SEXPR, BCF_BUILTIN | BCF_ARG_LIST},
++  };
++
++  Kind kind = op.getKind();
++  TypeNode ty = op.getType();
++
++  if (kind == Kind::APPLY_UF)
++  {
++    const std::map<std::string, Kind> symbol_map = {
++        {"@bit", Kind::BITVECTOR_BIT},
++        {"@list", Kind::SEXPR},
++        {"extract", Kind::BITVECTOR_EXTRACT},
++        {"sign_extend", Kind::BITVECTOR_SIGN_EXTEND},
++        {"zero_extend", Kind::BITVECTOR_ZERO_EXTEND},
++    };
++
++    op = op.getOperator();
++    Assert(op.getKind() == Kind::RAW_SYMBOL);
++
++    auto kind_it = symbol_map.find(op.getName());
++    if (kind_it == symbol_map.end())
++    {
++      std::cerr << "unsupported raw symbol: " << op.getName() << std::endl;
++      goto err_out;
++    }
++
++    kind = kind_it->second;
++  }
++  else if (kind == Kind::APPLY_INDEXED_SYMBOLIC)
++  {
++    Node inner = op.getOperator();
++    kind = inner.getConst<GenericOp>().getKind();
++  }
++
++  if (kind_table.find(kind) == kind_table.end())
++  {
++    std::cerr << "Unsupported kind (" << kind << "): " << op << std::endl;
++    goto err_out;
++  }
++  if (args.size() > UINT8_MAX)
++  {
++    std::cerr << "too many children: " << args.size() << std::endl;
++    goto err_out;
++  }
++  if (ty.isBitVector() && ty.getBitVectorSize() > UINT8_MAX)
++  {
++    std::cerr << "bv too big: " << ty.getBitVectorSize() << std::endl;
++    goto err_out;
++  }
++
++  expr->code = kind_table.find(kind)->second;
++  expr->vlen = args.size();
++  expr->params = 0;
++  if (ty.isBitVector())
++    expr->params = ty.getBitVectorSize();
++  else if (ty.isInteger())
++    expr->params = 64; /* treat integer as a 64-bits bv */
++
++  switch (kind)
++  {
++    case Kind::BITVECTOR_ADD:
++    case Kind::BITVECTOR_SUB:
++    case Kind::BITVECTOR_MULT:
++    case Kind::BITVECTOR_OR:
++    case Kind::BITVECTOR_AND:
++    case Kind::BITVECTOR_XOR:
++    case Kind::BITVECTOR_CONCAT:
++      Assert(expr->params);
++      Assert(expr->vlen >= 2);
++      break;
++    case Kind::BITVECTOR_FROM_BOOLS:
++      Assert(expr->params);
++      Assert(expr->vlen >= 1);
++      break;
++    case Kind::BITVECTOR_SHL:
++    case Kind::BITVECTOR_LSHR:
++    case Kind::BITVECTOR_ASHR:
++    case Kind::BITVECTOR_UDIV:
++    case Kind::BITVECTOR_UREM:
++      Assert(expr->vlen == 2);
++      Assert(expr->params);
++      break;
++    case Kind::BITVECTOR_NEG:
++      Assert(expr->vlen == 1);
++      Assert(expr->params);
++      break;
++    case Kind::BITVECTOR_SIZE:
++      Assert(expr->vlen == 1);
++      Assert(expr->params == 64);
++      break;
++
++    case Kind::BITVECTOR_UGT:
++    case Kind::BITVECTOR_UGE:
++    case Kind::BITVECTOR_SGT:
++    case Kind::BITVECTOR_SGE:
++    case Kind::BITVECTOR_ULT:
++    case Kind::BITVECTOR_ULE:
++    case Kind::BITVECTOR_SLT:
++    case Kind::BITVECTOR_SLE:
++      Assert(expr->vlen == 2);
++      Assert(!expr->params);
++      Assert(args[0].getType().isBitVector());
++      expr->params = args[0].getType().getBitVectorSize();
++      break;
++
++    case Kind::ADD:
++    case Kind::SUB:
++    case Kind::MULT:
++      Assert(expr->vlen >= 2);
++      Assert(expr->params == 64);
++      break;
++    case Kind::NEG:
++      Assert(expr->vlen == 1);
++      Assert(expr->params == 64);
++      break;
++
++    case Kind::GT:
++    case Kind::GEQ:
++    case Kind::LT:
++    case Kind::LEQ:
++      Assert(expr->vlen == 2);
++      expr->params = 64;
++      break;
++
++    case Kind::NOT: Assert(!expr->params && expr->vlen == 1); break;
++    case Kind::EQUAL:
++    case Kind::IMPLIES: Assert(!expr->params && expr->vlen == 2); break;
++    case Kind::AND:
++    case Kind::OR:
++    case Kind::XOR: Assert(!expr->params && expr->vlen >= 2); break;
++    case Kind::ITE: Assert(expr->vlen == 3); break;
++
++    case Kind::BITVECTOR_BIT:
++    {
++      Assert(ty.isBoolean());
++      Assert(args.size() == 2);
++      Assert(args[0].getKind() == Kind::CONST_INTEGER);
++      Assert(args[1].getType().isBitVector());
++
++      u16 bit = getUInt64(args[0]);
++      expr->params = args[1].getType().getBitVectorSize();
++      Assert(bit < expr->params);
++
++      expr->params |= bit << 8;
++      expr->vlen = 1;
++      args.erase(args.begin());
++      break;
++    }
++
++    case Kind::BITVECTOR_EXTRACT:
++    {
++      Assert(args.size() == 3);
++      Assert(args[0].getKind() == Kind::CONST_INTEGER);
++      Assert(args[1].getKind() == Kind::CONST_INTEGER);
++      Assert(args[2].getType().isBitVector());
++
++      expr->params = getUInt64(args[1]);
++      expr->params |= (u16)getUInt64(args[0]) << 8;
++      expr->vlen = 1;
++      args.erase(args.begin(), args.begin() + 2);
++      break;
++    }
++
++    case Kind::BITVECTOR_ZERO_EXTEND:
++    case Kind::BITVECTOR_SIGN_EXTEND:
++    {
++      Assert(args.size() == 2);
++      Assert(args[0].getKind() == Kind::CONST_INTEGER);
++      Assert(args[1].getType().isBitVector());
++
++      u32 ext = getUInt64(args[0]);
++      expr->params |= (u16)ext << 8;
++      expr->vlen = 1;
++      args.erase(args.begin());
++      break;
++    }
++
++    case Kind::CONST_BITVECTOR:
++    {
++      const BitVector& bv = op.getConst<BitVector>();
++
++      Assert(args.empty() && expr->params == bv.getSize());
++
++      if (bv.getSize() > 64)
++      {
++        std::cerr << "bv const too big: " << bv.getSize() << std::endl;
++        goto err_out;
++      }
++
++      u64 val = bv.getValue().getUnsigned64();
++      expr->args[0] = val;
++      expr->vlen = 1;
++      if (bv.getSize() > 32)
++      {
++        expr->args[1] = val >> 32;
++        expr->vlen++;
++      }
++
++      break;
++    }
++
++    case Kind::POW2:
++    {
++      Assert(args.size() == 1);
++      Assert(expr->params == 64);
++      if (!args[0].isConst())
++      {
++        std::cerr << "pow2 arg non-const: " << args[0].getKind() << std::endl;
++        goto err_out;
++      }
++
++      u64 n = getUInt64(args[0]);
++      if (n > 64)
++      {
++        std::cerr << "pow2 too big: 1<<" << n << std::endl;
++        goto err_out;
++      }
++
++      u64 val = 1 << n;
++      expr->vlen = 2;
++      expr->args[0] = val;
++      expr->args[1] = val >> 32;
++      break;
++    }
++
++    case Kind::CONST_INTEGER:
++    {
++      Assert(args.empty() && expr->params == 64);
++      u64 val = getUInt64(op);
++      expr->vlen = 2;
++      expr->args[0] = val;
++      expr->args[1] = val >> 32;
++      break;
++    }
++
++    case Kind::CONST_BOOLEAN:
++    {
++      expr->vlen = 0;
++      expr->params = op.getConst<bool>() ? BCF_BOOL_TRUE : BCF_BOOL_FALSE;
++      break;
++    }
++
++    /* TODO handle @bv correctly */
++    case Kind::CONST_BITVECTOR_SYMBOLIC:
++    case Kind::VARIABLE:
++    {
++      expr->vlen = 0;
++      if (ty.isBitVector() || ty.isInteger())
++        expr->code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR;
++      else if (ty.isBoolean())
++      {
++        Assert(!expr->params);
++        expr->code = BCF_BOOL_PRED | BCF_BOOL_VAR;
++      }
++      else
++      {
++        std::cerr << "Unsupported variable type: " << kind << std::endl;
++        goto err_out;
++      }
++      break;
++    }
++
++    /* handle special const list in chain_resolutoin */
++    case Kind::SEXPR: Assert(expr->vlen); break;
++
++    default: std::cerr << "unhandled kind: " << kind << std::endl; goto err_out;
++  }
++
++  if (handle_args)
++  {
++    for (size_t i = 0; i < args.size(); i++) expr->args[i] = addNode(args[i]);
++  }
++  return;
++
++err_out:
++  d_ok = false;
++  return;
++}
++
++struct bcf_proof_step_args
++{
++  __u16 rule;
++  __u8 vlen;
++  __u8 params;
++  __u32 args[255];
++};
++
++static_assert(offsetof(struct bcf_proof_step_args, args)
++              == offsetof(struct bcf_proof_step, args));
++
++void AlfPrintChannelBCF::printAssume(TNode n, size_t i, bool isPush)
++{
++  struct bcf_proof_step_args step_buf = {0};
++  struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++
++  if (isPush) d_ok = false;
++  if (!d_ok) return;
++
++  step->rule = BCF_RULE_BUILTIN | BCF_RULE_ASSUME;
++  step->vlen = 1;
++  step->args[0] = addNode(n);
++  addStep(step);
++  return;
++}
++
++void AlfPrintChannelBCF::printStep(ProofRule r,
++                                   const std::string& rname,
++                                   TNode n,
++                                   size_t i,
++                                   const std::vector<size_t>& premises,
++                                   const std::vector<Node>& args,
++                                   bool isPop)
++{
++  static const std::map<ProofRule, u16> rule_table = {
++      {ProofRule::REFL, BCF_RULE_REFL | BCF_RULE_EQUALITY},
++      {ProofRule::SYMM, BCF_RULE_SYMM | BCF_RULE_EQUALITY},
++      {ProofRule::TRANS, BCF_RULE_TRANS | BCF_RULE_EQUALITY},
++      {ProofRule::CONG, BCF_RULE_CONG | BCF_RULE_EQUALITY},
++      {ProofRule::NARY_CONG, BCF_RULE_CONG | BCF_RULE_EQUALITY},
++      // {ProofRule::HO_CONG, BCF_RULE_CONG | BCF_RULE_EQUALITY},
++      {ProofRule::TRUE_INTRO, BCF_RULE_TRUE_INTRO | BCF_RULE_EQUALITY},
++      {ProofRule::TRUE_ELIM, BCF_RULE_TRUE_ELIM | BCF_RULE_EQUALITY},
++      {ProofRule::FALSE_INTRO, BCF_RULE_FALSE_INTRO | BCF_RULE_EQUALITY},
++      {ProofRule::FALSE_ELIM, BCF_RULE_FALSE_ELIM | BCF_RULE_EQUALITY},
++
++      {ProofRule::FACTORING, BCF_RULE_FACTORING | BCF_RULE_BOOLEAN},
++      {ProofRule::REORDERING, BCF_RULE_REORDERING | BCF_RULE_BOOLEAN},
++      {ProofRule::RESOLUTION, BCF_RULE_RESOLUTION | BCF_RULE_BOOLEAN},
++      {ProofRule::CHAIN_RESOLUTION,
++       BCF_RULE_CHAIN_RESOLUTION | BCF_RULE_BOOLEAN},
++      {ProofRule::SPLIT, BCF_RULE_SPLIT | BCF_RULE_BOOLEAN},
++      {ProofRule::EQ_RESOLVE, BCF_RULE_EQ_RESOLVE | BCF_RULE_BOOLEAN},
++      {ProofRule::MODUS_PONENS, BCF_RULE_MODUS_PONENS | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_NOT_ELIM, BCF_RULE_NOT_NOT_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::CONTRA, BCF_RULE_CONTRA | BCF_RULE_BOOLEAN},
++      {ProofRule::AND_ELIM, BCF_RULE_AND_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::AND_INTRO, BCF_RULE_AND_INTRO | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_OR_ELIM, BCF_RULE_NOT_OR_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::IMPLIES_ELIM, BCF_RULE_IMPLIES_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_IMPLIES_ELIM1,
++       BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_IMPLIES_ELIM2,
++       BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::EQUIV_ELIM1, BCF_RULE_EQUIV_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::EQUIV_ELIM2, BCF_RULE_EQUIV_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_EQUIV_ELIM1, BCF_RULE_NOT_EQUIV_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_EQUIV_ELIM2, BCF_RULE_NOT_EQUIV_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::XOR_ELIM1, BCF_RULE_XOR_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::XOR_ELIM2, BCF_RULE_XOR_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_XOR_ELIM1, BCF_RULE_NOT_XOR_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_XOR_ELIM2, BCF_RULE_NOT_XOR_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::ITE_ELIM1, BCF_RULE_ITE_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::ITE_ELIM2, BCF_RULE_ITE_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_ITE_ELIM1, BCF_RULE_NOT_ITE_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_ITE_ELIM2, BCF_RULE_NOT_ITE_ELIM | BCF_RULE_BOOLEAN},
++      {ProofRule::NOT_AND, BCF_RULE_NOT_AND | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_AND_NEG, BCF_RULE_CNF_AND_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_AND_POS, BCF_RULE_CNF_AND_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_OR_POS, BCF_RULE_CNF_OR_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_OR_NEG, BCF_RULE_CNF_OR_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_IMPLIES_POS, BCF_RULE_CNF_IMPLIES_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_IMPLIES_NEG1,
++       BCF_RULE_CNF_IMPLIES_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_IMPLIES_NEG2,
++       BCF_RULE_CNF_IMPLIES_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_EQUIV_POS1, BCF_RULE_CNF_EQUIV_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_EQUIV_POS2, BCF_RULE_CNF_EQUIV_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_EQUIV_NEG1, BCF_RULE_CNF_EQUIV_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_EQUIV_NEG2, BCF_RULE_CNF_EQUIV_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_XOR_POS1, BCF_RULE_CNF_XOR_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_XOR_POS2, BCF_RULE_CNF_XOR_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_XOR_NEG1, BCF_RULE_CNF_XOR_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_XOR_NEG2, BCF_RULE_CNF_XOR_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_ITE_POS1, BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_ITE_POS2, BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_ITE_POS3, BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_ITE_NEG1, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_ITE_NEG2, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::CNF_ITE_NEG3, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOLEAN},
++      {ProofRule::ITE_EQ, BCF_RULE_ITE_EQ | BCF_RULE_BOOLEAN},
++
++      {ProofRule::BV_BITBLAST_STEP, BCF_RULE_BITBLAST | BCF_RULE_BV},
++
++      {ProofRule::SKOLEM_INTRO, BCF_RULE_REFL | BCF_RULE_EQUALITY},
++  };
++
++  struct bcf_proof_step_args step_buf = {0};
++  struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++  bool trust = false;
++  u16 code;
++
++  if (isPop) d_ok = false;
++  if (!d_ok) return;
++
++  if (premises.size() + args.size() > UINT8_MAX)
++  {
++    std::cerr << r << ": too many premises/args: " << premises.size() + args.size()
++              << std::endl;
++    std::cerr << "fallback to trusted" << std::endl;
++    trust = true;
++  }
++
++  auto it = rule_table.find(r);
++  if (it == rule_table.end() || trust)
++  {
++    if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
++    code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
++  } else {
++    code = it->second;
++
++  }
++
++  encodeStep(code, r, n, i, premises, args, step);
++  addStep(step);
++
++  return;
++}
++
++void AlfPrintChannelBCF::printTrustStep(ProofRule r,
++                                        TNode n,
++                                        size_t i,
++                                        const std::vector<size_t>& premises,
++                                        const std::vector<Node>& args,
++                                        TNode nc)
++{
++  struct bcf_proof_step_args step_buf = {0};
++  struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++  u16 code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
++
++  if (!d_ok) return;
++
++  if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
++
++  encodeStep(code, r, n, i, premises, args, step);
++  addStep(step);
++
++  return;
++}
++
++void AlfPrintChannelBCF::printLetList(LetBinding& lbind) { return; }
++
++void AlfPrintChannelBCF::encodeStep(u16 code,
++                                    ProofRule orig_rule,
++                                    TNode conclusion,
++                                    size_t step_id,
++                                    const std::vector<size_t>& premises,
++                                    const std::vector<Node>& args,
++                                    struct bcf_proof_step* step)
++{
++  struct bcf_expr_args expr_buf = {0};
++  struct bcf_expr* expr = (struct bcf_expr*)&expr_buf;
++
++  step->rule = code;
++  step->vlen = 0;
++  step->params = 0;
++
++  if (code == (BCF_RULE_BUILTIN | BCF_RULE_REWRITE)
++      || code == (BCF_RULE_BV | BCF_RULE_BITBLAST)
++      || code == (BCF_RULE_BOOLEAN | BCF_RULE_FACTORING)
++      || code == (BCF_RULE_BOOLEAN | BCF_RULE_REORDERING))
++  {
++    /* if a trusted step does not have any conclusion, we cannot continue.
++     * For instance, scope.
++     */
++    if (conclusion.isNull()) goto err_out;
++    u32 idx = addNode(conclusion);
++    step->args[step->vlen++] = idx;
++    return;
++  }
++
++  for (size_t i = 0; i < premises.size(); i++)
++    step->args[step->vlen++] = premises[i] - 1;
++
++  switch (code)
++  {
++    case BCF_RULE_REFL | BCF_RULE_EQUALITY:
++      Assert(premises.empty());
++      Assert(args.size() == 1);
++      break;
++    case BCF_RULE_SYMM | BCF_RULE_EQUALITY:
++    case BCF_RULE_TRUE_INTRO | BCF_RULE_EQUALITY:
++    case BCF_RULE_TRUE_ELIM | BCF_RULE_EQUALITY:
++    case BCF_RULE_FALSE_INTRO | BCF_RULE_EQUALITY:
++    case BCF_RULE_FALSE_ELIM | BCF_RULE_EQUALITY:
++      Assert(premises.size() == 1);
++      Assert(args.size() == 0);
++      break;
++    case BCF_RULE_TRANS | BCF_RULE_EQUALITY:
++      Assert(premises.size() >= 1);
++      Assert(args.size() == 0);
++      break;
++
++    case BCF_RULE_CONG | BCF_RULE_EQUALITY:
++    {
++      Assert(conclusion.getNumChildren() == 2);
++      encodeExpr(conclusion[0], expr, false);
++      u32 code_encoding = expr->code;
++      code_encoding |= (u32)expr->vlen << 8;
++      code_encoding |= (u32)expr->params << 16;
++      step->args[step->vlen++] = code_encoding;
++      return;
++    }
++
++    case BCF_RULE_RESOLUTION | BCF_RULE_BOOLEAN:
++    {
++      Assert(args.size() == 2);
++      step->params = args[0].getConst<bool>() ? BCF_BOOL_TRUE : BCF_BOOL_FALSE;
++      step->args[step->vlen++] = addNode(args[1]);
++      return;
++    }
++
++    case BCF_RULE_CHAIN_RESOLUTION | BCF_RULE_BOOLEAN:
++    {
++      Assert(args.size() == 2);
++      Node pols = args[0];
++      expr->code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAL;
++      expr->vlen = (pols.getNumChildren() + 31) / 32;
++      expr->params = pols.getNumChildren();
++      u32* expr_args = expr->args;
++      for (size_t i = 0; i < pols.getNumChildren(); i++)
++      {
++        u32 v = pols[i].getConst<bool>() ? 1 : 0;
++        expr_args[i / 32] |= (v << (i % 32));
++      }
++      u32 pol_idx = addExpr(expr);
++      u32 pivot_idx = addNode(args[1]);
++      step->args[step->vlen++] = pol_idx;
++      step->args[step->vlen++] = pivot_idx;
++      return;
++    }
++
++    case BCF_RULE_SPLIT | BCF_RULE_BOOLEAN:
++      Assert(args.size() == 1);
++      Assert(premises.empty());
++      break;
++    case BCF_RULE_EQ_RESOLVE | BCF_RULE_BOOLEAN:
++    case BCF_RULE_MODUS_PONENS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_NOT_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CONTRA | BCF_RULE_BOOLEAN:
++    case BCF_RULE_AND_INTRO | BCF_RULE_BOOLEAN:
++    case BCF_RULE_IMPLIES_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_AND | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_AND_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_OR_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_IMPLIES_POS | BCF_RULE_BOOLEAN: break;
++    case BCF_RULE_ITE_EQ | BCF_RULE_BOOLEAN: break;
++
++    case BCF_RULE_AND_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_OR_ELIM | BCF_RULE_BOOLEAN:
++      Assert(args.size() == 1);
++      step->params = getUInt64(args[0]);
++      return;
++
++    case BCF_RULE_CNF_AND_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_OR_NEG | BCF_RULE_BOOLEAN:
++      step->args[step->vlen++] = addNode(args[0]);
++      step->params = getUInt64(args[1]);
++      return;
++
++    case BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_EQUIV_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_EQUIV_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_XOR_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_XOR_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_ITE_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_NOT_ITE_ELIM | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_IMPLIES_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_EQUIV_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_EQUIV_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_XOR_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_XOR_NEG | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOLEAN:
++    case BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOLEAN:
++      switch (orig_rule)
++      {
++        case ProofRule::NOT_IMPLIES_ELIM1:
++        case ProofRule::EQUIV_ELIM1:
++        case ProofRule::NOT_EQUIV_ELIM1:
++        case ProofRule::XOR_ELIM1:
++        case ProofRule::NOT_XOR_ELIM1:
++        case ProofRule::ITE_ELIM1:
++        case ProofRule::NOT_ITE_ELIM1:
++        case ProofRule::CNF_IMPLIES_NEG1:
++        case ProofRule::CNF_EQUIV_POS1:
++        case ProofRule::CNF_EQUIV_NEG1:
++        case ProofRule::CNF_XOR_POS1:
++        case ProofRule::CNF_XOR_NEG1:
++        case ProofRule::CNF_ITE_POS1:
++        case ProofRule::CNF_ITE_NEG1: step->params = 0; break;
++        case ProofRule::NOT_IMPLIES_ELIM2:
++        case ProofRule::EQUIV_ELIM2:
++        case ProofRule::NOT_EQUIV_ELIM2:
++        case ProofRule::XOR_ELIM2:
++        case ProofRule::NOT_XOR_ELIM2:
++        case ProofRule::ITE_ELIM2:
++        case ProofRule::NOT_ITE_ELIM2:
++        case ProofRule::CNF_IMPLIES_NEG2:
++        case ProofRule::CNF_EQUIV_POS2:
++        case ProofRule::CNF_EQUIV_NEG2:
++        case ProofRule::CNF_XOR_POS2:
++        case ProofRule::CNF_XOR_NEG2:
++        case ProofRule::CNF_ITE_POS2:
++        case ProofRule::CNF_ITE_NEG2: step->params = 1; break;
++        case ProofRule::CNF_ITE_POS3:
++        case ProofRule::CNF_ITE_NEG3: step->params = 2; break;
++        default:
++          std::cerr << "unsupported rule: " << orig_rule << std::endl;
++          goto err_out;
++      }
++      break;
++
++    default:
++      std::cerr << "unsupported rule: " << orig_rule << std::endl;
++      goto err_out;
++  }
++
++  for (size_t i = 0; i < args.size(); i++)
++  {
++    u32 idx = addNode(args[i]);
++    step->args[step->vlen++] = idx;
++  }
++  return;
++
++err_out:
++  d_ok = false;
++  return;
++}
++
++std::pair<std::vector<u32>, std::vector<u32>>
++AlfPrintChannelBCF::getEncodedProof()
++{
++  if (!d_ok) return {};
++  return {d_exprs, d_steps};
++}
++
+ }  // namespace proof
+ }  // namespace cvc5::internal
+diff --git a/src/proof/alf/alf_print_channel.h b/src/proof/alf/alf_print_channel.h
+index 33af4df150..f5250dd2d5 100644
+--- a/src/proof/alf/alf_print_channel.h
++++ b/src/proof/alf/alf_print_channel.h
+@@ -20,7 +20,9 @@
+ 
+ #include <iostream>
+ #include <map>
++#include <utility>
+ 
++#include "bcf.h"
+ #include "expr/node.h"
+ #include "printer/let_binding.h"
+ #include "proof/proof_node.h"
+@@ -54,7 +56,8 @@ class AlfPrintChannel
+    * @param args The arguments of the proof rule.
+    * @param isPop Whether this is a step-pop command.
+    */
+-  virtual void printStep(const std::string& rname,
++  virtual void printStep(ProofRule r,
++                         const std::string& rname,
+                          TNode n,
+                          size_t i,
+                          const std::vector<size_t>& premises,
+@@ -67,6 +70,69 @@ class AlfPrintChannel
+                               const std::vector<size_t>& premises,
+                               const std::vector<Node>& args,
+                               TNode conc) = 0;
++  virtual void printLetList(LetBinding& lbind);
++  virtual std::ostream& getOStream();
++};
++
++/** Prints the proof in BCF format */
++class AlfPrintChannelBCF : public AlfPrintChannel
++{
++ public:
++  typedef uint32_t u32;
++
++  AlfPrintChannelBCF(const LetBinding* lbind);
++
++  /* don't care */
++  void printNode(TNode n) override{};
++  void printTypeNode(TypeNode tn) override{};
++
++  /* encode the assume step, isPush must be false */
++  void printAssume(TNode n, size_t i, bool isPush) override;
++  void printStep(ProofRule r,
++                 const std::string& rname,
++                 TNode n,
++                 size_t i,
++                 const std::vector<size_t>& premises,
++                 const std::vector<Node>& args,
++                 bool isPop = false) override;
++  void printTrustStep(ProofRule r,
++                      TNode n,
++                      size_t i,
++                      const std::vector<size_t>& premises,
++                      const std::vector<Node>& args,
++                      TNode conc) override;
++  void printLetList(LetBinding& lbind) override;
++
++  std::pair<std::vector<u32>, std::vector<u32>> getEncodedProof();
++  bool d_ok = true;
++
++ private:
++  void encodeExpr(Node n, struct bcf_expr* expr, bool handle_args = true);
++  void encodeExpr(Node op,
++                  std::vector<Node> args,
++                  struct bcf_expr* expr,
++                  bool handle_args);
++  void encodeStep(u16 code,
++                  ProofRule orig_rule,
++                  TNode conclusion,
++                  size_t step_id,
++                  const std::vector<size_t>& premises,
++                  const std::vector<Node>& args,
++                  struct bcf_proof_step* step);
++
++  u32 addExpr(struct bcf_expr* expr);
++  u32 addStep(struct bcf_proof_step* step);
++  u32 addNode(Node node);
++
++  /** The let binding */
++  const LetBinding* d_lbind;
++  /* From let expr id to idx in d_exprs */
++  std::map<u32, u32> d_letIdMap;
++  /* From node to idx in d_exprs */
++  std::map<Node, u32> d_nodeIdxMap;
++  std::vector<u32> d_exprs;
++  std::vector<u32> d_steps;
++  std::unordered_set<ProofRule> d_trusted;
+ };
+ 
+ /** Prints the proof to output stream d_out */
+@@ -80,7 +146,8 @@ class AlfPrintChannelOut : public AlfPrintChannel
+   void printNode(TNode n) override;
+   void printTypeNode(TypeNode tn) override;
+   void printAssume(TNode n, size_t i, bool isPush) override;
+-  void printStep(const std::string& rname,
++  void printStep(ProofRule r,
++                 const std::string& rname,
+                  TNode n,
+                  size_t i,
+                  const std::vector<size_t>& premises,
+@@ -92,6 +159,8 @@ class AlfPrintChannelOut : public AlfPrintChannel
+                       const std::vector<size_t>& premises,
+                       const std::vector<Node>& args,
+                       TNode conc) override;
++  void printLetList(LetBinding& lbind) override;
++  std::ostream& getOStream() override;
+ 
+   /**
+    * Print node to stream in the expected format of ALF.
+@@ -101,7 +170,7 @@ class AlfPrintChannelOut : public AlfPrintChannel
+    * Print type node to stream in the expected format of ALF.
+    */
+   void printTypeNodeInternal(std::ostream& out, TypeNode tn);
+-  std::ostream& getOStream() { return d_out; }
++  AlfPrintChannelBCF bcf;
+ 
+  private:
+   /**
+@@ -142,7 +211,8 @@ class AlfPrintChannelPre : public AlfPrintChannel
+   void printNode(TNode n) override;
+   void printTypeNode(TypeNode tn) override;
+   void printAssume(TNode n, size_t i, bool isPush) override;
+-  void printStep(const std::string& rname,
++  void printStep(ProofRule r,
++                 const std::string& rname,
+                  TNode n,
+                  size_t i,
+                  const std::vector<size_t>& premises,
+@@ -163,7 +233,6 @@ class AlfPrintChannelPre : public AlfPrintChannel
+   /** Process that we will print node n in the final proof */
+   void processInternal(const Node& n);
+ };
+-
+ }  // namespace proof
+ }  // namespace cvc5::internal
+ 
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index 7a38281a37..b0b0f81673 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -15,7 +15,11 @@
+ 
+ #include "proof/alf/alf_printer.h"
+ 
++#include <errno.h>
++#include <unistd.h>
++
+ #include <cctype>
++#include <cstring>
+ #include <iostream>
+ #include <memory>
+ #include <ostream>
+@@ -41,7 +45,8 @@ namespace proof {
+ AlfPrinter::AlfPrinter(Env& env,
+                        BaseAlfNodeConverter& atp,
+                        rewriter::RewriteDb* rdb,
+-                       uint32_t letThresh)
++                       uint32_t letThresh,
++                       bool bcfFormat)
+     : EnvObj(env),
+       d_tproc(atp),
+       d_pfIdCounter(0),
+@@ -57,10 +62,12 @@ AlfPrinter::AlfPrinter(Env& env,
+       // utility.
+       d_lbind(d_termLetPrefix, letThresh, true, true),
+       d_lbindUse(options().proof.proofDagGlobal ? &d_lbind : nullptr),
+-      d_aletify(d_lbindUse)
++      d_aletify(d_lbindUse),
++      d_bcfFormat(bcfFormat)
+ {
+   d_pfType = nodeManager()->mkSort("proofType");
+   d_false = nodeManager()->mkConst(false);
++  if (!d_bcfFormat && std::getenv("BCF_PROOF_CHECK")) d_bcfFormat = true;
+ }
+ 
+ bool AlfPrinter::isHandled(const Options& opts, const ProofNode* pfn)
+@@ -224,12 +231,11 @@ bool AlfPrinter::isHandled(const Options& opts, const ProofNode* pfn)
+         case Kind::STRING_REPLACE:
+         case Kind::STRING_STOI:
+         case Kind::STRING_ITOS:
+-        case Kind::SEQ_NTH:
+-          return true;
+-        default:
+-          break;
++        case Kind::SEQ_NTH: return true;
++        default: break;
+       }
+-      Trace("alf-printer-debug") << "Cannot STRING_REDUCTION " << k << std::endl;
++      Trace("alf-printer-debug")
++          << "Cannot STRING_REDUCTION " << k << std::endl;
+       return false;
+     }
+     break;
+@@ -615,20 +621,88 @@ void AlfPrinter::printDslRule(std::ostream& out, ProofRewriteRule r)
+ 
+ LetBinding* AlfPrinter::getLetBinding() { return d_lbindUse; }
+ 
+-void AlfPrinter::printLetList(std::ostream& out, LetBinding& lbind)
++extern "C" int bcf_check_proof(struct bpf_verifier_env* verifier_env,
++                               union __bpf_attr* attr,
++                               bpfptr_t uattr);
++
++static void test_bcf_proof_checker(std::vector<u32> exprs,
++                                   std::vector<u32> steps)
+ {
+-  std::vector<Node> letList;
+-  lbind.letify(letList);
+-  std::map<Node, size_t>::const_iterator it;
+-  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
++  if (exprs.empty())
+   {
+-    Node n = letList[i];
+-    // use define command which does not invoke type checking
+-    out << "(define " << d_termLetPrefix << lbind.getId(n);
+-    out << " () ";
+-    Printer::getPrinter(out)->toStream(out, n, &lbind, false);
+-    out << ")" << std::endl;
++    std::cerr << "bcf exprs empty" << std::endl;
++    return;
+   }
++  if (steps.empty())
++  {
++    std::cerr << "bcf steps empty" << std::endl;
++    return;
++  }
++
++  std::cerr << "bcf proof size: "
++            << (exprs.size() + steps.size()) * sizeof(uint32_t) << std::endl;
++
++  std::vector<u32> proof;
++  struct bcf_proof_header hdr = {.magic = BCF_MAGIC,
++                                 .expr_cnt = (u32)exprs.size(),
++                                 .step_cnt = (u32)steps.size()};
++  proof.reserve(exprs.size() + steps.size() + sizeof(hdr));
++  proof.push_back(hdr.magic);
++  proof.push_back(hdr.expr_cnt);
++  proof.push_back(hdr.step_cnt);
++  proof.insert(proof.end(), exprs.begin(), exprs.end());
++  proof.insert(proof.end(), steps.begin(), steps.end());
++
++  u32 proof_size = proof.size() * sizeof(u32);
++  u32* proof_data = proof.data();
++  union __bpf_attr attr = {0};
++  attr.bcf_buf = (u64)(void*)proof_data;
++  attr.bcf_buf_size = proof_size;
++
++  int err;
++  int err_code;
++  if (std::getenv("BCF_KERNEL_CHECKER"))
++  {
++#ifndef __NR_bpf
++#if defined(__i386__)
++#define __NR_bpf 357
++#elif defined(__x86_64__)
++#define __NR_bpf 321
++#elif defined(__aarch64__)
++#define __NR_bpf 280
++#elif defined(__sparc__)
++#define __NR_bpf 349
++#elif defined(__s390__)
++#define __NR_bpf 351
++#elif defined(__arc__)
++#define __NR_bpf 280
++#elif defined(__mips__) && defined(_ABIO32)
++#define __NR_bpf 4355
++#elif defined(__mips__) && defined(_ABIN32)
++#define __NR_bpf 6319
++#elif defined(__mips__) && defined(_ABI64)
++#define __NR_bpf 5315
++#else
++#error __NR_bpf not defined. bpf checker does not support your arch.
++#endif
++#endif
++    err = syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
++    err_code = errno;
++  }
++  else
++  {
++    struct bpf_verifier_env env = {0};
++    bpfptr_t uattr = make_bpfptr((u64)(void*)&attr, false);
++    attr.bcf_buf_true_size = proof_size;
++    err = bcf_check_proof(&env, &attr, uattr);
++    err_code = err;
++  }
++
++  if (err < 0)
++    std::cerr << "proof rejected: " << std::strerror(err_code) << std::endl;
++  else
++    std::cerr << "proof accepted" << std::endl;
++  return;
+ }
+ 
+ void AlfPrinter::print(std::ostream& out,
+@@ -641,10 +715,24 @@ void AlfPrinter::print(std::ostream& out,
+   options::ioutils::applyPrintSkolemDefinitions(out, true);
+   // allocate a print channel
+   AlfPrintChannelOut aprint(out, d_lbindUse, d_termLetPrefix, true);
++  aprint.bcf.d_ok = d_bcfFormat;
+   print(aprint, pfn, psm);
++  if (d_bcfFormat)
++  {
++    auto p = aprint.bcf.getEncodedProof();
++    test_bcf_proof_checker(p.first, p.second);
++  }
++}
++
++std::pair<std::vector<uint32_t>, std::vector<uint32_t>> AlfPrinter::printBCF(
++    std::shared_ptr<ProofNode> pfn)
++{
++  AlfPrintChannelBCF bcfOut(d_lbindUse);
++  print(bcfOut, pfn, ProofScopeMode::DEFINITIONS_AND_ASSERTIONS);
++  return bcfOut.getEncodedProof();
+ }
+ 
+-void AlfPrinter::print(AlfPrintChannelOut& aout,
++void AlfPrinter::print(AlfPrintChannel& aout,
+                        std::shared_ptr<ProofNode> pfn,
+                        ProofScopeMode psm)
+ {
+@@ -709,7 +797,7 @@ void AlfPrinter::print(AlfPrintChannelOut& aout,
+         out << outDef.str();
+       }
+       // [3] print proof-level term bindings
+-      printLetList(out, d_lbind);
++      ao->printLetList(d_lbind);
+     }
+     // [4] print (unique) assumptions, including definitions
+     std::unordered_set<Node> processed;
+@@ -740,7 +828,7 @@ void AlfPrinter::print(AlfPrintChannelOut& aout,
+       size_t id = allocateAssumeId(n, wasAlloc);
+       Node f = d_tproc.convert(n[0]);
+       Node lam = d_tproc.convert(n[1]);
+-      ao->printStep("refl", f.eqNode(lam), id, {}, {lam});
++      ao->printStep(ProofRule::REFL, "refl", f.eqNode(lam), id, {}, {lam});
+     }
+     // [5] print proof body
+     printProofInternal(ao, pnBody, i == 1);
+@@ -753,11 +841,9 @@ void AlfPrinter::printNext(AlfPrintChannelOut& aout,
+   const ProofNode* pnBody = pfn.get();
+   // print with letification
+   printProofInternal(&d_aletify, pnBody, false);
+-  // print the new let bindings
+-  std::ostream& out = aout.getOStream();
+   // Print new terms from the let binding. note that this should print only
+   // the terms we have yet to see so far.
+-  printLetList(out, d_lbind);
++  aout.printLetList(d_lbind);
+   // print the proof
+   printProofInternal(&aout, pnBody, true);
+ }
+@@ -956,7 +1042,8 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+   TNode conclusion = d_tproc.convert(pn->getResult());
+   TNode conclusionPrint;
+   // print conclusion only if option is set, or this is false
+-  if (options().proof.proofPrintConclusion || conclusion == d_false)
++  if (options().proof.proofPrintConclusion || conclusion == d_false
++      || d_bcfFormat)
+   {
+     conclusionPrint = conclusion;
+   }
+@@ -1036,19 +1123,19 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+     }
+     else
+     {
+-      // Assuming the body of the scope has identifier id_0, the following prints:
+-      // (step-pop id_1 :rule scope :premises (id_0))
++      // Assuming the body of the scope has identifier id_0, the following
++      // prints: (step-pop id_1 :rule scope :premises (id_0))
+       // ...
+       // (step-pop id_n :rule scope :premises (id_{n-1}))
+       // (step id :rule process_scope :premises (id_n) :args (C))
+       size_t tmpId;
+       for (size_t i = 0, nargs = args.size(); i < nargs; i++)
+       {
+-        // Manually increment proof id counter and premises. Note they will only be
+-        // used locally here to chain together the pops mentioned above.
++        // Manually increment proof id counter and premises. Note they will only
++        // be used locally here to chain together the pops mentioned above.
+         tmpId = d_pfIdCounter;
+         d_pfIdCounter++;
+-        out->printStep(rname, Node::null(), tmpId, premises, {}, true);
++        out->printStep(r, rname, Node::null(), tmpId, premises, {}, true);
+         // The current id is the premises of the next.
+         premises.clear();
+         premises.push_back(tmpId);
+@@ -1056,14 +1143,14 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+       // Finish with the process scope step.
+       std::vector<Node> pargs;
+       pargs.push_back(d_tproc.convert(children[0]->getResult()));
+-      out->printStep("process_scope", conclusionPrint, id, premises, pargs);
++      out->printStep(r, "process_scope", conclusionPrint, id, premises, pargs);
+     }
+     // We are done with the assumptions in scope, pop a context.
+     d_passumeCtx.pop();
+   }
+   else
+   {
+-    out->printStep(rname, conclusionPrint, id, premises, args);
++    out->printStep(r, rname, conclusionPrint, id, premises, args);
+   }
+ }
+ 
+diff --git a/src/proof/alf/alf_printer.h b/src/proof/alf/alf_printer.h
+index 03421d605d..9e3f2c251b 100644
+--- a/src/proof/alf/alf_printer.h
++++ b/src/proof/alf/alf_printer.h
+@@ -44,7 +44,8 @@ class AlfPrinter : protected EnvObj
+   AlfPrinter(Env& env,
+              BaseAlfNodeConverter& atp,
+              rewriter::RewriteDb* rdb,
+-             uint32_t letThresh = 2);
++             uint32_t letThresh = 2,
++             bool bcfFormat = false);
+   ~AlfPrinter() {}
+ 
+   /**
+@@ -63,9 +64,12 @@ class AlfPrinter : protected EnvObj
+    * @param pfn The proof node.
+    * @param psm The scope mode.
+    */
+-  void print(AlfPrintChannelOut& out,
++  void print(AlfPrintChannel& out,
+              std::shared_ptr<ProofNode> pfn,
+              ProofScopeMode psm = ProofScopeMode::DEFINITIONS_AND_ASSERTIONS);
++
++  std::pair<std::vector<uint32_t>, std::vector<uint32_t>> printBCF(
++      std::shared_ptr<ProofNode> pfn);
+   /**
+    * Print the proof, assuming that previous proofs have been printed on this
+    * printer that have (partially) given the definition of subterms and
+@@ -160,8 +164,6 @@ class AlfPrinter : protected EnvObj
+    * Allocate (if necessary) the identifier for step
+    */
+   size_t allocateProofId(const ProofNode* pn, bool& wasAlloc);
+-  /** Print let list to output stream out */
+-  void printLetList(std::ostream& out, LetBinding& lbind);
+   /** Reference to the term processor */
+   BaseAlfNodeConverter& d_tproc;
+   /** Assume id counter */
+@@ -198,6 +200,8 @@ class AlfPrinter : protected EnvObj
+   LetBinding* d_lbindUse;
+   /** The letification channel. */
+   AlfPrintChannelPre d_aletify;
++  /* print to bcf format. */
++  bool d_bcfFormat;
+ };
+ 
+ }  // namespace proof
+diff --git a/src/proof/alf/bcf.c b/src/proof/alf/bcf.c
+new file mode 100644
+index 0000000000..e6f2fcd6b2
+--- /dev/null
++++ b/src/proof/alf/bcf.c
+@@ -0,0 +1,2314 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "bcf_stubs.h"
++#include "bcf.h"
++
++#define EXPR_BUF_LEN 255
++#define CMP_STACK_SIZE 128
++
++struct expr_cmp_state {
++	struct bcf_expr *e0;
++	struct bcf_expr *e1;
++	u32 cur_arg;
++};
++
++struct bcf_checker_env {
++	struct bpf_verifier_env *verifier_env;
++	struct bcf_expr *exprs; /* bcf expression buffer */
++	u32 expr_cnt;
++	u32 expr_size;
++	unsigned long *expr_idx_bitmap; /* valid expr index */
++	u32 bitmap_size;
++	u32 step_cnt; /* total step count */
++	struct bcf_proof_step *steps;
++	int goal; /* goal to prove, idx to exprs */
++	u32 cur_step; /* current checking step */
++	u32 *step_facts; /* conclusion of each step, idx to exprs */
++
++	struct {
++		u16 code;
++		u8 vlen;
++		u8 params;
++		u32 args[EXPR_BUF_LEN];
++	} expr_buf; /* tmp buffer for building expr */
++
++	struct expr_cmp_state cmp_stack[CMP_STACK_SIZE]; /* for expr equiv cmp */
++};
++
++static bool valid_idx(struct bcf_checker_env *env, u32 idx)
++{
++	return idx < env->bitmap_size && test_bit(idx, env->expr_idx_bitmap);
++}
++
++static bool is_ite(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_ITE);
++}
++
++static bool bv_expr(struct bcf_expr *expr)
++{
++	u8 class = BPF_CLASS(expr->code);
++
++	if (is_ite(expr->code))
++		return expr->params != 0;
++
++	return class == BCF_BV_ALU;
++}
++
++static bool is_pred_class(u8 code)
++{
++	return BPF_CLASS(code) == BCF_BV_PRED ||
++	       BPF_CLASS(code) == BCF_BOOL_PRED;
++}
++
++static bool pred_expr(struct bcf_expr *expr)
++{
++	if (is_ite(expr->code))
++		return expr->params == 0;
++
++	return is_pred_class(expr->code);
++}
++
++static bool is_pred_false(struct bcf_expr *expr)
++{
++	return expr->code == (BCF_BOOL_PRED | BCF_BOOL_VAL) &&
++	       BCF_PRED_VAL(expr->params) == BCF_BOOL_FALSE;
++}
++
++static bool is_pred_true(struct bcf_expr *expr)
++{
++	return expr->code == (BCF_BOOL_PRED | BCF_BOOL_VAL) &&
++	       BCF_PRED_VAL(expr->params) == BCF_BOOL_TRUE;
++}
++
++static bool is_disj(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_DISJ);
++}
++
++static bool is_conj(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_CONJ);
++}
++
++static bool is_equiv(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_EQUIV) ||
++	       code == (BCF_BV_PRED | BPF_JEQ);
++}
++
++static bool is_xor(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_XOR);
++}
++
++static bool is_implies(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_IMPLIES);
++}
++
++static bool is_pred_not(u8 code)
++{
++	return code == (BCF_BOOL_PRED | BCF_NOT);
++}
++
++static bool is_bv_var(u8 code)
++{
++	return code == (BCF_BV_ALU | BCF_EXT | BCF_BV_VAR);
++}
++
++static bool is_bv_val(u8 code)
++{
++	return code == (BCF_BV_ALU | BCF_EXT | BCF_BV_VAL);
++}
++
++static bool is_bitof(u8 code)
++{
++	return code == (BCF_BV_PRED | BCF_BITOF);
++}
++
++static bool bcf_code_intable(u8 code)
++{
++#define BV_ALU(OP)	(BCF_BV_ALU | BPF_##OP)
++#define BV_EXT(OP)	(BCF_BV_ALU | BCF_EXT | BCF_##OP)
++#define BV_PRED(OP)	(BCF_BV_PRED | BPF_##OP)
++#define BOOL_PRED(OP)	(BCF_BOOL_PRED | BCF_##OP)
++#define BCF_OPCODE(MAPPER)			\
++	MAPPER(BV_ALU(ADD)),			\
++	MAPPER(BV_ALU(SUB)),			\
++	MAPPER(BV_ALU(MUL)),			\
++	MAPPER(BV_ALU(OR)),			\
++	MAPPER(BV_ALU(AND)),			\
++	MAPPER(BV_ALU(LSH)),			\
++	MAPPER(BV_ALU(RSH)),			\
++	MAPPER(BV_ALU(XOR)),			\
++	MAPPER(BV_ALU(ARSH)),			\
++	MAPPER(BV_ALU(NEG)),			\
++	MAPPER(BV_ALU(MOD)),			\
++	MAPPER(BV_ALU(DIV)),			\
++	MAPPER(BV_EXT(BV_VAR)),			\
++	MAPPER(BV_EXT(BV_VAL)),			\
++	MAPPER(BV_EXT(BBT)),			\
++	MAPPER(BV_EXT(EXTRACT)),		\
++	MAPPER(BV_EXT(SIGN_EXTEND)),		\
++	MAPPER(BV_EXT(ZERO_EXTEND)),		\
++	MAPPER(BV_EXT(CONCAT)),			\
++	MAPPER(BV_EXT(BVSIZE)),			\
++	MAPPER(BV_PRED(JEQ)),			\
++	MAPPER(BV_PRED(JGT)),			\
++	MAPPER(BV_PRED(JGE)),			\
++	MAPPER(BV_PRED(JNE)),			\
++	MAPPER(BV_PRED(JLT)),			\
++	MAPPER(BV_PRED(JLE)),			\
++	MAPPER(BV_PRED(JSGT)),			\
++	MAPPER(BV_PRED(JSGE)),			\
++	MAPPER(BV_PRED(JSLT)),			\
++	MAPPER(BV_PRED(JSLE)),			\
++	MAPPER((BCF_BV_PRED | BCF_BITOF)),	\
++	MAPPER(BOOL_PRED(BOOL_VAL)),		\
++	MAPPER(BOOL_PRED(BOOL_VAR)),		\
++	MAPPER(BOOL_PRED(CONJ)),		\
++	MAPPER(BOOL_PRED(DISJ)),		\
++	MAPPER(BOOL_PRED(IMPLIES)),		\
++	MAPPER(BOOL_PRED(XOR)),			\
++	MAPPER(BOOL_PRED(ITE)),			\
++	MAPPER(BOOL_PRED(NOT)),			\
++	MAPPER(BOOL_PRED(EQUIV)),		\
++	MAPPER((BCF_BUILTIN | BCF_ARG_LIST))
++
++#define CODE_TBL(OPCODE)	[OPCODE] = true
++	static const bool code_table[256] = {
++		[0 ... 255] = false,
++		BCF_OPCODE(CODE_TBL),
++	};
++#undef BV_ALU
++#undef BV_EXT
++#undef BV_PRED
++#undef BOOL_PRED
++#undef BCF_OPCODE
++#undef CODE_TBL
++	return code_table[code];
++}
++
++static u8 bv_size(struct bcf_expr *expr)
++{
++	u8 op = BPF_OP(expr->code);
++
++	if (op == BCF_EXTRACT) {
++		u8 start = BCF_EXTRACT_START(expr->params);
++		u8 last = BCF_EXTRACT_LAST(expr->params);
++
++		return start - last + 1;
++	}
++
++	return BCF_BV_BITSZ(expr->params);
++}
++
++static int check_bv_arg(struct bcf_checker_env *env, u32 arg, u8 bv_sz)
++{
++	struct bcf_expr *expr;
++
++	if (!valid_idx(env, arg))
++		return -EINVAL;
++
++	expr = env->exprs + arg;
++	if (!bv_expr(expr) || bv_size(expr) != bv_sz)
++		return -EINVAL;
++	return 0;
++}
++
++static int check_bv(struct bcf_checker_env *env, struct bcf_expr *bv)
++{
++	u8 op = BPF_OP(bv->code), bv_sz = BCF_BV_BITSZ(bv->params);
++	int i, err;
++
++	pr_debug("%s: %x %d %x\n", __func__, bv->code, bv->vlen, bv->params);
++
++	switch (op) {
++	case BPF_NEG:
++		if (bv->vlen != 1)
++			return -EINVAL;
++		break;
++	case BPF_LSH:
++	case BPF_RSH:
++	case BPF_ARSH:
++	case BPF_DIV:
++	case BPF_MOD:
++		if (bv->vlen != 2)
++			return -EINVAL;
++		break;
++	case BPF_ADD:
++	case BPF_SUB:
++	case BPF_MUL:
++	case BPF_OR:
++	case BPF_AND:
++	case BPF_XOR:
++		if (bv->vlen < 2)
++			return -EINVAL;
++		break;
++	default:
++		pr_debug("unsupported bv op: %x\n", op);
++		/* BPF_SDIV BPF_SMOD BPF_MOV BPF_SMOV BPF_END */
++		return -ENOTSUPP;
++	}
++
++	if (bv->params & 0xFF00 || !bv_sz)
++		return -EINVAL;
++
++	for (i = 0; i < bv->vlen; i++) {
++		err = check_bv_arg(env, bv->args[i], bv_sz);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int check_bv_ext(struct bcf_checker_env *env, struct bcf_expr *bv_ext)
++{
++	u8 op = BPF_OP(bv_ext->code), bv_sz = bv_size(bv_ext);
++	struct bcf_expr *arg_expr;
++	u8 start, last, ext_sz, u32_bits;
++	u32 arg_bv_sz;
++	int vlen, i;
++
++	pr_debug("%s: %x %d %x\n", __func__, bv_ext->code, bv_ext->vlen,
++		 bv_ext->params);
++	if (op != BCF_EXTRACT && !bv_sz)
++		return -EINVAL;
++
++	switch (op) {
++	case BCF_EXTRACT:
++		start = BCF_EXTRACT_START(bv_ext->params);
++		last = BCF_EXTRACT_LAST(bv_ext->params);
++		if (start < last || bv_ext->vlen != 1)
++			return -EINVAL;
++
++		if (!valid_idx(env, bv_ext->args[0]))
++			return -EINVAL;
++
++		arg_expr = env->exprs + bv_ext->args[0];
++		if (!bv_expr(arg_expr) || bv_size(arg_expr) <= start)
++			return -EINVAL;
++
++		return 0;
++	case BCF_SIGN_EXTEND:
++	case BCF_ZERO_EXTEND:
++		if (bv_ext->vlen != 1)
++			return -EINVAL;
++
++		ext_sz = BCF_BV_EXTSZ(bv_ext->params);
++		if (!ext_sz || ext_sz >= bv_sz)
++			return -EINVAL;
++
++		return check_bv_arg(env, bv_ext->args[0], bv_sz - ext_sz);
++	case BCF_BV_VAL:
++		u32_bits = BITS_PER_BYTE * sizeof(u32);
++		vlen = ALIGN(bv_sz, u32_bits) / u32_bits;
++		/* TODO check unused bits are zeroed */
++		if (bv_ext->vlen != vlen)
++			return -EINVAL;
++		break;
++	case BCF_BV_VAR:
++		if (bv_ext->vlen)
++			return -EINVAL;
++		break;
++	case BCF_CONCAT:
++		if (bv_ext->vlen <= 1)
++			return -EINVAL;
++
++		arg_bv_sz = 0;
++		for (i = 0; i < bv_ext->vlen; i++) {
++			arg_expr = env->exprs + bv_ext->args[i];
++			if (!bv_expr(arg_expr))
++				return -EINVAL;
++			arg_bv_sz += bv_size(arg_expr);
++		}
++
++		if (arg_bv_sz != bv_sz)
++			return -EINVAL;
++		break;
++	case BCF_BBT:
++		if (!bv_ext->vlen || bv_ext->vlen != bv_sz)
++			return -EINVAL;
++		for (i = 0; i < bv_ext->vlen; i++) {
++			arg_expr = env->exprs + bv_ext->args[i];
++			if (!pred_expr(arg_expr))
++				return -EINVAL;
++		}
++		break;
++	case BCF_BVSIZE:
++		/* TODO BVSIZE is actually of the int type */
++		if (bv_ext->vlen != 1 || bv_sz != 64)
++			return -EINVAL;
++		arg_expr = env->exprs + bv_ext->args[0];
++		if (!bv_expr(arg_expr))
++			return -EINVAL;
++		break;
++	default:
++		return -ENOTSUPP;
++	}
++
++	if (bv_ext->params & 0xFF00)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int check_bv_pred(struct bcf_checker_env *env, struct bcf_expr *bv_pred)
++{
++	u8 bv_sz = BCF_BV_BITSZ(bv_pred->params);
++	int err;
++
++	pr_debug("%s: %x %d %x\n", __func__, bv_pred->code, bv_pred->vlen,
++		 bv_pred->params);
++	if (is_bitof(bv_pred->code)) {
++		u8 bit = bv_pred->params >> 8;
++
++		if (bv_pred->vlen != 1 || !bv_sz || bit >= bv_sz)
++			return -EINVAL;
++		return check_bv_arg(env, bv_pred->args[0], bv_sz);
++	}
++
++	if (bv_pred->vlen != 2 || bv_pred->params & 0xFF00)
++		return -EINVAL;
++
++	err = check_bv_arg(env, bv_pred->args[0], bv_sz);
++	err = err ?: check_bv_arg(env, bv_pred->args[1], bv_sz);
++	return err;
++}
++
++static int check_pred_arg(struct bcf_checker_env *env, u32 arg)
++{
++	struct bcf_expr *expr;
++
++	if (!valid_idx(env, arg))
++		return -EINVAL;
++
++	expr = env->exprs + arg;
++	if (!pred_expr(expr))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int check_bool_pred(struct bcf_checker_env *env,
++			   struct bcf_expr *pred_ext)
++{
++	u8 op = BPF_OP(pred_ext->code);
++	u8 vlen = pred_ext->vlen;
++	u16 params = pred_ext->params;
++	u32 *args = pred_ext->args;
++	int i, err;
++
++	pr_debug("%s: %x %d %x\n", __func__, pred_ext->code, pred_ext->vlen,
++		 pred_ext->params);
++	switch (op) {
++	case BCF_NOT:
++		if (vlen != 1)
++			return -EINVAL;
++		break;
++	case BCF_IMPLIES:
++	case BCF_EQUIV:
++		/* TODO equiv is overloaded, needs type check */
++		if (vlen != 2)
++			return -EINVAL;
++		return 0;
++	case BCF_ITE: {
++		if (vlen != 3)
++			return -EINVAL;
++
++		err = check_pred_arg(env, args[0]);
++		if (err)
++			return err;
++
++		if (!pred_ext->params) {
++			err = check_pred_arg(env, args[1]);
++			err = err ?: check_pred_arg(env, args[2]);
++			return err;
++		}
++
++		err = check_bv_arg(env, args[1], params);
++		err = err ?: check_bv_arg(env, args[2], params);
++		return err;
++	}
++	case BCF_CONJ:
++	case BCF_DISJ:
++	case BCF_XOR:
++		if (vlen < 2)
++			return -EINVAL;
++		break;
++	case BCF_BOOL_VAL:
++		if (vlen)
++			return -EINVAL;
++		if (params != BCF_BOOL_TRUE && params != BCF_BOOL_FALSE)
++			return -EINVAL;
++		break;
++	case BCF_BOOL_VAR:
++		if (vlen)
++			return -EINVAL;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (pred_ext->params && op != BCF_BOOL_VAL)
++		return -EINVAL;
++
++	for (i = 0; i < pred_ext->vlen; i++) {
++		err = check_pred_arg(env, args[i]);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int check_builtin_expr(struct bcf_checker_env *env,
++			      struct bcf_expr *expr)
++{
++	u8 op = BPF_OP(expr->code);
++	int i, err;
++
++	if (op != BCF_ARG_LIST)
++		return -EINVAL;
++
++	if (expr->params || !expr->vlen)
++		return -EINVAL;
++
++	for (i = 0; i < expr->vlen; i++) {
++		err = check_pred_arg(env, expr->args[i]);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++static int check_exprs(struct bcf_checker_env *env, struct bcf_expr *exprs,
++		       u32 expr_cnt)
++{
++	u32 idx = 0;
++	int err = 0;
++
++	env->bitmap_size = expr_cnt;
++	env->expr_idx_bitmap = kvmalloc(bitmap_size(expr_cnt), GFP_KERNEL);
++	if (!env->expr_idx_bitmap)
++		return -ENOMEM;
++	bitmap_zero(env->expr_idx_bitmap, expr_cnt);
++
++	BUILD_BUG_ON(sizeof(*exprs) != sizeof(*exprs->args));
++
++	pr_debug("checking exprs...\n");
++	while (idx < expr_cnt) {
++		struct bcf_expr *expr = exprs + idx;
++		u8 class = BPF_CLASS(expr->code);
++		u32 sz = expr->vlen + 1;
++
++		pr_debug("expr#%d: %x\n", idx, expr->code);
++
++		if (idx + sz > expr_cnt) {
++			pr_debug("expr too big: %d\n", sz);
++			return -EINVAL;
++		}
++
++		if (!bcf_code_intable(expr->code)) {
++			pr_debug("invalid code\n");
++			return -EINVAL;
++		}
++
++		if (class == BCF_BV_ALU && BPF_SRC(expr->code) == BCF_EXT)
++			err = check_bv_ext(env, expr);
++		else if (class == BCF_BV_ALU)
++			err = check_bv(env, expr);
++		else if (class == BCF_BV_PRED)
++			err = check_bv_pred(env, expr);
++		else if (class == BCF_BOOL_PRED)
++			err = check_bool_pred(env, expr);
++		else if (class == BCF_BUILTIN)
++			err = check_builtin_expr(env, expr);
++		else
++			err = -EINVAL;
++
++		if (err)
++			return err;
++
++		set_bit(idx, env->expr_idx_bitmap);
++		idx += sz;
++	}
++
++	return err;
++}
++
++static int set_step_fact(struct bcf_checker_env *env, int fact)
++{
++	if (fact < 0)
++		return fact;
++
++	env->step_facts[env->cur_step] = fact;
++	return 0;
++}
++
++static struct bcf_expr *get_premise(struct bcf_checker_env *env, u32 step)
++{
++	if (step >= env->cur_step)
++		return NULL;
++	return env->exprs + env->step_facts[step];
++}
++
++static struct bcf_expr *get_pred_arg(struct bcf_checker_env *env, u32 arg)
++{
++	int err;
++
++	err = check_pred_arg(env, arg);
++	if (err)
++		return NULL;
++	return env->exprs + arg;
++}
++
++static struct bcf_expr *__get_arg(struct bcf_checker_env *env, u32 idx, u8 code)
++{
++	struct bcf_expr *expr;
++
++	if (!valid_idx(env, idx))
++		return NULL;
++
++	expr = env->exprs + idx;
++	if (expr->code != code)
++		return NULL;
++	return expr;
++}
++
++static struct bcf_expr *get_bv_val_arg(struct bcf_checker_env *env, u32 arg)
++{
++	return __get_arg(env, arg, BCF_BV_ALU | BCF_EXT | BCF_BV_VAL);
++}
++
++static struct bcf_expr *get_list_arg(struct bcf_checker_env *env, u32 arg)
++{
++	return __get_arg(env, arg, BCF_BUILTIN | BCF_ARG_LIST);
++}
++
++static struct bcf_expr *get_ite_arg(struct bcf_checker_env *env, u32 arg)
++{
++	return __get_arg(env, arg, BCF_BOOL_PRED | BCF_ITE);
++}
++
++static struct bcf_expr *get_expr_buf(struct bcf_checker_env *env)
++{
++	env->expr_buf.code = 0;
++	env->expr_buf.vlen = 0;
++	env->expr_buf.params = 0;
++	return (struct bcf_expr *)&env->expr_buf;
++}
++
++static struct bcf_expr *reserve_expr_buf(struct bcf_checker_env *env, u32 arg_n)
++{
++	if (arg_n > EXPR_BUF_LEN)
++		return NULL;
++
++	return get_expr_buf(env);
++}
++
++static int add_expr(struct bcf_checker_env *env, struct bcf_expr *expr)
++{
++	u32 cnt = expr->vlen + 1;
++	int ret;
++
++	if (cnt + env->expr_cnt > env->expr_size) {
++		u32 size = env->expr_size;
++		struct bcf_expr *exprs;
++
++		/* two slots for each of the rest steps */
++		size += cnt * (env->step_cnt - env->cur_step);
++		exprs = kvrealloc(env->exprs, size * sizeof(*expr), GFP_KERNEL);
++		if (!exprs) {
++			kvfree(env->exprs);
++			env->exprs = NULL;
++			return -ENOMEM;
++		}
++		env->exprs = exprs;
++		env->expr_size = size;
++	}
++
++	memcpy(env->exprs + env->expr_cnt, expr, sizeof(*expr) * cnt);
++	ret = env->expr_cnt;
++	env->expr_cnt += cnt;
++	return ret;
++}
++
++static int add_not_expr(struct bcf_checker_env *env, u32 idx)
++{
++	struct bcf_expr_unary not_expr = { 0 };
++	struct bcf_expr *expr = (struct bcf_expr *)&not_expr;
++
++	expr->code = BCF_BOOL_PRED | BCF_NOT;
++	expr->args[expr->vlen++] = idx;
++	return add_expr(env, expr);
++}
++
++static int add_equiv(struct bcf_checker_env *env, u32 arg0, u32 arg1)
++{
++	struct bcf_expr_binary equiv = { 0 };
++	struct bcf_expr *expr = (struct bcf_expr *)&equiv;
++
++	expr->code = BCF_BOOL_PRED | BCF_EQUIV;
++	expr->vlen = 2;
++	expr->args[0] = arg0;
++	expr->args[1] = arg1;
++	return add_expr(env, expr);
++}
++
++static int add_disj(struct bcf_checker_env *env, u32 arg0, u32 arg1)
++{
++	struct bcf_expr_binary disj = { 0 };
++	struct bcf_expr *expr = (struct bcf_expr *)&disj;
++
++	expr->code = BCF_BOOL_PRED | BCF_DISJ;
++	expr->vlen = 2;
++	expr->args[0] = arg0;
++	expr->args[1] = arg1;
++	return add_expr(env, expr);
++}
++
++static int add_disj3(struct bcf_checker_env *env, u32 arg0, u32 arg1, u32 arg2)
++{
++	struct bcf_expr_ternary disj = { 0 };
++	struct bcf_expr *expr = (struct bcf_expr *)&disj;
++
++	expr->code = BCF_BOOL_PRED | BCF_DISJ;
++	expr->vlen = 3;
++	expr->args[0] = arg0;
++	expr->args[1] = arg1;
++	expr->args[2] = arg2;
++	return add_expr(env, expr);
++}
++
++static int add_ite(struct bcf_checker_env *env, u32 cond, u32 f0, u32 f1)
++{
++	struct bcf_expr_ternary ite = { 0 };
++	struct bcf_expr *expr = (struct bcf_expr *)&ite;
++
++	expr->code = BCF_BOOL_PRED | BCF_ITE;
++	expr->vlen = 3;
++	expr->args[0] = cond;
++	expr->args[1] = f0;
++	expr->args[2] = f1;
++	return add_expr(env, expr);
++}
++
++/* Expression node level comparison without considering children */
++static bool expr_node_equiv(struct bcf_expr *e0, struct bcf_expr *e1)
++{
++	if (e0->code != e1->code || e0->vlen != e1->vlen ||
++	    e0->params != e1->params)
++		return false;
++
++	if (is_bv_val(e0->code)) {
++		int i = 0;
++
++		for (; i < e0->vlen && e0->args[i] == e1->args[i]; i++)
++			;
++
++		return i == e0->vlen;
++	}
++
++	return true;
++}
++
++#define BCF_VAR_IDX_MAP_SIZE 128
++struct bcf_var_map {
++	struct bcf_idx_pair {
++		u32 idx0;
++		u32 idx1;
++	} pair[BCF_VAR_IDX_MAP_SIZE];
++	u32 cnt;
++};
++
++static bool var_equiv(struct bcf_var_map *map, u32 v0, u32 v1)
++{
++	int i;
++
++	if (!map)
++		return false;
++
++	for (i = 0; i < map->cnt; i++) {
++		if (map->pair[i].idx0 == v0)
++			return map->pair[i].idx1 == v1;
++		if (map->pair[i].idx1 == v1)
++			return false;
++	}
++
++	if (map->cnt < BCF_VAR_IDX_MAP_SIZE) {
++		map->pair[map->cnt].idx0 = v0;
++		map->pair[map->cnt].idx1 = v1;
++		map->cnt++;
++		return true;
++	}
++	return false;
++}
++
++static int ___expr_equiv(struct bcf_checker_env *env, struct bcf_expr *exprs0,
++			 struct bcf_expr *e0, struct bcf_expr *exprs1,
++			 struct bcf_expr *e1, struct bcf_var_map *map)
++{
++	struct expr_cmp_state *cmp_stack = env->cmp_stack;
++	u32 stack_size;
++
++	if (!expr_node_equiv(e0, e1))
++		return 0;
++
++	cmp_stack[0] = (struct expr_cmp_state){ e0, e1, 0 };
++	stack_size = 1;
++
++	while (stack_size) {
++		struct expr_cmp_state *cmp = &cmp_stack[stack_size - 1];
++
++		e0 = cmp->e0;
++		e1 = cmp->e1;
++		if (cmp->cur_arg >= e0->vlen || is_bv_val(e0->code)) {
++			stack_size--;
++			continue;
++		}
++
++		for (; cmp->cur_arg < e0->vlen; cmp->cur_arg++) {
++			u32 arg0 = e0->args[cmp->cur_arg];
++			u32 arg1 = e1->args[cmp->cur_arg];
++			struct bcf_expr *a0, *a1;
++
++			/* When expr0 is the same as expr1, the same bv
++			 * variable must always share same idx.
++			 */
++			if (exprs0 == exprs1 && arg0 == arg1)
++				continue;
++
++			a0 = exprs0 + arg0;
++			a1 = exprs1 + arg1;
++			if (!expr_node_equiv(a0, a1))
++				return 0;
++
++			if (is_bv_val(a0->code))
++				continue;
++
++			if (is_bv_var(a0->code)) {
++				if (var_equiv(map, arg0, arg1))
++					continue;
++				return false;
++			}
++
++			if (stack_size == CMP_STACK_SIZE)
++				return -E2BIG;
++			cmp_stack[stack_size++] =
++				(struct expr_cmp_state){ a0, a1, 0 };
++			cmp->cur_arg++; /* skip cur arg */
++			break;
++		}
++	}
++
++	return 1;
++}
++
++static int __expr_equiv(struct bcf_checker_env *env, struct bcf_expr *e0,
++			struct bcf_expr *e1)
++{
++	return ___expr_equiv(env, env->exprs, e0, env->exprs, e1, NULL);
++}
++
++static int expr_equiv(struct bcf_checker_env *env, u32 idx0, u32 idx1)
++{
++	struct bcf_expr *e0, *e1;
++
++	if (idx0 == idx1)
++		return 1;
++
++	e0 = env->exprs + idx0;
++	e1 = env->exprs + idx1;
++	return __expr_equiv(env, e0, e1);
++}
++
++static void dump_expr(struct bcf_expr *expr, char *name)
++{
++	int i;
++
++	pr_debug("\t >> %s (%x, %d, %x):", name, expr->code, expr->vlen,
++		 expr->params);
++	for (i = 0; i < expr->vlen; i++)
++		pr_debug(" %d", expr->args[i]);
++	pr_debug("\n");
++}
++
++static void dump_step(struct bcf_proof_step *step, const char *name)
++{
++	int i;
++
++	pr_debug("\t> %s (%d, %d, %x):", name, BCF_STEP_RULE(step->rule),
++		 step->vlen, step->params);
++	for (i = 0; i < step->vlen; i++)
++		pr_debug(" %d", step->args[i]);
++	pr_debug("\n");
++}
++
++static int check_builtin_step(struct bcf_checker_env *env,
++			      struct bcf_proof_step *step, u16 rule)
++{
++	u32 arg;
++	int err;
++
++	dump_step(step, rule == BCF_RULE_ASSUME ? "ASSUME" : "REWRITE");
++
++	if (rule != BCF_RULE_ASSUME && rule != BCF_RULE_REWRITE)
++		return -EINVAL;
++
++	if (step->vlen != 1 || step->params)
++		return -EINVAL;
++
++	arg = step->args[0];
++	err = check_pred_arg(env, arg);
++	if (err)
++		return err;
++
++	if (rule == BCF_RULE_REWRITE) {
++		struct bcf_expr *eq_expr;
++
++		eq_expr = env->exprs + arg;
++		if (!is_equiv(eq_expr->code))
++			return -EINVAL;
++		return set_step_fact(env, arg);
++	}
++
++	/* multiple assume steps */
++	if (env->goal >= 0)
++		return -ENOTSUPP;
++	env->goal = arg;
++	return set_step_fact(env, arg);
++}
++
++static int check_bv_step(struct bcf_checker_env *env,
++			 struct bcf_proof_step *step, u16 rule)
++{
++	struct bcf_expr *eq_expr;
++	u32 arg;
++	int err;
++
++	dump_step(step, "BV_BITBLAST");
++
++	if (rule != BCF_RULE_BITBLAST || step->vlen != 1 || step->params)
++		return -EINVAL;
++
++	arg = step->args[0];
++	err = check_pred_arg(env, arg);
++	if (err)
++		return err;
++	eq_expr = env->exprs + arg;
++	if (!is_equiv(eq_expr->code))
++		return -EINVAL;
++
++	/* TODO Handle bitblast */
++	return set_step_fact(env, arg);
++}
++
++static int elim_pivot(struct bcf_checker_env *env, struct bcf_expr *expr_buf,
++		      u32 pm_idx, struct bcf_expr *pivot)
++{
++	u32 *expr_args = expr_buf->args + expr_buf->vlen;
++	struct bcf_expr *pm = env->exprs + pm_idx;
++	u32 *pm_args = pm->args;
++	bool eliminated = false;
++	int i, err;
++
++	err = __expr_equiv(env, pm, pivot);
++	if (err)
++		return err < 0 ? err : 0;
++
++	if (!is_disj(pm->code)) {
++		*expr_args = pm_idx;
++		expr_buf->vlen++;
++		return 0;
++	}
++
++	for (i = 0; i < pm->vlen; i++) {
++		struct bcf_expr *pm_arg = env->exprs + pm_args[i];
++
++		if (eliminated) {
++			*expr_args++ = pm_args[i];
++			expr_buf->vlen++;
++			continue;
++		}
++
++		err = __expr_equiv(env, pm_arg, pivot);
++		if (err < 0)
++			return err;
++		if (!err) {
++			*expr_args++ = pm_args[i];
++			expr_buf->vlen++;
++			continue;
++		}
++
++		eliminated = true;
++	}
++
++	return 0;
++}
++
++static bool polarity_of(u32 *pols, u32 idx)
++{
++	u32 bits_per_u32 = BITS_PER_BYTE * sizeof(u32);
++	u32 i = idx % bits_per_u32;
++
++	return pols[idx / bits_per_u32] & (1 << i);
++}
++
++static int copy_clauses(struct bcf_checker_env *env, struct bcf_expr *expr_buf,
++			u32 step, u32 pivot_idx, bool polarity)
++{
++	struct bcf_expr *pm, *pivot;
++	struct bcf_expr_unary not_pivot;
++	int err;
++
++	pm = get_premise(env, step);
++	pivot = get_pred_arg(env, pivot_idx);
++	if (!pm || !pivot)
++		return -EINVAL;
++
++	not_pivot = BCF_PRED_NOT(pivot_idx);
++	if (!polarity)
++		pivot = (struct bcf_expr *)&not_pivot;
++
++	if (!is_disj(pm->code)) {
++		*expr_buf->args = env->step_facts[step];
++		expr_buf->vlen++;
++		return 0;
++	}
++
++	err = __expr_equiv(env, pm, pivot);
++	if (err)
++		return err < 0 ? err : 0;
++
++	memcpy(expr_buf->args, pm->args, sizeof(*pm->args) * pm->vlen);
++	expr_buf->vlen += pm->vlen;
++	return 0;
++}
++
++static int resolution_inplace(struct bcf_checker_env *env,
++			      struct bcf_expr *expr_buf, u32 step_rhs,
++			      u32 pivot, bool polarity)
++{
++	struct bcf_expr_unary not_pivot = BCF_PRED_NOT(pivot);
++	struct bcf_expr *rhs, *pivots[2];
++	int i, ret;
++
++	rhs = get_premise(env, step_rhs);
++	pivots[0] = get_pred_arg(env, pivot);
++	if (!rhs || !pivots[0])
++		return -EINVAL;
++
++	pivots[1] = (struct bcf_expr *)&not_pivot;
++	if (!polarity)
++		swap(pivots[0], pivots[1]);
++
++	/* eliminate pivots[0] in lhs */
++	for (i = 0; i < expr_buf->vlen; i++) {
++		struct bcf_expr *arg = env->exprs + expr_buf->args[i];
++		u32 left;
++
++		ret = __expr_equiv(env, arg, pivots[0]);
++		if (ret < 0)
++			return ret;
++		if (!ret)
++			continue;
++
++		left = expr_buf->vlen - (i + 1);
++		if (left)
++			memmove(expr_buf->args + i, expr_buf->args + i + 1,
++				sizeof(*expr_buf->args) * left);
++		expr_buf->vlen--;
++		break;
++	}
++
++	if ((u32)rhs->vlen + expr_buf->vlen > EXPR_BUF_LEN)
++		return -E2BIG;
++	return elim_pivot(env, expr_buf, env->step_facts[step_rhs], pivots[1]);
++}
++
++static int build_resolution_fact(struct bcf_checker_env *env,
++				 struct bcf_expr *expr)
++{
++	int fact;
++
++	if (expr->vlen == 0) {
++		fact = add_expr(env, &BCF_PRED_FALSE);
++	} else if (expr->vlen == 1) {
++		fact = expr->args[0];
++	} else {
++		expr->code = BCF_BOOL_PRED | BCF_DISJ;
++		expr->params = 0;
++		fact = add_expr(env, expr);
++	}
++	return set_step_fact(env, fact);
++}
++
++static int check_boolean_step(struct bcf_checker_env *env,
++			      struct bcf_proof_step *step, u16 rule)
++{
++	u8 vlen = step->vlen, params = step->params;
++	struct bcf_expr *expr_buf;
++	u32 *args = step->args;
++	int err, i, fact;
++
++	if (rule >= __MAX_BCF_BOOLEAN_RULES)
++		return -EINVAL;
++
++#define BCF_RULE(RULE_NAME) BCF_RULE_##RULE_NAME
++	// clang-format off
++#define BCF_BOOLEAN_RULES(MAPPER)	\
++	MAPPER(RESOLUTION),		\
++	MAPPER(CHAIN_RESOLUTION),	\
++	MAPPER(FACTORING),		\
++	MAPPER(REORDERING),		\
++	MAPPER(SPLIT),			\
++	MAPPER(EQ_RESOLVE),		\
++	MAPPER(MODUS_PONENS),		\
++	MAPPER(NOT_NOT_ELIM),		\
++	MAPPER(CONTRA),			\
++	MAPPER(AND_ELIM),		\
++	MAPPER(AND_INTRO),		\
++	MAPPER(NOT_OR_ELIM),		\
++	MAPPER(IMPLIES_ELIM),		\
++	MAPPER(NOT_IMPLIES_ELIM),	\
++	MAPPER(EQUIV_ELIM),		\
++	MAPPER(NOT_EQUIV_ELIM),		\
++	MAPPER(XOR_ELIM),		\
++	MAPPER(NOT_XOR_ELIM),		\
++	MAPPER(ITE_ELIM),		\
++	MAPPER(NOT_ITE_ELIM),		\
++	MAPPER(NOT_AND),		\
++	MAPPER(CNF_AND_POS),		\
++	MAPPER(CNF_AND_NEG),		\
++	MAPPER(CNF_OR_POS),		\
++	MAPPER(CNF_OR_NEG),		\
++	MAPPER(CNF_IMPLIES_POS),	\
++	MAPPER(CNF_IMPLIES_NEG),	\
++	MAPPER(CNF_EQUIV_POS),		\
++	MAPPER(CNF_EQUIV_NEG),		\
++	MAPPER(CNF_XOR_POS),		\
++	MAPPER(CNF_XOR_NEG),		\
++	MAPPER(CNF_ITE_POS),		\
++	MAPPER(CNF_ITE_NEG),		\
++	MAPPER(ITE_EQ)
++
++// clang-format on
++#define RULE_LABEL(RULE_NAME) [BCF_RULE(RULE_NAME)] = &&RULE_NAME
++	static const void *const
++		jumptable[__MAX_BCF_BOOLEAN_RULES] __annotate_jump_table = {
++			[0 ... __MAX_BCF_BOOLEAN_RULES - 1] = &&err_bad_rule,
++			BCF_BOOLEAN_RULES(RULE_LABEL),
++		};
++#undef RULE_LABEL
++#define RULE_STR(RULE_NAME) [BCF_RULE(RULE_NAME)] = __stringify(RULE_NAME)
++	static const char *const rule_name[__MAX_BCF_BOOLEAN_RULES] = {
++		[0 ... __MAX_BCF_BOOLEAN_RULES - 1] = "unknown rule",
++		BCF_BOOLEAN_RULES(RULE_STR),
++	};
++#undef RULE_STR
++#undef BCF_BOOLEAN_RULES
++#undef BCF_RULE
++
++	dump_step(step, rule_name[rule]);
++	goto *jumptable[rule];
++
++RESOLUTION: {
++	struct bcf_expr *pivots[2], *pms[2];
++	struct bcf_expr_unary not_arg;
++	bool polarity = params;
++
++	if (vlen != 3 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	pms[0] = get_premise(env, args[0]);
++	pms[1] = get_premise(env, args[1]);
++	pivots[0] = get_pred_arg(env, args[2]);
++	if (!pms[0] || !pms[1] || !pivots[0])
++		return -EINVAL;
++
++	not_arg = BCF_PRED_NOT(args[2]);
++	pivots[1] = (struct bcf_expr *)&not_arg;
++	if (!polarity)
++		swap(pivots[0], pivots[1]);
++
++	expr_buf = reserve_expr_buf(env, pms[0]->vlen + pms[1]->vlen);
++	if (!expr_buf)
++		return -E2BIG;
++
++	err = elim_pivot(env, expr_buf, env->step_facts[args[0]], pivots[0]);
++	// clang-format off
++	err = err ?: elim_pivot(env, expr_buf, env->step_facts[args[1]],
++				     pivots[1]);
++	// clang-format on
++	if (err < 0)
++		return err;
++	return build_resolution_fact(env, expr_buf);
++}
++
++CHAIN_RESOLUTION: {
++	struct bcf_expr *pol_expr, *pivot_expr;
++	u32 premise_cnt, pol_idx, pivot_list;
++	u32 *pols;
++	bool polarity;
++
++	/* chain resolution has at least three premises, and two args */
++	if (vlen < 4 || params)
++		return -EINVAL;
++
++	premise_cnt = vlen - 2;
++	pol_idx = args[vlen - 2];
++	pol_expr = get_bv_val_arg(env, pol_idx);
++	pivot_list = args[vlen - 1];
++	pivot_expr = get_list_arg(env, pivot_list);
++	if (!pol_expr || !pivot_expr)
++		return -EINVAL;
++
++	if (BCF_BV_BITSZ(pol_expr->params) != pivot_expr->vlen ||
++	    pivot_expr->vlen + 1 != premise_cnt)
++		return -EINVAL;
++
++	pols = pol_expr->args;
++	expr_buf = get_expr_buf(env);
++	polarity = polarity_of(pols, 0);
++	err = copy_clauses(env, expr_buf, args[0], pivot_expr->args[0],
++			   polarity);
++	if (err)
++		return err;
++
++	for (i = 0; i < pivot_expr->vlen; i++) {
++		u32 pm_idx = args[i + 1];
++		u32 pivot = pivot_expr->args[i];
++
++		polarity = polarity_of(pols, i);
++		err = resolution_inplace(env, expr_buf, pm_idx, pivot,
++					 polarity);
++		if (err)
++			return err;
++	}
++	return build_resolution_fact(env, expr_buf);
++}
++
++FACTORING: {
++	if (vlen != 1 || params)
++		return -EINVAL;
++	err = check_pred_arg(env, args[0]);
++	if (err < 0)
++		return err;
++
++	return set_step_fact(env, args[0]);
++}
++
++REORDERING: {
++	if (vlen != 1 || params)
++		return -EINVAL;
++	err = check_pred_arg(env, args[0]);
++	if (err < 0)
++		return err;
++
++	return set_step_fact(env, args[0]);
++}
++
++SPLIT: {
++	int not_arg, disj;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	err = check_pred_arg(env, args[0]);
++	if (err)
++		return err;
++
++	not_arg = add_not_expr(env, args[0]);
++	disj = add_disj(env, args[0], not_arg);
++	if (not_arg < 0 || disj < 0)
++		return -ENOMEM;
++	return set_step_fact(env, disj);
++}
++
++EQ_RESOLVE: {
++	struct bcf_expr *pm, *pm_eq;
++	u32 idx0, idx1;
++
++	if (vlen != 2 || params)
++		return -EINVAL;
++
++	pm = get_premise(env, args[0]);
++	pm_eq = get_premise(env, args[1]);
++	if (!pm || !pm_eq) {
++		pr_debug("invalid premises: %d %d\n", args[0], args[1]);
++		return -EINVAL;
++	}
++	if (!is_equiv(pm_eq->code)) {
++		dump_expr(pm_eq, "pm1 not eq expr");
++		return -EINVAL;
++	}
++
++	idx0 = env->step_facts[args[0]];
++	idx1 = pm_eq->args[0];
++	err = expr_equiv(env, idx0, idx1);
++	if (err < 0)
++		return err;
++	if (!err) {
++		struct bcf_expr *pm_lhs = env->exprs + idx1;
++
++		pr_debug("\t>> pm not equiv:");
++		dump_expr(pm, "pm0");
++		dump_expr(pm_lhs, "pm1[0]");
++		return -EINVAL;
++	}
++	return set_step_fact(env, pm_eq->args[1]);
++}
++
++MODUS_PONENS: {
++	struct bcf_expr *pm, *pm_implies;
++
++	if (vlen != 2 || params)
++		return -EINVAL;
++
++	pm = get_premise(env, args[0]);
++	pm_implies = get_premise(env, args[1]);
++	if (!pm || !pm_implies || !is_implies(pm_implies->code))
++		return -EINVAL;
++
++	err = expr_equiv(env, env->step_facts[args[0]], pm_implies->args[0]);
++	if (err < 0)
++		return err;
++	if (!err)
++		return -EINVAL;
++	return set_step_fact(env, pm_implies->args[1]);
++}
++
++NOT_NOT_ELIM: {
++	struct bcf_expr *not_expr;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	not_expr = get_premise(env, args[0]);
++	if (!not_expr || !is_pred_not(not_expr->code))
++		return -EINVAL;
++
++	not_expr = env->exprs + not_expr->args[0];
++	if (!is_pred_not(not_expr->code))
++		return -EINVAL;
++
++	return set_step_fact(env, not_expr->args[0]);
++}
++
++CONTRA: {
++	struct bcf_expr *pm, *pm_not;
++
++	if (vlen != 2 || params)
++		return -EINVAL;
++
++	pm = get_premise(env, args[0]);
++	pm_not = get_premise(env, args[1]);
++	if (!pm || !pm_not || !is_pred_not(pm_not->code))
++		return -EINVAL;
++
++	err = expr_equiv(env, env->step_facts[args[0]], pm_not->args[0]);
++	if (err < 0)
++		return err;
++	if (!err)
++		return -EINVAL;
++
++	return set_step_fact(env, add_expr(env, &BCF_PRED_FALSE));
++}
++
++AND_ELIM: {
++	struct bcf_expr *and;
++	u32 idx = params;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	and = get_premise(env, args[0]);
++	if (!and || !is_conj(and->code) || idx >= and->vlen)
++		return -EINVAL;
++	return set_step_fact(env, and->args[idx]);
++}
++
++AND_INTRO: {
++	if (!vlen || params)
++		return -EINVAL;
++
++	if (vlen == 1) {
++		if (!get_premise(env, args[0]))
++			return -EINVAL;
++		return set_step_fact(env, env->step_facts[args[0]]);
++	}
++
++	expr_buf = get_expr_buf(env);
++	expr_buf->code = BCF_BOOL_PRED | BCF_CONJ;
++	expr_buf->vlen = vlen;
++	for (i = 0; i < vlen; i++) {
++		if (!get_premise(env, args[i]))
++			return -EINVAL;
++		expr_buf->args[i] = env->step_facts[args[i]];
++	}
++	return set_step_fact(env, add_expr(env, expr_buf));
++}
++
++NOT_OR_ELIM: {
++	struct bcf_expr *not_disj;
++	u32 idx = params;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	not_disj = get_premise(env, args[0]);
++	if (!not_disj || !is_pred_not(not_disj->code))
++		return -EINVAL;
++
++	not_disj = env->exprs + not_disj->args[0];
++	if (!is_disj(not_disj->code) || idx >= not_disj->vlen)
++		return -EINVAL;
++
++	fact = add_not_expr(env, not_disj->args[idx]);
++	return set_step_fact(env, fact);
++}
++
++IMPLIES_ELIM: {
++	struct bcf_expr *implies;
++	int not, disj;
++	u32 arg0, arg1;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	implies = get_premise(env, args[0]);
++	if (!implies || !is_implies(implies->code))
++		return -EINVAL;
++
++	arg0 = implies->args[0];
++	arg1 = implies->args[1];
++	not = add_not_expr(env, arg0);
++	disj = add_disj(env, not, arg1);
++	if (not < 0 || disj < 0)
++		return -ENOMEM;
++	return set_step_fact(env, disj);
++}
++
++NOT_IMPLIES_ELIM: {
++	struct bcf_expr *not_implies;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	not_implies = get_premise(env, args[0]);
++	if (!not_implies || !is_pred_not(not_implies->code))
++		return -EINVAL;
++
++	not_implies = env->exprs + not_implies->args[0];
++	if (!is_implies(not_implies->code))
++		return -EINVAL;
++
++	fact = not_implies->args[0];
++	if (params)
++		fact = add_not_expr(env, not_implies->args[1]);
++	return set_step_fact(env, fact);
++}
++
++EQUIV_ELIM: {
++	struct bcf_expr *equiv;
++	int arg0, arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	equiv = get_premise(env, args[0]);
++	if (!equiv || !is_equiv(equiv->code))
++		return -EINVAL;
++
++	arg0 = equiv->args[0];
++	arg1 = equiv->args[1];
++	if (!params)
++		arg0 = add_not_expr(env, arg0);
++	else
++		arg1 = add_not_expr(env, arg1);
++	if (arg0 < 0 || arg1 < 0)
++		return -ENOMEM;
++
++	return set_step_fact(env, add_disj(env, arg0, arg1));
++}
++
++NOT_EQUIV_ELIM: {
++	struct bcf_expr *not_equiv;
++	int arg0, arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	not_equiv = get_premise(env, args[0]);
++	if (!not_equiv || !is_pred_not(not_equiv->code))
++		return -EINVAL;
++	not_equiv = env->exprs + not_equiv->args[0];
++	if (!is_equiv(not_equiv->code))
++		return -EINVAL;
++
++	arg0 = not_equiv->args[0];
++	arg1 = not_equiv->args[1];
++	if (params) {
++		arg0 = add_not_expr(env, arg0);
++		arg1 = add_not_expr(env, arg1);
++	}
++	if (arg0 < 0 || arg1 < 0)
++		return -ENOMEM;
++	return set_step_fact(env, add_disj(env, arg0, arg1));
++}
++
++XOR_ELIM: {
++	struct bcf_expr *xor;
++	int arg0, arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	xor = get_premise(env, args[0]);
++	if (!xor || !is_xor(xor->code))
++		return -EINVAL;
++
++	arg0 = xor->args[0];
++	arg1 = xor->args[1];
++	if (params) {
++		arg0 = add_not_expr(env, arg0);
++		arg1 = add_not_expr(env, arg1);
++	}
++	if (arg0 < 0 || arg1 < 0)
++		return -ENOMEM;
++	return set_step_fact(env, add_disj(env, arg0, arg1));
++}
++
++NOT_XOR_ELIM: {
++	struct bcf_expr *not_xor;
++	int arg0, arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	not_xor = get_premise(env, args[0]);
++	if (!not_xor || !is_pred_not(not_xor->code))
++		return -EINVAL;
++	not_xor = env->exprs + not_xor->args[0];
++	if (!is_xor(not_xor->code))
++		return -EINVAL;
++
++	arg0 = not_xor->args[0];
++	arg1 = not_xor->args[1];
++	if (params)
++		arg0 = add_not_expr(env, arg0);
++	else
++		arg1 = add_not_expr(env, arg1);
++	if (arg0 < 0 || arg1 < 0)
++		return -ENOMEM;
++	return set_step_fact(env, add_disj(env, arg0, arg1));
++}
++
++ITE_ELIM: {
++	struct bcf_expr *ite;
++	int cond, f0, f1;
++	int arg0, arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	ite = get_premise(env, args[0]);
++	if (!ite || !is_ite(ite->code))
++		return -EINVAL;
++
++	cond = ite->args[0];
++	f0 = ite->args[1];
++	f1 = ite->args[2];
++	if (!params) {
++		arg0 = add_not_expr(env, cond);
++		arg1 = f0;
++	} else {
++		arg0 = cond;
++		arg1 = f1;
++	}
++	if (arg0 < 0)
++		return -ENOMEM;
++
++	return set_step_fact(env, add_disj(env, arg0, arg1));
++}
++
++NOT_ITE_ELIM: {
++	struct bcf_expr *not_ite, *ite;
++	int cond, f0, f1;
++	int arg0, arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	not_ite = get_premise(env, args[0]);
++	if (!not_ite || !is_pred_not(not_ite->code))
++		return -EINVAL;
++	ite = env->exprs + not_ite->args[0];
++	if (!is_ite(ite->code))
++		return -EINVAL;
++
++	cond = ite->args[0];
++	f0 = ite->args[1];
++	f1 = ite->args[2];
++	if (!params) {
++		arg0 = add_not_expr(env, cond);
++		arg1 = add_not_expr(env, f0);
++	} else {
++		arg0 = cond;
++		arg1 = add_not_expr(env, f1);
++	}
++	if (arg0 < 0 || arg1 < 0)
++		return -ENOMEM;
++
++	return set_step_fact(env, add_disj(env, arg0, arg1));
++}
++
++NOT_AND: {
++	struct bcf_expr *not_and, *and;
++	int not;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	not_and = get_premise(env, args[0]);
++	if (!not_and || !is_pred_not(not_and->code))
++		return -EINVAL;
++	and = env->exprs + not_and->args[0];
++	if (!is_conj(and->code))
++		return -EINVAL;
++
++	expr_buf = get_expr_buf(env);
++	expr_buf->code = BCF_BOOL_PRED | BCF_DISJ;
++	for (i = 0; i < and->vlen; i++) {
++		not = add_not_expr(env, and->args[i]);
++		if (not < 0)
++			return not;
++		expr_buf->args[expr_buf->vlen++] = not;
++	}
++
++	return set_step_fact(env, add_expr(env, expr_buf));
++}
++
++CNF_AND_POS: {
++	struct bcf_expr *and;
++	u32 idx = params;
++	int not_and;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	and = get_pred_arg(env, args[0]);
++	if (!and || !is_conj(and->code) || idx >= and->vlen)
++		return -EINVAL;
++
++	not_and = add_not_expr(env, args[0]);
++	if (not_and < 0)
++		return not_and;
++
++	and = env->exprs + args[0];
++	return set_step_fact(env, add_disj(env, not_and, and->args[idx]));
++}
++
++CNF_AND_NEG: {
++	struct bcf_expr *and;
++	int not_arg;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	and = get_pred_arg(env, args[0]);
++	if (!and || !is_conj(and->code))
++		return -EINVAL;
++
++	expr_buf = reserve_expr_buf(env, and->vlen + 1);
++	if (!expr_buf)
++		return -E2BIG;
++
++	expr_buf->code = BCF_BOOL_PRED | BCF_DISJ;
++	expr_buf->args[expr_buf->vlen++] = args[0];
++	for (i = 0; i < and->vlen; i++) {
++		not_arg = add_not_expr(env, and->args[i]);
++		if (not_arg < 0)
++			return not_arg;
++		expr_buf->args[expr_buf->vlen++] = not_arg;
++		and = env->exprs + args[0];
++	}
++	return set_step_fact(env, add_expr(env, expr_buf));
++}
++
++CNF_OR_POS: {
++	struct bcf_expr *disj;
++	int not_arg;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	disj = get_pred_arg(env, args[0]);
++	if (!disj || !is_disj(disj->code))
++		return -EINVAL;
++
++	expr_buf = reserve_expr_buf(env, disj->vlen + 1);
++	if (!expr_buf)
++		return -E2BIG;
++
++	not_arg = add_not_expr(env, args[0]);
++	if (not_arg < 0)
++		return not_arg;
++
++	expr_buf->code = BCF_BOOL_PRED | BCF_DISJ;
++	expr_buf->args[expr_buf->vlen++] = not_arg;
++	for (i = 0; i < disj->vlen; i++)
++		expr_buf->args[expr_buf->vlen++] = disj->args[i];
++	return set_step_fact(env, add_expr(env, expr_buf));
++}
++
++CNF_OR_NEG: {
++	struct bcf_expr *disj;
++	u32 idx = params;
++	int not_arg;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	disj = get_pred_arg(env, args[0]);
++	if (!disj || !is_disj(disj->code) || idx >= disj->vlen)
++		return -EINVAL;
++
++	not_arg = add_not_expr(env, disj->args[idx]);
++	if (not_arg < 0)
++		return not_arg;
++	return set_step_fact(env, add_disj(env, args[0], not_arg));
++}
++
++CNF_IMPLIES_POS: {
++	struct bcf_expr *implies;
++	int not_implies, not_f0;
++	u32 arg0, arg1;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	implies = get_pred_arg(env, args[0]);
++	if (!implies || !is_implies(implies->code))
++		return -EINVAL;
++
++	arg0 = implies->args[0];
++	arg1 = implies->args[1];
++	not_implies = add_not_expr(env, args[0]);
++	not_f0 = add_not_expr(env, arg0);
++	if (not_implies < 0 || not_f0 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, not_implies, not_f0, arg1);
++	return set_step_fact(env, fact);
++}
++
++CNF_IMPLIES_NEG: {
++	struct bcf_expr *implies;
++	int arg1;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	implies = get_pred_arg(env, args[0]);
++	if (!implies || !is_implies(implies->code))
++		return -EINVAL;
++
++	arg1 = implies->args[0];
++	if (params)
++		arg1 = add_not_expr(env, implies->args[1]);
++	if (arg1 < 0)
++		return arg1;
++	return set_step_fact(env, add_disj(env, args[0], arg1));
++}
++
++CNF_EQUIV_POS: {
++	struct bcf_expr *equiv;
++	int not_equiv, arg1, arg2;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	equiv = get_pred_arg(env, args[0]);
++	if (!equiv || !is_equiv(equiv->code))
++		return -EINVAL;
++
++	arg1 = equiv->args[0];
++	arg2 = equiv->args[1];
++	not_equiv = add_not_expr(env, args[0]);
++	if (!params)
++		arg1 = add_not_expr(env, arg1);
++	else
++		arg2 = add_not_expr(env, arg2);
++	if (not_equiv < 0 || arg1 < 0 || arg2 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, not_equiv, arg1, arg2);
++	return set_step_fact(env, fact);
++}
++
++CNF_EQUIV_NEG: {
++	struct bcf_expr *equiv;
++	int arg1, arg2;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	equiv = get_pred_arg(env, args[0]);
++	if (!equiv || !is_equiv(equiv->code))
++		return -EINVAL;
++
++	arg1 = equiv->args[0];
++	arg2 = equiv->args[1];
++	if (params) {
++		arg1 = add_not_expr(env, arg1);
++		arg2 = add_not_expr(env, arg2);
++	}
++	if (arg1 < 0 || arg2 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, args[0], arg1, arg2);
++	return set_step_fact(env, fact);
++}
++
++CNF_XOR_POS: {
++	struct bcf_expr *xor_expr;
++	int not_xor, arg1, arg2;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	xor_expr = get_pred_arg(env, args[0]);
++	if (!xor_expr || !is_xor(xor_expr->code))
++		return -EINVAL;
++
++	arg1 = xor_expr->args[0];
++	arg2 = xor_expr->args[1];
++	not_xor = add_not_expr(env, args[0]);
++	if (params) {
++		arg1 = add_not_expr(env, arg1);
++		arg2 = add_not_expr(env, arg2);
++	}
++	if (arg1 < 0 || arg2 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, not_xor, arg1, arg2);
++	return set_step_fact(env, fact);
++}
++
++CNF_XOR_NEG: {
++	struct bcf_expr *xor_expr;
++	int arg1, arg2;
++
++	if (vlen != 1 || (params != 0 && params != 1))
++		return -EINVAL;
++
++	xor_expr = get_pred_arg(env, args[0]);
++	if (!xor_expr || !is_xor(xor_expr->code))
++		return -EINVAL;
++
++	arg1 = xor_expr->args[0];
++	arg2 = xor_expr->args[1];
++	if (!params)
++		arg1 = add_not_expr(env, arg1);
++	else
++		arg2 = add_not_expr(env, arg2);
++	if (arg1 < 0 || arg2 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, args[0], arg1, arg2);
++	return set_step_fact(env, fact);
++}
++
++CNF_ITE_POS: {
++	struct bcf_expr *ite;
++	int not_ite, arg1, arg2, f0, f1, cond;
++
++	if (vlen != 1 || (params != 0 && params != 1 && params != 2))
++		return -EINVAL;
++
++	ite = get_ite_arg(env, args[0]);
++	if (!ite)
++		return -EINVAL;
++
++	cond = ite->args[0];
++	f0 = ite->args[1];
++	f1 = ite->args[2];
++	not_ite = add_not_expr(env, args[0]);
++	if (!params) {
++		arg1 = add_not_expr(env, cond);
++		arg2 = f0;
++	} else if (params == 1) {
++		arg1 = cond;
++		arg2 = f1;
++	} else {
++		arg1 = f0;
++		arg2 = f1;
++	}
++	if (not_ite < 0 || arg1 < 0 || arg2 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, not_ite, arg1, arg2);
++	return set_step_fact(env, fact);
++}
++
++CNF_ITE_NEG: {
++	struct bcf_expr *ite;
++	int arg1, arg2, f0, f1, cond;
++
++	if (vlen != 1 || (params != 0 && params != 1 && params != 2))
++		return -EINVAL;
++
++	ite = get_ite_arg(env, args[0]);
++	if (!ite)
++		return -EINVAL;
++
++	cond = ite->args[0];
++	f0 = ite->args[1];
++	f1 = ite->args[2];
++	if (!params) {
++		arg1 = add_not_expr(env, cond);
++		arg2 = add_not_expr(env, f0);
++	} else if (params == 1) {
++		arg1 = cond;
++		arg2 = add_not_expr(env, f1);
++	} else {
++		arg1 = add_not_expr(env, f0);
++		arg2 = add_not_expr(env, f1);
++	}
++	if (arg1 < 0 || arg2 < 0)
++		return -ENOMEM;
++
++	fact = add_disj3(env, args[0], arg1, arg2);
++	return set_step_fact(env, fact);
++}
++
++ITE_EQ: {
++	struct bcf_expr *ite;
++	int f0, f1, cond, eq0, eq1;
++
++	if (vlen != 1 || params)
++		return -EINVAL;
++
++	ite = get_ite_arg(env, args[0]);
++	if (!ite)
++		return -EINVAL;
++
++	cond = ite->args[0];
++	f0 = ite->args[1];
++	f1 = ite->args[2];
++	eq0 = add_equiv(env, args[0], f0);
++	eq1 = add_equiv(env, args[0], f1);
++	if (eq0 < 0 || eq1 < 0)
++		return -ENOMEM;
++
++	fact = add_ite(env, cond, eq0, eq1);
++	return set_step_fact(env, fact);
++}
++
++err_bad_rule:
++	pr_warn("BCF proof checker: unknown rule %04x\n", rule);
++	BUG_ON(1);
++	return -EFAULT;
++}
++
++static int check_equality_step(struct bcf_checker_env *env,
++			       struct bcf_proof_step *step, u16 rule)
++{
++	u8 vlen = step->vlen, params = step->params;
++	struct bcf_expr *expr_buf, *arg;
++	u32 *args = step->args;
++	int err, i, fact;
++
++	if (rule >= __MAX_BCF_EQUALITY_RULES)
++		return -EINVAL;
++
++	// clang-format off
++#define BCF_EQUALITY_RULES(MAPPER)	\
++	MAPPER(REFL),			\
++	MAPPER(SYMM),			\
++	MAPPER(TRANS),			\
++	MAPPER(CONG),			\
++	MAPPER(TRUE_INTRO),		\
++	MAPPER(TRUE_ELIM),		\
++	MAPPER(FALSE_INTRO),		\
++	MAPPER(FALSE_ELIM)
++
++// clang-format on
++#define BCF_RULE(RULE_NAME) BCF_RULE_##RULE_NAME
++#define RULE_LABEL(RULE_NAME) [BCF_RULE(RULE_NAME)] = &&RULE_NAME
++	static const void *const
++		jumptable[__MAX_BCF_EQUALITY_RULES] __annotate_jump_table = {
++			[0 ... __MAX_BCF_EQUALITY_RULES - 1] = &&err_bad_rule,
++			BCF_EQUALITY_RULES(RULE_LABEL),
++		};
++#undef RULE_LABEL
++#define RULE_STR(RULE_NAME) [BCF_RULE(RULE_NAME)] = __stringify(RULE_NAME)
++	static const char *const rule_name[__MAX_BCF_EQUALITY_RULES] = {
++		[0 ... __MAX_BCF_EQUALITY_RULES - 1] = "unknown rule",
++		BCF_EQUALITY_RULES(RULE_STR),
++	};
++#undef RULE_STR
++#undef BCF_RULE
++#undef BCF_EQUALITY_RULES
++
++	dump_step(step, rule_name[rule]);
++	if (params)
++		return -EINVAL;
++
++	expr_buf = get_expr_buf(env);
++	goto *jumptable[rule];
++
++REFL: {
++	if (vlen != 1 || !valid_idx(env, args[0]))
++		return -EINVAL;
++	fact = add_equiv(env, args[0], args[0]);
++	return set_step_fact(env, fact);
++}
++SYMM: {
++	struct bcf_expr *eq;
++	int symm;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	arg = get_premise(env, args[0]);
++	if (!arg)
++		return -EINVAL;
++	eq = arg;
++	if (is_pred_not(eq->code))
++		eq = env->exprs + eq->args[0];
++	if (!is_equiv(eq->code))
++		return -EINVAL;
++
++	symm = add_equiv(env, eq->args[1], eq->args[0]);
++	arg = get_premise(env, args[0]);
++	if (symm >= 0 && is_pred_not(arg->code))
++		symm = add_not_expr(env, symm);
++	return set_step_fact(env, symm);
++}
++TRANS: {
++	struct bcf_expr *eq;
++	int first = -1;
++	u32 curr;
++
++	if (!vlen)
++		return -EINVAL;
++
++	for (i = 0; i < vlen; i++) {
++		eq = get_premise(env, args[i]);
++		if (!eq || !is_equiv(eq->code))
++			return -EINVAL;
++
++		if (first < 0) {
++			first = eq->args[0];
++			curr = eq->args[1];
++			continue;
++		}
++
++		err = expr_equiv(env, curr, eq->args[0]);
++		if (err < 0) {
++			pr_debug("\t>> equiv failed: %d\n", err);
++			return err;
++		}
++		if (!err) {
++			pr_debug("\t>> expr not equiv:");
++			dump_expr(env->exprs + curr, "cur");
++			dump_expr(env->exprs + eq->args[0], "eq[0]");
++			return -EINVAL;
++		}
++		curr = eq->args[1];
++	}
++
++	if (vlen == 1)
++		fact = env->step_facts[args[0]];
++	else
++		fact = add_equiv(env, first, curr);
++	return set_step_fact(env, fact);
++}
++CONG: {
++	struct bcf_expr *eq;
++	int lhs, rhs;
++	u32 op;
++
++	if (vlen < 2)
++		return -EINVAL;
++
++	op = args[vlen - 1];
++	expr_buf->code = op;
++	expr_buf->vlen = op >> 8;
++	expr_buf->params = op >> 16;
++	/* TODO use check_expr */
++	if (!bcf_code_intable(expr_buf->code) || expr_buf->vlen + 1 != vlen)
++		return -EINVAL;
++
++	for (i = 0; i < expr_buf->vlen; i++) {
++		eq = get_premise(env, args[i]);
++		if (!eq || !is_equiv(eq->code))
++			return -EINVAL;
++
++		expr_buf->args[i] = eq->args[0];
++	}
++	lhs = add_expr(env, expr_buf);
++	if (lhs < 0)
++		return lhs;
++
++	for (i = 0; i < expr_buf->vlen; i++) {
++		eq = env->exprs + env->step_facts[args[i]];
++		expr_buf->args[i] = eq->args[1];
++	}
++	rhs = add_expr(env, expr_buf);
++	if (rhs < 0)
++		return rhs;
++
++	fact = add_equiv(env, lhs, rhs);
++	return set_step_fact(env, fact);
++}
++TRUE_INTRO: {
++	int true_expr;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	if (!get_premise(env, args[0]))
++		return -EINVAL;
++
++	true_expr = add_expr(env, &BCF_PRED_TRUE);
++	if (true_expr < 0)
++		return true_expr;
++	fact = add_equiv(env, env->step_facts[args[0]], true_expr);
++	return set_step_fact(env, fact);
++}
++TRUE_ELIM: {
++	struct bcf_expr *eq_true, *true_expr;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	eq_true = get_premise(env, args[0]);
++	if (!eq_true || !is_equiv(eq_true->code))
++		return -EINVAL;
++	true_expr = env->exprs + eq_true->args[1];
++	if (!is_pred_true(true_expr))
++		return -EINVAL;
++
++	return set_step_fact(env, eq_true->args[0]);
++}
++FALSE_INTRO: {
++	struct bcf_expr *not_expr;
++	int false_expr;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	not_expr = get_premise(env, args[0]);
++	if (!not_expr || !is_pred_not(not_expr->code))
++		return -EINVAL;
++
++	false_expr = add_expr(env, &BCF_PRED_FALSE);
++	if (false_expr < 0)
++		return false_expr;
++	fact = add_equiv(env, not_expr->args[0], false_expr);
++	return set_step_fact(env, fact);
++}
++FALSE_ELIM: {
++	struct bcf_expr *eq_false, *false_expr;
++
++	if (vlen != 1)
++		return -EINVAL;
++
++	eq_false = get_premise(env, args[0]);
++	if (!eq_false || !is_equiv(eq_false->code))
++		return -EINVAL;
++	false_expr = env->exprs + eq_false->args[1];
++	if (!is_pred_false(false_expr))
++		return -EINVAL;
++	fact = add_not_expr(env, eq_false->args[0]);
++	return set_step_fact(env, fact);
++}
++err_bad_rule:
++	pr_warn("BCF proof checker: unknown rule %04x\n", rule);
++	BUG_ON(1);
++	return -EFAULT;
++}
++
++static int check_proof(struct bcf_checker_env *env,
++		       struct bcf_proof_step *steps, u32 step_cnt)
++{
++	u32 idx = 0, last_step;
++	struct bcf_expr *expr;
++	int err = 0;
++
++	env->goal = -1;
++	env->cur_step = 0;
++	env->step_facts =
++		kvmalloc_array(step_cnt, sizeof(*env->step_facts), GFP_KERNEL);
++	if (!env->step_facts)
++		return -ENOMEM;
++
++	BUILD_BUG_ON(sizeof(*steps) != sizeof(*steps->args));
++
++	pr_debug("checking proof...\n");
++	while (idx < step_cnt) {
++		struct bcf_proof_step *step = steps + idx;
++		u16 class = BCF_STEP_CLASS(step->rule);
++		u16 rule = BCF_STEP_RULE(step->rule);
++		u32 sz = step->vlen + 1;
++
++		err = -EAGAIN;
++		if (signal_pending(current))
++			goto err_free;
++
++		if (need_resched())
++			cond_resched();
++
++		pr_debug("step#%d at %d...", env->cur_step, idx);
++
++		err = -EINVAL;
++		if (!step->vlen || idx + sz > step_cnt)
++			goto err_free;
++
++		if (class == BCF_RULE_BUILTIN)
++			err = check_builtin_step(env, step, rule);
++		else if (class == BCF_RULE_BOOLEAN)
++			err = check_boolean_step(env, step, rule);
++		else if (class == BCF_RULE_EQUALITY)
++			err = check_equality_step(env, step, rule);
++		else if (class == BCF_RULE_BV)
++			err = check_bv_step(env, step, rule);
++		else
++			err = -EINVAL;
++
++		if (err)
++			goto err_free;
++
++		idx += sz;
++		env->cur_step++;
++	}
++
++	last_step = env->cur_step - 1;
++	expr = env->exprs + env->step_facts[last_step];
++	/* false indicates a contradiction, hence the goal does not hold,
++	 * but its negation holds.
++	 */
++	err = env->goal >= 0 && is_pred_false(expr) ? 0 : -EINVAL;
++err_free:
++	kvfree(env->step_facts);
++	return err;
++}
++
++static int check_goal(struct bcf_checker_env *env, int goal_idx)
++{
++	struct bcf_expr *goal, *proved;
++	struct bpf_verifier_env *venv;
++	struct bcf_expr *exprs0, *exprs1;
++	struct bcf_var_map map = { 0 };
++	int err;
++
++	pr_debug("checking goal\n");
++	venv = env->verifier_env;
++	exprs0 = venv->bcf.exprs;
++	goal = exprs0 + goal_idx;
++
++	exprs1 = env->exprs;
++	proved = exprs1 + env->goal;
++
++	map.cnt = 0;
++	err = ___expr_equiv(env, exprs0, goal, exprs1, proved, &map);
++	if (err < 0)
++		return err;
++
++	return err == 1 ? 0 : -EINVAL;
++}
++
++static int check_hdr(struct bcf_proof_header *hdr, union bpf_attr *attr,
++		     bpfptr_t bcf_buf)
++{
++	u32 proof_size = attr->bcf_buf_true_size, proof_sz_u32;
++	u32 expr_size, step_size;
++
++	pr_debug("checking hdr...\n");
++
++	if (proof_size > attr->bcf_buf_size ||
++	    proof_size > MAX_BCF_PROOF_SIZE || proof_size <= sizeof(*hdr) ||
++	    proof_size % sizeof(u32))
++		return -EINVAL;
++
++	if (copy_from_bpfptr(hdr, bcf_buf, sizeof(*hdr)))
++		return -EFAULT;
++	if (hdr->magic != BCF_MAGIC)
++		return -EINVAL;
++
++	proof_sz_u32 = (proof_size - sizeof(*hdr)) / sizeof(u32);
++	if (!hdr->expr_cnt || hdr->expr_cnt >= proof_sz_u32 || !hdr->step_cnt ||
++	    hdr->step_cnt >= proof_sz_u32)
++		return -EINVAL;
++
++	expr_size = hdr->expr_cnt * sizeof(struct bcf_expr);
++	step_size = hdr->step_cnt * sizeof(struct bcf_expr);
++	if (proof_size != sizeof(*hdr) + expr_size + step_size)
++		return -EINVAL;
++
++	return 0;
++}
++
++int bcf_check_proof(struct bpf_verifier_env *verifier_env, union bpf_attr *attr,
++		    bpfptr_t uattr)
++{
++	bpfptr_t bcf_buf = make_bpfptr(attr->bcf_buf, uattr.is_kernel);
++	struct bcf_checker_env *bcf_env;
++	struct bcf_proof_header hdr;
++	u32 expr_size, step_size;
++	int err;
++
++	err = check_hdr(&hdr, attr, bcf_buf);
++	if (err < 0)
++		return err;
++
++	bcf_env = kzalloc(sizeof(*bcf_env), GFP_KERNEL);
++	if (!bcf_env)
++		return -ENOMEM;
++	bcf_env->verifier_env = verifier_env;
++
++	/* each step produce at least one expr */
++	bcf_env->expr_size = hdr.expr_cnt + hdr.step_cnt;
++	bcf_env->expr_cnt = hdr.expr_cnt;
++	bcf_env->exprs = kvmalloc_array(bcf_env->expr_size,
++					sizeof(*bcf_env->exprs), GFP_KERNEL);
++	err = -ENOMEM;
++	if (!bcf_env->exprs)
++		goto err_free;
++	err = -EFAULT;
++	expr_size = hdr.expr_cnt * sizeof(*bcf_env->exprs);
++	if (copy_from_bpfptr_offset(bcf_env->exprs, bcf_buf, sizeof(hdr),
++				    expr_size))
++		goto err_free;
++
++	err = check_exprs(bcf_env, bcf_env->exprs, bcf_env->expr_cnt);
++	if (err)
++		goto err_free;
++
++	err = -ENOMEM;
++	bcf_env->step_cnt = hdr.step_cnt;
++	bcf_env->steps = kvmalloc_array(bcf_env->step_cnt,
++					sizeof(*bcf_env->steps), GFP_KERNEL);
++	if (!bcf_env->steps)
++		goto err_free;
++	err = -EFAULT;
++	step_size = hdr.step_cnt * sizeof(*bcf_env->steps);
++	if (copy_from_bpfptr_offset(bcf_env->steps, bcf_buf,
++				    sizeof(hdr) + expr_size, step_size))
++		goto err_free;
++
++	err = check_proof(bcf_env, bcf_env->steps, bcf_env->step_cnt);
++	(void) check_goal;
++
++err_free:
++	kvfree(bcf_env->expr_idx_bitmap);
++	kvfree(bcf_env->exprs);
++	kvfree(bcf_env->steps);
++	kfree(bcf_env);
++	return err;
++}
+diff --git a/src/proof/alf/bcf.h b/src/proof/alf/bcf.h
+new file mode 100644
+index 0000000000..6798386560
+--- /dev/null
++++ b/src/proof/alf/bcf.h
+@@ -0,0 +1,354 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef __LINUX_BCF_H__
++#define __LINUX_BCF_H__
++
++#include <linux/bpf.h>
++#include <linux/bpf_common.h>
++#include <linux/types.h>
++#include <malloc.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* BCF expression classes */
++#define BCF_BV_ALU 0x00
++#define BCF_BV_PRED 0x01
++#define BCF_BOOL_PRED 0x02
++#define BCF_BUILTIN 0x03
++
++#define BCF_EXT 0x08
++
++/* BCF bitvec extended operations (BCF_BV_ALU | BCF_EXT) */
++#define BCF_BV_VAR 0x00
++#define BCF_BV_VAL 0x10
++#define BCF_BBT 0x20
++#define BCF_EXTRACT 0x30
++#define BCF_SIGN_EXTEND 0x40
++#define BCF_ZERO_EXTEND 0x50
++#define BCF_CONCAT 0x60
++#define BCF_BVSIZE 0x70
++
++/* BCF bitvec predicate (BCF_BV_PRED) */
++#define BCF_BITOF 0x00
++
++/* BCF boolean predicate (BCF_BOOL_PRED) */
++#define BCF_BOOL_VAR 0x00
++#define BCF_BOOL_VAL 0x10
++#define BCF_CONJ 0x20
++#define BCF_DISJ 0x30
++#define BCF_IMPLIES 0x40
++#define BCF_XOR 0x50
++#define BCF_ITE 0x60
++#define BCF_NOT 0x70
++#define BCF_EQUIV 0x80
++
++/*BCF boolean value (BCF_BOOL_VAL) */
++#define BCF_BOOL_TRUE 0x0
++#define BCF_BOOL_FALSE 0x1
++
++/* BCF builtin expressions (BCF_BUILTIN) */
++#define BCF_ARG_LIST 0x00
++
++struct bcf_expr
++{
++  __u8 code;
++  /* number of args */
++  __u8 vlen;
++  /* Parameterize the code. For BCF_BV_*, the lower 8 bits is the bitvec
++   * bit size, and the higher bits are reserved, except: (1) the higher
++   * bits mean the extended bits for zero/sign extension, (2) the higher
++   * and lower mean the start and end of the bit for extraction, and (3)
++   * the first bit of higher bits is used to indicate signed mod/div.
++   * For PRED_EXT, the lowest one bit is for BCF_VAL (0/1 for true/false),
++   * and all bits are reserved for other cases.
++   */
++  __u16 params;
++  /* arguments (arg_idx), counted by vlen */
++  __u32 args[];
++};
++
++#define BCF_BV_BITSZ(PARAMS) ((PARAMS) & 0x00ff)
++#define BCF_BV_EXTSZ(PARAMS) (((PARAMS) & 0xff00) >> 8)
++#define BCF_EXTRACT_START(PARAMS) BCF_BV_EXTSZ(PARAMS)
++#define BCF_EXTRACT_LAST(PARAMS) BCF_BV_BITSZ(PARAMS)
++#define BCF_PRED_VAL(PARAMS) ((PARAMS) & 0x0001)
++
++#define BCF_MAGIC 0x0BCF
++
++struct bcf_proof_header
++{
++  __u32 magic;
++  __u32 expr_cnt;
++  __u32 step_cnt;
++};
++
++struct bcf_proof_step
++{
++  __u16 rule;
++  __u8 vlen;
++  __u8 params;
++  __u32 args[];
++};
++
++#define BCF_STEP_CLASS(rule) ((rule) & 0xe000)
++#define BCF_RULE_BUILTIN 0x0000
++#define BCF_RULE_BOOLEAN 0x2000
++#define BCF_RULE_EQUALITY 0x4000
++#define BCF_RULE_BV 0x6000
++
++#define BCF_STEP_RULE(step) ((step) & 0x1fff)
++
++/* Builtin Rules */
++enum
++{
++  BCF_RULE_ASSUME = 0,
++  BCF_RULE_REWRITE,
++
++  __MAX_BCF_BUILTIN_RULES,
++};
++
++/* Boolean Rules */
++enum
++{
++  BCF_RULE_RESOLUTION = 0,
++  BCF_RULE_CHAIN_RESOLUTION,
++  BCF_RULE_FACTORING,
++  BCF_RULE_REORDERING,
++  BCF_RULE_SPLIT,
++  BCF_RULE_EQ_RESOLVE,
++  BCF_RULE_MODUS_PONENS,
++  BCF_RULE_NOT_NOT_ELIM,
++  BCF_RULE_CONTRA,
++  BCF_RULE_AND_ELIM,
++  BCF_RULE_AND_INTRO,
++  BCF_RULE_NOT_OR_ELIM,
++  BCF_RULE_IMPLIES_ELIM,
++  BCF_RULE_NOT_IMPLIES_ELIM,
++  BCF_RULE_EQUIV_ELIM,
++  BCF_RULE_NOT_EQUIV_ELIM,
++  BCF_RULE_XOR_ELIM,
++  BCF_RULE_NOT_XOR_ELIM,
++  BCF_RULE_ITE_ELIM,
++  BCF_RULE_NOT_ITE_ELIM,
++  BCF_RULE_NOT_AND,
++  BCF_RULE_CNF_AND_POS,
++  BCF_RULE_CNF_AND_NEG,
++  BCF_RULE_CNF_OR_POS,
++  BCF_RULE_CNF_OR_NEG,
++  BCF_RULE_CNF_IMPLIES_POS,
++  BCF_RULE_CNF_IMPLIES_NEG,
++  BCF_RULE_CNF_EQUIV_POS,
++  BCF_RULE_CNF_EQUIV_NEG,
++  BCF_RULE_CNF_XOR_POS,
++  BCF_RULE_CNF_XOR_NEG,
++  BCF_RULE_CNF_ITE_POS,
++  BCF_RULE_CNF_ITE_NEG,
++  BCF_RULE_ITE_EQ,
++
++  __MAX_BCF_BOOLEAN_RULES,
++};
++
++/* Equality Rules */
++enum
++{
++  BCF_RULE_REFL = 0,
++  BCF_RULE_SYMM,
++  BCF_RULE_TRANS,
++  BCF_RULE_CONG,
++  BCF_RULE_TRUE_INTRO,
++  BCF_RULE_TRUE_ELIM,
++  BCF_RULE_FALSE_INTRO,
++  BCF_RULE_FALSE_ELIM,
++
++  __MAX_BCF_EQUALITY_RULES,
++};
++
++/* BitVector Rules */
++enum
++{
++  BCF_RULE_BITBLAST = 0,
++
++  __MAX_BCF_BV_RULES,
++};
++
++typedef uint8_t u8;
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef uint64_t u64;
++
++enum
++{
++  BCF_F_PROOF_REQUESTED = (1U << 0),
++  BCF_F_PROOF_PROVIDED = (1U << 1),
++  BCF_F_PROOF_PATH_UNREACHABLE = (1U << 2),
++};
++
++union __bpf_attr
++{
++  struct
++  {                     /* anonymous struct used by BPF_MAP_CREATE command */
++    __u32 map_type;     /* one of enum bpf_map_type */
++    __u32 key_size;     /* size of key in bytes */
++    __u32 value_size;   /* size of value in bytes */
++    __u32 max_entries;  /* max number of entries in a map */
++    __u32 map_flags;    /* BPF_MAP_CREATE related
++                         * flags defined above.
++                         */
++    __u32 inner_map_fd; /* fd pointing to the inner map */
++    __u32 numa_node;    /* numa node (effective only if
++                         * BPF_F_NUMA_NODE is set).
++                         */
++    char map_name[BPF_OBJ_NAME_LEN];
++    __u32 map_ifindex;               /* ifindex of netdev to create on */
++    __u32 btf_fd;                    /* fd pointing to a BTF type data */
++    __u32 btf_key_type_id;           /* BTF type_id of the key */
++    __u32 btf_value_type_id;         /* BTF type_id of the value */
++    __u32 btf_vmlinux_value_type_id; /* BTF type_id of a kernel-
++                                      * struct stored as the
++                                      * map value
++                                      */
++    /* Any per-map-type extra fields
++     *
++     * BPF_MAP_TYPE_BLOOM_FILTER - the lowest 4 bits indicate the
++     * number of hash functions (if 0, the bloom filter will default
++     * to using 5 hash functions).
++     *
++     * BPF_MAP_TYPE_ARENA - contains the address where user space
++     * is going to mmap() the arena. It has to be page aligned.
++     */
++    __u64 map_extra;
++
++    __s32 value_type_btf_obj_fd; /* fd pointing to a BTF
++                                  * type data for
++                                  * btf_vmlinux_value_type_id.
++                                  */
++    /* BPF token FD to use with BPF_MAP_CREATE operation.
++     * If provided, map_flags should have BPF_F_TOKEN_FD flag set.
++     */
++    __s32 map_token_fd;
++  };
++
++  struct
++  { /* anonymous struct used by BPF_MAP_*_ELEM commands */
++    __u32 map_fd;
++    __aligned_u64 key;
++    union
++    {
++      __aligned_u64 value;
++      __aligned_u64 next_key;
++    };
++    __u64 flags;
++  };
++
++  struct
++  {                          /* struct used by BPF_MAP_*_BATCH commands */
++    __aligned_u64 in_batch;  /* start batch,
++                              * NULL to start from beginning
++                              */
++    __aligned_u64 out_batch; /* output: next start batch */
++    __aligned_u64 keys;
++    __aligned_u64 values;
++    __u32 count; /* input/output:
++                  * input: # of key/value
++                  * elements
++                  * output: # of filled elements
++                  */
++    __u32 map_fd;
++    __u64 elem_flags;
++    __u64 flags;
++  } batch;
++
++  struct
++  {                  /* anonymous struct used by BPF_PROG_LOAD command */
++    __u32 prog_type; /* one of enum bpf_prog_type */
++    __u32 insn_cnt;
++    __aligned_u64 insns;
++    __aligned_u64 license;
++    __u32 log_level;       /* verbosity level of verifier */
++    __u32 log_size;        /* size of user buffer */
++    __aligned_u64 log_buf; /* user supplied buffer */
++    __u32 kern_version;    /* not used */
++    __u32 prog_flags;
++    char prog_name[BPF_OBJ_NAME_LEN];
++    __u32 prog_ifindex; /* ifindex of netdev to prep for */
++    /* For some prog types expected attach type must be known at
++     * load time to verify attach type specific parts of prog
++     * (context accesses, allowed helpers, etc).
++     */
++    __u32 expected_attach_type;
++    __u32 prog_btf_fd;        /* fd pointing to BTF type data */
++    __u32 func_info_rec_size; /* userspace bpf_func_info size */
++    __aligned_u64 func_info;  /* func info */
++    __u32 func_info_cnt;      /* number of bpf_func_info records */
++    __u32 line_info_rec_size; /* userspace bpf_line_info size */
++    __aligned_u64 line_info;  /* line info */
++    __u32 line_info_cnt;      /* number of bpf_line_info records */
++    __u32 attach_btf_id;      /* in-kernel BTF type id to attach to */
++    union
++    {
++      /* valid prog_fd to attach to bpf prog */
++      __u32 attach_prog_fd;
++      /* or valid module BTF object fd or 0 to attach to vmlinux */
++      __u32 attach_btf_obj_fd;
++    };
++    __u32 core_relo_cnt;    /* number of bpf_core_relo */
++    __aligned_u64 fd_array; /* array of FDs */
++    __aligned_u64 core_relos;
++    __u32 core_relo_rec_size; /* sizeof(struct bpf_core_relo) */
++    /* output: actual total log contents size (including termintaing zero).
++     * It could be both larger than original log_size (if log was
++     * truncated), or smaller (if log buffer wasn't filled completely).
++     */
++    __u32 log_true_size;
++    /* BPF token FD to use with BPF_PROG_LOAD operation.
++     * If provided, prog_flags should have BPF_F_TOKEN_FD flag set.
++     */
++    __s32 prog_token_fd;
++    /* output: bcf fd for loading proof, set by the verifier when
++     * bcf_flags & BCF_F_PROOF_REQUESTED
++     */
++    __u32 bcf_fd;
++    /* bcf buf for storing both the formula to be proved from the
++     * verifier and the proof provided from the user.
++     */
++    __aligned_u64 bcf_buf;
++    __u32 bcf_buf_size; /* size of bcf_buf */
++    /* input/output: the size of actual proof or formula */
++    __u32 bcf_buf_true_size;
++    /* input/output: proof requested or provided */
++    __u32 bcf_flags;
++  };
++} __attribute__((aligned(8)));
++
++struct bcf_verifier_env
++{
++  u32 dummy;
++};
++
++typedef struct
++{
++  union
++  {
++    void* kernel;
++    void* user;
++  };
++  bool is_kernel : 1;
++} bpfptr_t;
++
++static inline bpfptr_t make_bpfptr(u64 addr, bool is_kernel)
++{
++  return (bpfptr_t){.kernel = (void*)addr, .is_kernel = is_kernel};
++}
++
++/* verifier env stub */
++struct bpf_verifier_env
++{
++  struct
++  {
++    struct bcf_expr* exprs;
++    u32 formula;
++  } bcf;
++};
++
++#endif /* __LINUX_BCF_H__ */
+diff --git a/src/proof/alf/bcf.patch b/src/proof/alf/bcf.patch
+new file mode 100644
+index 0000000000..9e2cb98887
+--- /dev/null
++++ b/src/proof/alf/bcf.patch
+@@ -0,0 +1,16 @@
++diff --git a/../../kernels/bpf-next/kernel/bpf/bcf.c b/./src/proof/alf/bcf.c
++index 0df828e49b..98c1f32c6f 100644
++--- a/../../kernels/bpf-next/kernel/bpf/bcf.c
+++++ b/./src/proof/alf/bcf.c
++@@ -1,9 +1,5 @@
++-#include <uapi/linux/bcf.h>
++-#include <linux/bcf.h>
++-#include <linux/bpf.h>
++-#include <linux/bpf_verifier.h>
++-#include <linux/bitmap.h>
++-#include <linux/stringify.h>
+++#include "bcf_stubs.h"
+++#include "bcf.h"
++ 
++ #define EXPR_BUF_LEN 255
++ 
+diff --git a/src/proof/alf/bcf_stubs.h b/src/proof/alf/bcf_stubs.h
+new file mode 100644
+index 0000000000..8a1c8f6234
+--- /dev/null
++++ b/src/proof/alf/bcf_stubs.h
+@@ -0,0 +1,345 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef __BCF_CHECKER_H__
++#define __BCF_CHECKER_H__
++
++#include "bcf.h"
++
++#include <linux/types.h>
++#include <linux/bpf_common.h>
++#include <linux/bpf.h>
++#include <stdint.h>
++#include <string.h>
++#include <stdlib.h>
++#include <malloc.h>
++#include <stdbool.h>
++
++static inline void *__malloc(size_t len)
++{
++	void *ptr = malloc(len);
++	if (!ptr)
++		abort();
++	return ptr;
++}
++
++static inline void *__realloc(void *ptr, size_t new_size)
++{
++	void *nptr = realloc(ptr, new_size);
++	if (!nptr)
++		abort();
++	return nptr;
++}
++
++typedef int gfp_t;
++
++static inline void *__kmalloc(size_t size, gfp_t flags)
++{
++	(void)flags;
++
++	void *p = __malloc(size);
++	memset(p, 0, size);
++
++	return p;
++}
++
++static inline void *kmalloc(size_t size, gfp_t flags)
++{
++	return __kmalloc(size, flags);
++}
++
++static inline void *kvmalloc(size_t size, gfp_t flags)
++{
++	return __kmalloc(size, flags);
++}
++
++static inline void *kzalloc(size_t size, gfp_t flags)
++{
++	return __kmalloc(size, flags);
++}
++
++static inline void *krealloc(void *src, size_t len)
++{
++	return __realloc(src, len);
++}
++
++static inline void *kvrealloc(void *src, size_t len, gfp_t flags)
++{
++	return __realloc(src, len);
++}
++
++static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
++{
++	return __kmalloc(n * size, flags);
++}
++
++static inline void kfree(void *ptr)
++{
++	free(ptr);
++}
++
++static inline void kvfree(void *ptr)
++{
++	free(ptr);
++}
++
++static inline void bitmap_zero(unsigned long *bmap, u32 size)
++{
++    (void)size;
++    (void)bmap;
++    return;
++}
++
++static void set_bit(u32 idx, unsigned long *bmap){
++    (void)idx;
++    (void)bmap;
++    return;
++}
++
++bool test_bit(u32 idx, unsigned long *bmap)
++{
++    (void)idx;
++    (void)bmap;
++    return true;
++}
++
++#define pr_debug(args...) fprintf(stderr, ##args)
++#define pr_info(args...) fprintf(stderr, ##args)
++#define pr_warn(args...) fprintf(stderr, ##args)
++
++#define	EPERM		 1	/* Operation not permitted */
++#define	ENOENT		 2	/* No such file or directory */
++#define	ESRCH		 3	/* No such process */
++#define	EINTR		 4	/* Interrupted system call */
++#define	EIO		 5	/* I/O error */
++#define	ENXIO		 6	/* No such device or address */
++#define	E2BIG		 7	/* Argument list too long */
++#define	ENOEXEC		 8	/* Exec format error */
++#define	EBADF		 9	/* Bad file number */
++#define	ECHILD		10	/* No child processes */
++#define	EAGAIN		11	/* Try again */
++#define	ENOMEM		12	/* Out of memory */
++#define	EACCES		13	/* Permission denied */
++#define	EFAULT		14	/* Bad address */
++#define	ENOTBLK		15	/* Block device required */
++#define	EBUSY		16	/* Device or resource busy */
++#define	EEXIST		17	/* File exists */
++#define	EXDEV		18	/* Cross-device link */
++#define	ENODEV		19	/* No such device */
++#define	ENOTDIR		20	/* Not a directory */
++#define	EISDIR		21	/* Is a directory */
++#define	EINVAL		22	/* Invalid argument */
++#define	ENFILE		23	/* File table overflow */
++#define	EMFILE		24	/* Too many open files */
++#define	ENOTTY		25	/* Not a typewriter */
++#define	ETXTBSY		26	/* Text file busy */
++#define	EFBIG		27	/* File too large */
++#define	ENOSPC		28	/* No space left on device */
++#define	ESPIPE		29	/* Illegal seek */
++#define	EROFS		30	/* Read-only file system */
++#define	EMLINK		31	/* Too many links */
++#define	EPIPE		32	/* Broken pipe */
++#define	EDOM		33	/* Math argument out of domain of func */
++#define	ERANGE		34	/* Math result not representable */
++
++#define ENOTSUPP	35
++
++#define BITS_PER_BYTE 8
++
++
++#define GFP_KERNEL 0
++
++#define __stringify_1(x...)	#x
++#define __stringify(x...)	__stringify_1(x)
++
++#define __annotate_jump_table
++
++#define MAX_BCF_PROOF_SIZE 1000000
++
++struct bcf_expr_unary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++};
++
++struct bcf_expr_binary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++	u32 arg1;
++};
++
++struct bcf_expr_ternary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++	u32 arg1;
++	u32 arg2;
++};
++
++#define BCF_PRED_VAR                                  \
++	((struct bcf_expr){                           \
++		.code = BCF_BOOL_PRED | BCF_BOOL_VAR, \
++		.vlen = 0,                            \
++		.params = 0,                          \
++	})
++
++#define BCF_PRED_TRUE                                 \
++	((struct bcf_expr){                           \
++		.code = BCF_BOOL_PRED | BCF_BOOL_VAL, \
++		.vlen = 0,                            \
++		.params = BCF_BOOL_TRUE,              \
++	})
++
++#define BCF_PRED_FALSE                                \
++	((struct bcf_expr){                           \
++		.code = BCF_BOOL_PRED | BCF_BOOL_VAL, \
++		.vlen = 0,                            \
++		.params = BCF_BOOL_FALSE,             \
++	})
++
++#define BCF_PRED_NOT(ARG0)                       \
++	((struct bcf_expr_unary){                \
++		.code = BCF_BOOL_PRED | BCF_NOT, \
++		.vlen = 1,                       \
++		.params = 0,                     \
++		.arg0 = ARG0,                    \
++	})
++
++#define BCF_PRED_ITE(ARG0, ARG1, ARG2)           \
++	((struct bcf_expr_ternary){              \
++		.code = BCF_BOOL_PRED | BCF_ITE, \
++		.vlen = 3,                       \
++		.params = 0,                     \
++		.arg0 = ARG0,                    \
++		.arg1 = ARG1,                    \
++		.arg2 = ARG2,                    \
++	})
++
++#define BCF_BOOL_EXPR(OP, ARG0, ARG1)       \
++	((struct bcf_expr_binary){          \
++		.code = BCF_BOOL_PRED | OP, \
++		.vlen = 2,                  \
++		.params = 0,                \
++		.arg0 = ARG0,               \
++		.arg1 = ARG1,               \
++	})
++
++#define BCF_PRED_EQUIV(ARG0, ARG1) BCF_BOOL_EXPR(BCF_EQUIV, ARG0, ARG1)
++#define BCF_PRED_XOR(ARG0, ARG1) BCF_BOOL_EXPR(BCF_XOR, ARG0, ARG1)
++#define BCF_PRED_IMPLES(ARG0, ARG1) BCF_BOOL_EXPR(BCF_IMPLIES, ARG0, ARG1)
++
++#define BCF_BV_VAR32                                       \
++	((struct bcf_expr){                                \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR, \
++		.vlen = 0,                                 \
++		.params = 32,                              \
++	})
++
++#define BCF_BV_VAR64                                       \
++	((struct bcf_expr){                                \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR, \
++		.vlen = 0,                                 \
++		.params = 64,                              \
++	})
++
++#define BCF_BV_VAL32(IMM)                                  \
++	((struct bcf_expr_unary){                          \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAL, \
++		.vlen = 1,                                 \
++		.params = 32,                              \
++		.arg0 = IMM,                               \
++	})
++
++#define BCF_BV_VAL64(IMM)                                  \
++	((struct bcf_expr_binary){                         \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAL, \
++		.vlen = 2,                                 \
++		.params = 64,                              \
++		.arg0 = IMM,                               \
++		.arg1 = (u64)IMM >> 32,                    \
++	})
++
++#define BCF_BV_EXTRACT(SIZE, ARG0)                          \
++	((struct bcf_expr_unary){                           \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_EXTRACT, \
++		.vlen = 1,                                  \
++		.params = ((u16)SIZE - 1) << 8 | 0,         \
++		.arg0 = ARG0,                               \
++	})
++
++#define BCF_BV_ZEXT(SIZE, BITSZ, ARG0)                          \
++	((struct bcf_expr_unary){                               \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_ZERO_EXTEND, \
++		.vlen = 1,                                      \
++		.params = (u16)SIZE << 8 | BITSZ,               \
++		.arg0 = ARG0,                                   \
++	})
++
++#define BCF_BV_SEXT(SIZE, BITSZ, ARG0)                          \
++	((struct bcf_expr_unary){                               \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_SIGN_EXTEND, \
++		.vlen = 1,                                      \
++		.params = (u16)SIZE << 8 | BITSZ,               \
++		.arg0 = ARG0,                                   \
++	})
++
++#define BCF_BV_EXPR(CODE, ARG0, ARG1, BITS) \
++	((struct bcf_expr_binary){          \
++		.code = CODE,               \
++		.vlen = 2,                  \
++		.params = BITS,             \
++		.arg0 = ARG0,               \
++		.arg1 = ARG1,               \
++	})
++
++#define BCF_ALU(OP, ARG0, ARG1, BITS) \
++	BCF_BV_EXPR(BCF_BV_ALU | OP, ARG0, ARG1, BITS)
++
++#define BCF_ALU32(OP, ARG0, ARG1) BCF_ALU(OP, ARG0, ARG1, 32)
++#define BCF_ALU64(OP, ARG0, ARG1) BCF_ALU(OP, ARG0, ARG1, 64)
++
++#define BCF_PRED(OP, ARG0, ARG1, BITS) \
++	BCF_BV_EXPR(BCF_BV_PRED | OP, ARG0, ARG1, BITS)
++
++#define BCF_PRED32(OP, ARG0, ARG1) BCF_PRED(OP, ARG0, ARG1, 32)
++#define BCF_PRED64(OP, ARG0, ARG1) BCF_PRED(OP, ARG0, ARG1, 64)
++
++#define swap(a, b) \
++	do { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; } while (0)
++
++static inline int copy_from_bpfptr_offset(void *dst, bpfptr_t src, int off, int size)
++{
++	memcpy(dst, (char*)src.kernel + off, size);
++	return 0;
++}
++
++static inline int copy_from_bpfptr(void *dst, bpfptr_t src, int size)
++{
++	memcpy(dst, src.kernel, size);
++	return 0;
++}
++
++/* use our bpf attr */
++#define bpf_attr __bpf_attr
++
++#define WARN_ON_ONCE(COND) false
++
++static inline bool bcf_requested(struct bpf_verifier_env *env)
++{
++    return true;
++}
++
++#define ALIGN(SZ, BITS) (SZ + BITS - 1)
++#define BITS_PER_LONG (sizeof(unsigned long) * BITS_PER_BYTE)
++#define bitmap_size(nbits)	(ALIGN(nbits, BITS_PER_LONG) / BITS_PER_BYTE)
++
++#define BUILD_BUG_ON(COND)
++#define BUG_ON(COND)
++
++#define signal_pending(V) false
++#define need_resched() false
++#define cond_resched()
++
++#endif /* __BCF_CHECKER_H__ */
+diff --git a/src/smt/proof_manager.cpp b/src/smt/proof_manager.cpp
+index 7878ae52f3..a52766ed0f 100644
+--- a/src/smt/proof_manager.cpp
++++ b/src/smt/proof_manager.cpp
+@@ -267,6 +267,14 @@ std::shared_ptr<ProofNode> PfManager::connectProofToAssertions(
+   }
+ }
+ 
++std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
++PfManager::printProofBCF(std::shared_ptr<ProofNode> fp)
++{
++    proof::AlfNodeConverter atp(nodeManager());
++    proof::AlfPrinter alfp(d_env, atp, d_rewriteDb.get(), 1, true);
++    return alfp.printBCF(fp);
++}
++
+ void PfManager::printProof(std::ostream& out,
+                            std::shared_ptr<ProofNode> fp,
+                            options::ProofFormatMode mode,
+diff --git a/src/smt/proof_manager.h b/src/smt/proof_manager.h
+index 4db96d2d3a..10d06688df 100644
+--- a/src/smt/proof_manager.h
++++ b/src/smt/proof_manager.h
+@@ -104,6 +104,9 @@ class PfManager : protected EnvObj
+                   ProofScopeMode scopeMode,
+                   const std::map<Node, std::string>& assertionNames =
+                       std::map<Node, std::string>());
++  
++  std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
++  printProofBCF(std::shared_ptr<ProofNode> fp);
+ 
+   /**
+    * Translate difficulty map. This takes a mapping dmap from preprocessed
+diff --git a/src/smt/solver_engine.cpp b/src/smt/solver_engine.cpp
+index c5c129be71..6d88d7c0a3 100644
+--- a/src/smt/solver_engine.cpp
++++ b/src/smt/solver_engine.cpp
+@@ -1431,6 +1431,12 @@ void SolverEngine::ensureWellFormedTerms(const std::vector<Node>& ns,
+   }
+ }
+ 
++std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
++SolverEngine::printProofBCF(std::shared_ptr<ProofNode> fp)
++{
++    return d_pfManager->printProofBCF(fp);
++}
++
+ void SolverEngine::printProof(std::ostream& out,
+                               std::shared_ptr<ProofNode> fp,
+                               modes::ProofFormat proofFormat,
+diff --git a/src/smt/solver_engine.h b/src/smt/solver_engine.h
+index 47a564e831..051020e7a3 100644
+--- a/src/smt/solver_engine.h
++++ b/src/smt/solver_engine.h
+@@ -25,6 +25,7 @@
+ #include <string>
+ #include <unordered_set>
+ #include <vector>
++#include <utility>
+ 
+ #include "context/cdhashmap_forward.h"
+ #include "options/options.h"
+@@ -1061,6 +1062,9 @@ class CVC5_EXPORT SolverEngine
+                   modes::ProofFormat proofFormat,
+                   const std::map<Node, std::string>& assertionNames);
+ 
++  std::pair<std::vector<uint32_t>, std::vector<uint32_t>>
++  printProofBCF(std::shared_ptr<ProofNode> fp);
++
+   /* Members -------------------------------------------------------------- */
+ 
+   /** Solver instance that owns this SolverEngine instance. */

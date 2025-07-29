@@ -1,0 +1,51 @@
+From 7cd3b9f80b54c18edb24dbb6f3c81c9e15b823a0 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 17:57:00 +0100
+Subject: [PATCH 12/32] bpf: Refactor basic check rontines
+
+In the following patches, we will make the verifier resumable, such that
+when the proof is checked, the verifier can continue the last analysis
+using the refined abstraction.
+
+To achieve this, this patch refactors the relevant routines to move every
+analysis-related state that is originally local variable to the global
+verifier_env, e.g., prev_insn_idx is moved to the verifier_env.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index c9bee55c218f..2662a3f13f25 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19168,7 +19168,7 @@ static int do_check(struct bpf_verifier_env *env)
+ 	struct bpf_reg_state *regs;
+ 	int insn_cnt = env->prog->len;
+ 	bool do_print_state = false;
+-	int prev_insn_idx = -1;
++	int prev_insn_idx = env->prev_insn_idx;
+
+ 	for (;;) {
+ 		bool exception_exit = false;
+@@ -22386,6 +22386,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	struct bpf_reg_state *regs;
+ 	int ret, i;
+
++	env->prev_insn_idx = -1;
+ 	env->prev_linfo = NULL;
+ 	env->pass_cnt++;
+
+@@ -22490,6 +22491,8 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	}
+
+ 	ret = do_check(env);
++	if (bcf_requested(env))
++		return ret;
+ out:
+ 	/* check for NULL is necessary, since cur_state can be freed inside
+ 	 * do_check() under memory pressure.
+--
+2.34.1
+

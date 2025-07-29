@@ -1,0 +1,198 @@
+From 7dbe577a05559a70a4f97f4ac9f3877e2f0bdd3b Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 18:43:28 +0100
+Subject: [PATCH 3/6] libbpf: Add bcf proof load support
+
+Teach libbpf to check if bcf proof requested and invoke an
+external prover if requested.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ tools/lib/bpf/bpf.c             | 29 ++++++++++++++++++++++++++++-
+ tools/lib/bpf/bpf.h             | 11 ++++++++++-
+ tools/lib/bpf/libbpf.c          | 22 ++++++++++++++++++++++
+ tools/lib/bpf/libbpf.h          |  5 +++++
+ tools/lib/bpf/libbpf.map        |  2 ++
+ tools/lib/bpf/libbpf_internal.h |  2 ++
+ 6 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index becdfa701c75..5839a90ff321 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -238,12 +238,13 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
+ 		  const struct bpf_insn *insns, size_t insn_cnt,
+ 		  struct bpf_prog_load_opts *opts)
+ {
+-	const size_t attr_sz = offsetofend(union bpf_attr, prog_token_fd);
++	const size_t attr_sz = offsetofend(union bpf_attr, bcf_flags);
+ 	void *finfo = NULL, *linfo = NULL;
+ 	const char *func_info, *line_info;
+ 	__u32 log_size, log_level, attach_prog_fd, attach_btf_obj_fd;
+ 	__u32 func_info_rec_size, line_info_rec_size;
+ 	int fd, attempts;
++	__u32 *bcf_buf, bcf_buf_size;
+ 	union bpf_attr attr;
+ 	char *log_buf;
+
+@@ -318,8 +319,34 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
+ 		attr.log_level = log_level;
+ 	}
+
++	bcf_buf = OPTS_GET(opts, bcf_buf, NULL);
++	bcf_buf_size = OPTS_GET(opts, bcf_buf_size, 0);
++	if (!!bcf_buf != !!bcf_buf_size || (bcf_buf && !__bcf_prover))
++		return libbpf_err(-EINVAL);
++
++	if (bcf_buf) {
++		attr.bcf_buf = ptr_to_u64(bcf_buf);
++		attr.bcf_buf_size = bcf_buf_size;
++	}
++
+ 	fd = sys_bpf_prog_load(&attr, attr_sz, attempts);
++
++	while ((attr.bcf_flags & BCF_F_PROOF_REQUESTED)) {
++		int prove_err;
++
++		pr_info("bcf proof requested\n");
++		prove_err = (*__bcf_prover)((__u32 *)attr.bcf_buf, attr.bcf_buf_size,
++				   &attr.bcf_buf_true_size, &attr.bcf_flags);
++		if (prove_err)
++			break;
++
++		pr_info("proof size: %d\n", attr.bcf_buf_true_size);
++		attr.bcf_flags |= BCF_F_PROOF_PROVIDED;
++		fd = sys_bpf_prog_load(&attr, attr_sz, attempts);
++	}
++
+ 	OPTS_SET(opts, log_true_size, attr.log_true_size);
++	OPTS_SET(opts, bcf_buf_true_size, attr.bcf_buf_true_size);
+ 	if (fd >= 0)
+ 		return fd;
+
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index a4a7b1ad1b63..8ca8d20a63c0 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -107,9 +107,16 @@ struct bpf_prog_load_opts {
+ 	 */
+ 	__u32 log_true_size;
+ 	__u32 token_fd;
++
++	/* bcf proof options */
++	__u32 *bcf_buf;
++	__u32 bcf_buf_size;
++	/* output: actual bcf formula size */
++	__u32 bcf_buf_true_size;
++
+ 	size_t :0;
+ };
+-#define bpf_prog_load_opts__last_field token_fd
++#define bpf_prog_load_opts__last_field bcf_buf_true_size
+
+ LIBBPF_API int bpf_prog_load(enum bpf_prog_type prog_type,
+ 			     const char *prog_name, const char *license,
+@@ -122,6 +129,8 @@ LIBBPF_API int bpf_prog_load(enum bpf_prog_type prog_type,
+ /* Recommended log buffer size */
+ #define BPF_LOG_BUF_SIZE (UINT32_MAX >> 8) /* verifier maximum in kernels <= 5.1 */
+
++#define BCF_BUF_SIZE (UINT32_MAX >> 8)
++
+ struct bpf_btf_load_opts {
+ 	size_t sz; /* size of this struct for forward/backward compatibility */
+
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index 66173ddb5a2d..ffcbbb389d02 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -7448,6 +7448,17 @@ static int libbpf_prepare_prog_load(struct bpf_program *prog,
+
+ static void fixup_verifier_log(struct bpf_program *prog, char *buf, size_t buf_sz);
+
++bcf_prover_fn_t __bcf_prover;
++
++bcf_prover_fn_t libbpf_set_prover(bcf_prover_fn_t fn)
++{
++	bcf_prover_fn_t old_print_fn;
++
++	old_print_fn = __atomic_exchange_n(&__bcf_prover, fn, __ATOMIC_RELAXED);
++
++	return old_print_fn;
++}
++
+ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog,
+ 				struct bpf_insn *insns, int insns_cnt,
+ 				const char *license, __u32 kern_version, int *prog_fd)
+@@ -7458,6 +7469,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+ 	char *log_buf = NULL, *tmp;
+ 	bool own_log_buf = true;
+ 	__u32 log_level = prog->log_level;
++	__u32 *bcf_buf = NULL;
+ 	int ret, err;
+
+ 	/* Be more helpful by rejecting programs that can't be validated early
+@@ -7533,6 +7545,15 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+ 		return 0;
+ 	}
+
++	if (__bcf_prover && !load_attr.bcf_buf) {
++		bcf_buf = malloc(BCF_BUF_SIZE);
++		if (!bcf_buf)
++			return -ENOMEM;
++
++		load_attr.bcf_buf = bcf_buf;
++		load_attr.bcf_buf_size = BCF_BUF_SIZE;
++	}
++
+ retry_load:
+ 	/* if log_level is zero, we don't request logs initially even if
+ 	 * custom log_buf is specified; if the program load fails, then we'll
+@@ -7624,6 +7645,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+ out:
+ 	if (own_log_buf)
+ 		free(log_buf);
++	free(bcf_buf);
+ 	return ret;
+ }
+
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index b2ce3a72b11d..8eb9c2766f3d 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -1802,6 +1802,11 @@ LIBBPF_API int bpf_linker__add_file(struct bpf_linker *linker,
+ LIBBPF_API int bpf_linker__finalize(struct bpf_linker *linker);
+ LIBBPF_API void bpf_linker__free(struct bpf_linker *linker);
+
++typedef int (*bcf_prover_fn_t)(__u32 *bcf_buf, __u32 bcf_buf_size,
++				  __u32 *bcf_buf_true_size, __u32 *bcf_flags);
++
++LIBBPF_API bcf_prover_fn_t libbpf_set_prover(bcf_prover_fn_t fn);
++
+ /*
+  * Custom handling of BPF program's SEC() definitions
+  */
+diff --git a/tools/lib/bpf/libbpf.map b/tools/lib/bpf/libbpf.map
+index 54b6f312cfa8..3783390fb82f 100644
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -432,4 +432,6 @@ LIBBPF_1.5.0 {
+ } LIBBPF_1.4.0;
+
+ LIBBPF_1.6.0 {
++	global:
++		libbpf_set_prover;
+ } LIBBPF_1.5.0;
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index de498e2dd6b0..4880d1d06909 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -726,4 +726,6 @@ int elf_resolve_pattern_offsets(const char *binary_path, const char *pattern,
+
+ int probe_fd(int fd);
+
++extern bcf_prover_fn_t __bcf_prover;
++
+ #endif /* __LIBBPF_LIBBPF_INTERNAL_H */
+--
+2.34.1
+

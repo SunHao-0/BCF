@@ -1,0 +1,130 @@
+From 75bd2a898690039c936ecdcbb1112e431b661085 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 15:15:40 +0100
+Subject: [PATCH 11/32] bpf: Add path constraint tracking
+
+Add routines to track the path constraint in BCF. After analyzing the
+instruction, record_path_cond() is called to record the path condition,
+which checks if the last insn analyzed is a conditional jump; if so, the
+condition is recorded as a bcf_expr, and the idx of the expr is appended
+to path_conds. The final path constraint is the conjunction of those idx.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 86 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index b30ce890d52c..c9bee55c218f 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1899,6 +1899,14 @@ static int __bcf_add_cond(struct bpf_verifier_env *env, int expr)
+ 	return 0;
+ }
+
++static int bcf_add_cond(struct bpf_verifier_env *env,
++			struct bcf_expr_binary expr)
++{
++	int expr_idx = bcf_add_expr(env, expr);
++
++	return __bcf_add_cond(env, expr_idx);
++}
++
+ static int bcf_zext_32_to_64(struct bpf_verifier_env *env,
+ 			     struct bpf_reg_state *reg)
+ {
+@@ -19079,6 +19087,79 @@ static int bcf_match_path(struct bpf_verifier_env *env)
+ 	return PATH_MATCH;
+ }
+
++static int record_path_cond(struct bpf_verifier_env *env)
++{
++	int prev_insn_idx = env->prev_insn_idx;
++	struct bpf_reg_state *regs = cur_regs(env);
++	struct bpf_reg_state *dst, *src;
++	int dst_expr, src_expr;
++	struct bpf_insn *insn;
++	u8 class, op, bits;
++	bool jmp32, non_taken;
++
++	if (prev_insn_idx < 0)
++		return 0;
++
++	insn = &env->prog->insnsi[prev_insn_idx];
++	class = BPF_CLASS(insn->code);
++	op = BPF_OP(insn->code);
++
++	if (class != BPF_JMP && class != BPF_JMP32)
++		return 0;
++	if (op == BPF_CALL || op == BPF_EXIT || op == BPF_JA || op == BPF_JCOND)
++		return 0;
++
++	/* if the off of conditional jump is 0, we can't differentiate the
++	 * taken or fallthrough by only using the jmp history.
++	 */
++	if (insn->off == 0)
++		return -ENOTSUPP;
++
++	dst = regs + insn->dst_reg;
++	src = regs + insn->src_reg;
++	if (BPF_SRC(insn->code) == BPF_K) {
++		src = &env->fake_reg[0];
++		memset(src, 0, sizeof(*src));
++		src->type = SCALAR_VALUE;
++		__mark_reg_known(src, insn->imm);
++	}
++	if (dst->type != SCALAR_VALUE || src->type != SCALAR_VALUE)
++		return 0;
++
++	jmp32 = (class == BPF_JMP32);
++	if ((fit_u32(dst) && fit_u32(src)) || (fit_s32(dst) && fit_s32(src)))
++		jmp32 = true;
++	bits = jmp32 ? 32 : 64;
++
++	dst_expr = bcf_reg_expr(env, dst, jmp32);
++	src_expr = bcf_reg_expr(env, src, jmp32);
++	if (dst_expr < 0 || src_expr < 0)
++		return -EFAULT;
++
++	non_taken = (prev_insn_idx + 1 == env->insn_idx);
++	if (op == BPF_JSET) {
++		struct bcf_expr_binary and;
++		int and_expr, zero_expr;
++		u8 jmp_op;
++
++		and = BCF_ALU(BPF_AND, dst_expr, src_expr, bits);
++		and_expr = bcf_add_expr(env, and);
++		zero_expr = bcf_add_val(env, 0, jmp32);
++		if (and_expr < 0 || zero_expr < 0)
++			return -EFAULT;
++
++		jmp_op = BPF_JNE;
++		if (non_taken) /* equal to zero, no overlap */
++			jmp_op = BPF_JEQ;
++		return bcf_add_cond(env, BCF_PRED(jmp_op, and_expr, zero_expr,
++						  bits));
++	}
++
++	if (non_taken)
++		op = rev_opcode(op);
++	return bcf_add_cond(env, BCF_PRED(op, dst_expr, src_expr, bits));
++}
++
+ static int do_check(struct bpf_verifier_env *env)
+ {
+ 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
+@@ -19150,8 +19231,9 @@ static int do_check(struct bpf_verifier_env *env)
+ 				env->prev_insn_idx, env->insn_idx);
+ 			if (path == PATH_MISMATCH)
+ 				goto process_bpf_exit;
+-			else if (path == PATH_DONE)
+-				return 0;
++			err = record_path_cond(env);
++			if (err || path == PATH_DONE)
++				return err;
+ 		}
+
+ 		if (signal_pending(current))
+--
+2.34.1
+

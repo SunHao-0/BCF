@@ -1,0 +1,189 @@
+From 56415a598c49822a1228ce7f23719552af82c383 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 19:37:22 +0100
+Subject: [PATCH 5/6] bpftool: Copy bcf header to tools
+
+Copy bcf header to tools/include/uapi/linux/bcf.h
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ tools/include/uapi/linux/bcf.h | 167 +++++++++++++++++++++++++++++++++
+ 1 file changed, 167 insertions(+)
+ create mode 100644 tools/include/uapi/linux/bcf.h
+
+diff --git a/tools/include/uapi/linux/bcf.h b/tools/include/uapi/linux/bcf.h
+new file mode 100644
+index 000000000000..c714c2b610f4
+--- /dev/null
++++ b/tools/include/uapi/linux/bcf.h
+@@ -0,0 +1,167 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI__LINUX_BCF_H__
++#define _UAPI__LINUX_BCF_H__
++
++#include <linux/types.h>
++#include <linux/bpf_common.h>
++
++/* BCF expression classes */
++#define BCF_BV_ALU	0x00
++#define BCF_BV_PRED	0x01
++#define BCF_BOOL_PRED	0x02
++#define BCF_BUILTIN	0x03
++
++#define BCF_EXT		0x08
++
++/* BCF bitvec extended operations (BCF_BV_ALU | BCF_EXT) */
++#define BCF_BV_VAR	0x00
++#define BCF_BV_VAL	0x10
++#define BCF_BBT		0x20
++#define BCF_EXTRACT	0x30
++#define BCF_SIGN_EXTEND 0x40
++#define BCF_ZERO_EXTEND 0x50
++#define BCF_CONCAT	0x60
++#define BCF_BVSIZE	0x70
++
++/* BCF bitvec predicate (BCF_BV_PRED) */
++#define BCF_BITOF	0x00
++
++/* BCF boolean predicate (BCF_BOOL_PRED) */
++#define BCF_BOOL_VAR	0x00
++#define BCF_BOOL_VAL	0x10
++#define BCF_CONJ	0x20
++#define BCF_DISJ	0x30
++#define BCF_IMPLIES	0x40
++#define BCF_XOR		0x50
++#define BCF_ITE		0x60
++#define BCF_NOT		0x70
++#define BCF_EQUIV	0x80
++
++/*BCF boolean value (BCF_BOOL_VAL) */
++#define BCF_BOOL_TRUE	0x0
++#define BCF_BOOL_FALSE	0x1
++
++/* BCF builtin expressions (BCF_BUILTIN) */
++#define BCF_ARG_LIST	0x00
++
++struct bcf_expr {
++	__u8	code;
++	/* number of args */
++	__u8	vlen;
++	/* Parameterize the code. For BCF_BV_*, the lower 8 bits is the bitvec
++	 * bit size, and the higher bits are reserved, except: (1) the higher
++	 * bits mean the extended bits for zero/sign extension, (2) the higher
++	 * and lower mean the start and end of the bit for extraction.
++	 * For BCF_BOOL_BPRED, the lowest one bit for BCF_BOOL_VAL is the val,
++	 * and all bits are reserved for other cases.
++	 */
++	__u16	params;
++	/* arguments (arg_idx), counted by vlen */
++	__u32	args[];
++};
++
++#define BCF_BV_BITSZ(params)		((params) & 0x00ff)
++#define BCF_BV_EXTSZ(params)		(((params) & 0xff00) >> 8)
++#define BCF_EXTRACT_START(params)	BCF_BV_EXTSZ(params)
++#define BCF_EXTRACT_LAST(params)	BCF_BV_BITSZ(params)
++#define BCF_PRED_VAL(params)		((params) & 0x0001)
++
++struct bcf_conds {
++	__s32	path_cond;
++	__s32	refine_cond;
++};
++
++#define BCF_MAGIC 0x0BCF
++
++struct bcf_proof_header {
++	__u32	magic;
++	__u32	expr_cnt;
++	__u32	step_cnt;
++};
++
++struct bcf_proof_step {
++	__u16	rule;
++	__u8	vlen;
++	__u8	params;
++	__u32	args[];
++};
++
++#define BCF_STEP_CLASS(rule)		((rule) & 0xe000)
++#define		BCF_RULE_BUILTIN	0x0000
++#define		BCF_RULE_BOOLEAN	0x2000
++#define		BCF_RULE_EQUALITY	0x4000
++#define		BCF_RULE_BV		0x6000
++
++#define MAX_BCF_CLASS_RULES	0x1fff
++#define BCF_STEP_RULE(step)	((step) & 0x1fff)
++
++/* Builtin Rules */
++enum {
++	BCF_RULE_ASSUME = 0,
++	BCF_RULE_REWRITE,
++
++	__MAX_BCF_BUILTIN_RULES,
++};
++
++/* Boolean Rules */
++enum {
++	BCF_RULE_RESOLUTION = 0,
++	BCF_RULE_CHAIN_RESOLUTION,
++	BCF_RULE_FACTORING,
++	BCF_RULE_REORDERING,
++	BCF_RULE_SPLIT,
++	BCF_RULE_EQ_RESOLVE,
++	BCF_RULE_MODUS_PONENS,
++	BCF_RULE_NOT_NOT_ELIM,
++	BCF_RULE_CONTRA,
++	BCF_RULE_AND_ELIM,
++	BCF_RULE_AND_INTRO,
++	BCF_RULE_NOT_OR_ELIM,
++	BCF_RULE_IMPLIES_ELIM,
++	BCF_RULE_NOT_IMPLIES_ELIM,
++	BCF_RULE_EQUIV_ELIM,
++	BCF_RULE_NOT_EQUIV_ELIM,
++	BCF_RULE_XOR_ELIM,
++	BCF_RULE_NOT_XOR_ELIM,
++	BCF_RULE_ITE_ELIM,
++	BCF_RULE_NOT_ITE_ELIM,
++	BCF_RULE_NOT_AND,
++	BCF_RULE_CNF_AND_POS,
++	BCF_RULE_CNF_AND_NEG,
++	BCF_RULE_CNF_OR_POS,
++	BCF_RULE_CNF_OR_NEG,
++	BCF_RULE_CNF_IMPLIES_POS,
++	BCF_RULE_CNF_IMPLIES_NEG,
++	BCF_RULE_CNF_EQUIV_POS,
++	BCF_RULE_CNF_EQUIV_NEG,
++	BCF_RULE_CNF_XOR_POS,
++	BCF_RULE_CNF_XOR_NEG,
++	BCF_RULE_CNF_ITE_POS,
++	BCF_RULE_CNF_ITE_NEG,
++	BCF_RULE_ITE_EQ,
++
++	__MAX_BCF_BOOLEAN_RULES,
++};
++
++/* Equality Rules */
++enum {
++	BCF_RULE_REFL = 0,
++	BCF_RULE_SYMM,
++	BCF_RULE_TRANS,
++	BCF_RULE_CONG,
++	BCF_RULE_TRUE_INTRO,
++	BCF_RULE_TRUE_ELIM,
++	BCF_RULE_FALSE_INTRO,
++	BCF_RULE_FALSE_ELIM,
++
++	__MAX_BCF_EQUALITY_RULES,
++};
++
++/* BitVector Rules */
++enum {
++	BCF_RULE_BITBLAST = 0,
++
++	__MAX_BCF_BV_RULES,
++};
++
++#endif /* _UAPI__LINUX_BCF_H__ */
+--
+2.34.1
+

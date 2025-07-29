@@ -1,0 +1,561 @@
+From c20ca8c102f44c7d0c55f3c2be89d68701a66905 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Mon, 2 Dec 2024 18:54:16 +0100
+Subject: [PATCH 06/13] Handle more corner cases.
+
+Handle more corner cases.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ src/proof/alf/alf_print_channel.cpp | 280 +++++++++++++++++++---------
+ src/proof/alf/alf_print_channel.h   |   5 +
+ src/proof/alf/alf_printer.cpp       |   4 +-
+ 3 files changed, 203 insertions(+), 86 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 1944986656..6fd80ce78b 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -23,6 +23,7 @@
+ #include "printer/printer.h"
+ #include "proof/trust_id.h"
+ #include "rewriter/rewrite_db.h"
++#include "theory/builtin/generic_op.h"
+ #include "util/bitvector.h"
+ #include "util/divisible.h"
+ #include "util/real_algebraic_number.h"
+@@ -325,6 +326,33 @@ u32 AlfPrintChannelBCF::addNode(Node node)
+
+   Assert(d_lbind);
+
++  if (node.getKind() == Kind::APPLY_UF)
++  {
++    Node op = node.getOperator();
++    if (op.getName() == "@purify")
++    {
++      Assert(node.getNumChildren() == 1);
++      node = node[0];
++    }
++  }
++
++  if (node.getKind() == Kind::SKOLEM)
++  {
++    node = SkolemManager::getUnpurifiedForm(node);
++    if (node.getKind() == Kind::SKOLEM)
++    {
++      NodeManager* nm = NodeManager::currentNM();
++      SkolemManager* sm = nm->getSkolemManager();
++      SkolemId id;
++      Node cacheVal;
++
++      sm->isSkolemFunction(node, id, cacheVal);
++      std::cerr << "unsupported skolem id(" << id << "): " << node << std::endl;
++      d_ok = false;
++      return 0;
++    }
++  }
++
+   /* first, try to find in let id to idx map */
+   u32 l_id = d_lbind->getId(node);
+   if (l_id)
+@@ -350,9 +378,25 @@ u32 AlfPrintChannelBCF::addNode(Node node)
+   return idx;
+ }
+
++static u64 getUInt64(TNode n)
++{
++  Assert(n.getKind() == Kind::CONST_INTEGER
++         && n.getConst<Rational>().sgn() >= 0);
++  return n.getConst<Rational>().getNumerator().getUnsigned64();
++}
++
+ void AlfPrintChannelBCF::encodeExpr(Node node,
+                                     struct bcf_expr* expr,
+                                     bool handle_args)
++{
++  std::vector<Node> args(node.begin(), node.end());
++  return encodeExpr(node, args, expr, handle_args);
++}
++
++void AlfPrintChannelBCF::encodeExpr(Node op,
++                                    std::vector<Node> args,
++                                    struct bcf_expr* expr,
++                                    bool handle_args)
+ {
+   static const std::map<Kind, u8> kind_table = {
+       /* BV operations */
+@@ -395,6 +439,7 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+       {Kind::MULT, BCF_BV_ALU | BPF_MUL},
+       {Kind::NEG, BCF_BV_ALU | BPF_NEG},
+       {Kind::CONST_INTEGER, BCF_BV_EXT | BCF_VAL},
++      {Kind::POW2, BCF_BV_EXT | BCF_VAL},
+       {Kind::GT, BCF_BV_PRED | BPF_JSGT},
+       {Kind::GEQ, BCF_BV_PRED | BPF_JSGE},
+       {Kind::LT, BCF_BV_PRED | BPF_JSLT},
+@@ -418,29 +463,45 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+       {Kind::BOUND_VAR_LIST, BCF_BUILTIN | BCF_ARG_LIST},
+   };
+
+-  Kind kind = node.getKind();
+-  TypeNode ty = node.getType();
+-  Kind orig_kind = kind;
++  Kind kind = op.getKind();
++  TypeNode ty = op.getType();
++
++  if (kind == Kind::APPLY_UF)
++    return encodeExpr(op.getOperator(), args, expr, handle_args);
+
+-  if (kind == Kind::APPLY_UF || kind == Kind::APPLY_INDEXED_SYMBOLIC
+-      || kind == Kind::SKOLEM)
++  if (kind == Kind::RAW_SYMBOL)
+   {
+-    std::cerr << kind;
+-    if (node.getNumChildren()) std::cerr << ": " << node[0];
+-    std::cerr << std::endl;
+-    expr->code = BCF_PRED_EXT | BCF_VAL;
+-    return;
++    const std::map<std::string, Kind> symbol_map = {
++        {"@bit", Kind::BITVECTOR_BIT},
++        {"@list", Kind::SEXPR},
++        {"extract", Kind::BITVECTOR_EXTRACT},
++        {"sign_extend", Kind::BITVECTOR_SIGN_EXTEND},
++        {"zero_extend", Kind::BITVECTOR_ZERO_EXTEND},
++    };
++
++    auto kind_it = symbol_map.find(op.getName());
++    if (kind_it == symbol_map.end())
++    {
++      std::cerr << "unsupported raw symbol: " << op.getName() << std::endl;
++      goto err_out;
++    }
++
++    kind = kind_it->second;
++  }
++  else if (kind == Kind::APPLY_INDEXED_SYMBOLIC)
++  {
++    Node inner = op.getOperator();
++    kind = inner.getConst<GenericOp>().getKind();
+   }
+
+-  auto it = kind_table.find(kind);
+-  if (it == kind_table.end())
++  if (kind_table.find(kind) == kind_table.end())
+   {
+-    std::cerr << "Unsupported kind: " << kind << std::endl;
++    std::cerr << "Unsupported kind (" << kind << "): " << op << std::endl;
+     goto err_out;
+   }
+-  if (node.getNumChildren() > UINT8_MAX)
++  if (args.size() > UINT8_MAX)
+   {
+-    std::cerr << "too many children: " << node.getNumChildren() << std::endl;
++    std::cerr << "too many children: " << args.size() << std::endl;
+     goto err_out;
+   }
+   if (ty.isBitVector() && ty.getBitVectorSize() > UINT8_MAX)
+@@ -449,8 +510,8 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+     goto err_out;
+   }
+
+-  expr->code = it->second;
+-  expr->vlen = node.getNumChildren();
++  expr->code = kind_table.find(kind)->second;
++  expr->vlen = args.size();
+   expr->params = 0;
+   if (ty.isBitVector())
+     expr->params = ty.getBitVectorSize();
+@@ -465,22 +526,29 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+     case Kind::BITVECTOR_OR:
+     case Kind::BITVECTOR_AND:
+     case Kind::BITVECTOR_XOR:
++    case Kind::BITVECTOR_CONCAT:
++      Assert(expr->params);
++      Assert(expr->vlen >= 2);
++      break;
+     case Kind::BITVECTOR_FROM_BOOLS:
+-      Assert(kind == orig_kind && node.getNumChildren() && expr->params);
++      Assert(expr->params);
++      Assert(expr->vlen >= 1);
+       break;
+     case Kind::BITVECTOR_SHL:
+     case Kind::BITVECTOR_LSHR:
+     case Kind::BITVECTOR_ASHR:
+     case Kind::BITVECTOR_UDIV:
+     case Kind::BITVECTOR_UREM:
+-    case Kind::BITVECTOR_CONCAT:
+-      Assert(kind == orig_kind && node.getNumChildren() == 2 && expr->params);
++      Assert(expr->vlen == 2);
++      Assert(expr->params);
+       break;
+     case Kind::BITVECTOR_NEG:
+-      Assert(kind == orig_kind && node.getNumChildren() == 1 && expr->params);
++      Assert(expr->vlen == 1);
++      Assert(expr->params);
+       break;
+     case Kind::BITVECTOR_SIZE:
+-      Assert(kind == orig_kind && expr->params == 64 && expr->vlen == 1);
++      Assert(expr->vlen == 1);
++      Assert(expr->params == 64);
+       break;
+
+     case Kind::BITVECTOR_UGT:
+@@ -491,78 +559,87 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+     case Kind::BITVECTOR_ULE:
+     case Kind::BITVECTOR_SLT:
+     case Kind::BITVECTOR_SLE:
+-      Assert(kind == orig_kind && !expr->params && expr->vlen == 2);
+-      expr->params = node[0].getType().getBitVectorSize();
++      Assert(expr->vlen == 2);
++      Assert(!expr->params);
++      Assert(args[0].getType().isBitVector());
++      expr->params = args[0].getType().getBitVectorSize();
+       break;
+
+     case Kind::ADD:
+     case Kind::SUB:
+     case Kind::MULT:
++      Assert(expr->vlen >= 2);
++      Assert(expr->params == 64);
++      break;
+     case Kind::NEG:
++      Assert(expr->vlen == 1);
++      Assert(expr->params == 64);
++      break;
++
+     case Kind::GT:
+     case Kind::GEQ:
+     case Kind::LT:
+     case Kind::LEQ:
+-      Assert(kind == orig_kind && expr->params == 64 && expr->vlen);
++      Assert(expr->vlen == 2);
++      expr->params = 64;
+       break;
+
+-    case Kind::NOT:
++    case Kind::NOT: Assert(!expr->params && expr->vlen == 1); break;
++    case Kind::IMPLIES: Assert(!expr->params && expr->vlen == 2); break;
+     case Kind::AND:
+-    case Kind::IMPLIES:
+     case Kind::OR:
+-    case Kind::XOR:
+-    case Kind::ITE:
+-      Assert(kind == orig_kind && !expr->params && expr->vlen);
+-      break;
++    case Kind::XOR: Assert(!expr->params && expr->vlen >= 2); break;
++    case Kind::ITE: Assert(expr->vlen == 3); break;
+
+     case Kind::BITVECTOR_BIT:
+     {
+-      Node op = kind == orig_kind ? node : node[0];
+-      Node bv = kind == orig_kind ? node[0] : node[1];
++      Assert(args.size() == 2 && args[0].getKind() == Kind::CONST_INTEGER
++             && args[1].getType().isBitVector());
+
+-      expr->params = bv.getType().getBitVectorSize();
+-      u16 bit = op.getOperator().getConst<BitVectorBit>().d_bitIndex;
++      u16 bit = getUInt64(args[0]);
++      expr->params = args[1].getType().getBitVectorSize();
+       Assert(bit < expr->params);
++
+       expr->params |= bit << 8;
++      expr->vlen = 1;
++      args.erase(args.begin());
+       break;
+     }
+
+     case Kind::BITVECTOR_EXTRACT:
+     {
+-      Node op = kind == orig_kind ? node : node[0];
+-
+-      BitVectorExtract p = op.getConst<BitVectorExtract>();
+-      expr->params = p.d_low;
+-      expr->params |= (u16)p.d_high << 8;
++      Assert(args.size() == 3 && args[0].isConst() && args[1].isConst()
++             && args[2].getType().isBitVector());
++      expr->params = getUInt64(args[1]);
++      expr->params |= (u16)getUInt64(args[0]) << 8;
++      expr->vlen = 1;
++      args.erase(args.begin(), args.begin() + 2);
+       break;
+     }
+
+     case Kind::BITVECTOR_ZERO_EXTEND:
+-    {
+-      Node op = kind == orig_kind ? node : node[0];
+-
+-      u32 ext = op.getConst<BitVectorZeroExtend>().d_zeroExtendAmount;
+-      expr->params |= (u16)ext << 8;
+-      break;
+-    }
+     case Kind::BITVECTOR_SIGN_EXTEND:
+     {
+-      Node op = kind == orig_kind ? node : node[0];
++      Assert(args.size() == 2 && args[0].isConst()
++             && args[1].getType().isBitVector());
+
+-      u32 ext = op.getConst<BitVectorSignExtend>().d_signExtendAmount;
++      u32 ext = getUInt64(args[0]);
+       expr->params |= (u16)ext << 8;
++      expr->vlen = 1;
++      args.erase(args.begin());
+       break;
+     }
+
+     case Kind::CONST_BITVECTOR:
+     {
+-      const BitVector& bv = node.getConst<BitVector>();
++      const BitVector& bv = op.getConst<BitVector>();
+
+-      Assert(kind == orig_kind && node.getNumChildren() == 0);
++      Assert(args.empty() && expr->params == bv.getSize());
+
+       if (bv.getSize() > 64)
+       {
+         std::cerr << "bv const too big: " << bv.getSize() << std::endl;
++        goto err_out;
+       }
+
+       u64 val = bv.getValue().getUnsigned64();
+@@ -574,17 +651,40 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+         expr->vlen++;
+       }
+
+-      Assert(expr->params == bv.getSize());
++      break;
++    }
++
++    case Kind::POW2:
++    {
++      Assert(args.size() == 1);
++      if (!args[0].isConst())
++      {
++        std::cerr << "pow2 arg non-const: " << args[0].getKind() << std::endl;
++        goto err_out;
++      }
++
++      u64 n = getUInt64(args[0]);
++      if (n > 64)
++      {
++        std::cerr << "pow2 too big: 1<<" << n << std::endl;
++        goto err_out;
++      }
++
++      u64 val = 1 << n;
++      expr->vlen = 2;
++      expr->args[0] = val;
++      expr->args[1] = val >> 32;
+       break;
+     }
+
+     case Kind::CONST_INTEGER:
+     {
+-      const Rational& r = node.getConst<Rational>();
++      const Rational& r = op.getConst<Rational>();
++      Assert(args.empty() && expr->params == 64);
+
+-      Assert(kind == orig_kind && node.getNumChildren() == 0);
+       u64 val = r.getNumerator().getUnsigned64();
+-      Assert(r.getDenominator() == 1);
++      Assert(r.getNumerator() == val && r.getDenominator() == 1);
++
+       expr->vlen = 2;
+       expr->args[0] = val;
+       expr->args[1] = val >> 32;
+@@ -593,9 +693,8 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+
+     case Kind::CONST_BOOLEAN:
+     {
+-      Assert(kind == orig_kind && node.getNumChildren() == 0);
+       expr->vlen = 0;
+-      expr->params = node.getConst<bool>() ? BCF_TRUE : BCF_FALSE;
++      expr->params = op.getConst<bool>() ? BCF_TRUE : BCF_FALSE;
+       break;
+     }
+
+@@ -603,7 +702,6 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+     case Kind::CONST_BITVECTOR_SYMBOLIC:
+     case Kind::VARIABLE:
+     {
+-      Assert(kind == orig_kind);
+       expr->vlen = 0;
+       if (ty.isBitVector() || ty.isInteger())
+         expr->code = BCF_BV_EXT | BCF_VAR;
+@@ -619,9 +717,9 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+
+     case Kind::EQUAL:
+     {
+-      Assert(kind == orig_kind && expr.vlen == 2);
++      Assert(expr->vlen == 2);
+
+-      TypeNode eq_ty = node[0].getType();
++      TypeNode eq_ty = args[0].getType();
+       if (eq_ty.isBitVector() || eq_ty.isInteger())
+       {
+         expr->code = BCF_BV_ALU | BPF_JEQ;
+@@ -640,16 +738,14 @@ void AlfPrintChannelBCF::encodeExpr(Node node,
+
+     /* handle special const list in chain_resolutoin */
+     case Kind::SEXPR:
+-    case Kind::BOUND_VAR_LIST: Assert(kind == orig_kind && expr.vlen); break;
++    case Kind::BOUND_VAR_LIST: Assert(expr->vlen); break;
+
+     default: std::cerr << "unhandled kind: " << kind << std::endl; goto err_out;
+   }
+
+   if (handle_args)
+   {
+-    size_t i = kind == orig_kind ? 0 : 1;
+-    for (size_t j = 0; i < node.getNumChildren(); i++, j++)
+-      expr->args[j] = addNode(node[i]);
++    for (size_t i = 0; i < args.size(); i++) expr->args[i] = addNode(args[i]);
+   }
+   return;
+
+@@ -763,6 +859,8 @@ void AlfPrintChannelBCF::printStep(ProofRule r,
+       {ProofRule::CNF_ITE_NEG3, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOLEAN},
+
+       {ProofRule::BV_BITBLAST_STEP, BCF_RULE_BITBLAST | BCF_RULE_BV},
++
++      {ProofRule::SKOLEM_INTRO, BCF_RULE_REFL | BCF_RULE_EQUALITY},
+   };
+
+   struct bcf_proof_step_args step_buf = {0};
+@@ -776,7 +874,7 @@ void AlfPrintChannelBCF::printStep(ProofRule r,
+     code = it->second;
+   else
+   {
+-    std::cerr << "fallback to the trusted rewrite for " << r << std::endl;
++    if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
+     code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
+   }
+
+@@ -799,6 +897,7 @@ void AlfPrintChannelBCF::printTrustStep(ProofRule r,
+   u16 code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
+
+   if (!d_ok) return;
++  if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
+
+   encodeStep(code, r, n, i, premises, args, step);
+   if (!d_ok) return;
+@@ -809,26 +908,39 @@ void AlfPrintChannelBCF::printTrustStep(ProofRule r,
+
+ void AlfPrintChannelBCF::printLetList(LetBinding& lbind)
+ {
+-  if (!d_ok) return;
+-
+-  std::vector<Node> letList;
+-  lbind.letify(letList);
+-  for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
+-  {
+-    Node n = letList[i];
+-    addNode(n);
+-    if (!d_ok) break;
+-  }
++  // if (!d_ok) return;
++
++  // std::vector<Node> letList;
++  // lbind.letify(letList);
++  // for (size_t i = 0, nlets = letList.size(); i < nlets; i++)
++  // {
++  //   Node n = letList[i];
++
++  //   if (n.getKind() == Kind::APPLY_UF)
++  //   {
++  //     Node op = n.getOperator();
++  //     Assert(op.getKind() == Kind::RAW_SYMBOL);
++  //     std::string op_name = op.getName();
++
++  //     /* the term is used as args for narg_cong, which will be handled
++  //      * in bcf rule conversion
++  //      */
++  //     if (op_name != "@list" && op_name != "@bit" && op_name != "extract")
++  //       continue;
++  //   }
++  //   else if (n.getKind() == Kind::APPLY_INDEXED_SYMBOLIC)
++  //   {
++  //     Node inner = n.getOperator();
++  //     if (inner.getConst<GenericOp>().getKind() != Kind::BITVECTOR_EXTRACT)
++  //       continue;
++  //   }
++
++  //   addNode(n);
++  //   if (!d_ok) break;
++  // }
+   return;
+ }
+
+-static u64 getUInt32(TNode n)
+-{
+-  Assert(n.getKind() == Kind::CONST_INTEGER
+-         && n.getConst<Rational>().sgn() >= 0);
+-  return n.getConst<Rational>().getNumerator().getUnsigned64();
+-}
+-
+ void AlfPrintChannelBCF::encodeStep(u16 code,
+                                     ProofRule orig_rule,
+                                     TNode conclusion,
+@@ -926,13 +1038,13 @@ void AlfPrintChannelBCF::encodeStep(u16 code,
+
+     case BCF_RULE_AND_ELIM | BCF_RULE_BOOLEAN:
+     case BCF_RULE_NOT_OR_ELIM | BCF_RULE_BOOLEAN:
+-      step->params = getUInt32(args[0]);
++      step->params = getUInt64(args[0]);
+       return;
+
+     case BCF_RULE_CNF_AND_POS | BCF_RULE_BOOLEAN:
+     case BCF_RULE_CNF_OR_NEG | BCF_RULE_BOOLEAN:
+       step->args[step->vlen++] = addNode(args[0]);
+-      step->params = getUInt32(args[1]);
++      step->params = getUInt64(args[1]);
+       return;
+
+     case BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOLEAN:
+diff --git a/src/proof/alf/alf_print_channel.h b/src/proof/alf/alf_print_channel.h
+index e18e68ab60..fced4497cb 100644
+--- a/src/proof/alf/alf_print_channel.h
++++ b/src/proof/alf/alf_print_channel.h
+@@ -106,6 +106,10 @@ class AlfPrintChannelBCF : public AlfPrintChannel
+
+  private:
+   void encodeExpr(Node n, struct bcf_expr* expr, bool handle_args = true);
++  void encodeExpr(Node op,
++                  std::vector<Node> args,
++                  struct bcf_expr* expr,
++                  bool handle_args);
+   void encodeStep(u16 code,
+                   ProofRule orig_rule,
+                   TNode conclusion,
+@@ -126,6 +130,7 @@ class AlfPrintChannelBCF : public AlfPrintChannel
+   std::map<Node, u32> d_nodeIdxMap;
+   std::vector<u32> d_exprs;
+   std::vector<u32> d_steps;
++  std::unordered_set<ProofRule> d_trusted;
+   bool d_ok = true;
+
+   // AlfPrintChannelOut d_alfOut;
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index 2e6daf24f8..9c73339062 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -132,7 +132,8 @@ bool AlfPrinter::isHandled(const Options& opts,
+     case ProofRule::FACTORING:
+     case ProofRule::REORDERING:
+     case ProofRule::RESOLUTION:
+-    case ProofRule::CHAIN_RESOLUTION: return true;
++    case ProofRule::CHAIN_RESOLUTION:
++    case ProofRule::SKOLEM_INTRO: return true;
+     default:
+       if (bcfFormat) return false;
+       break;
+@@ -160,7 +161,6 @@ bool AlfPrinter::isHandled(const Options& opts,
+     case ProofRule::ARITH_TRANS_SINE_TANGENT_PI:
+     case ProofRule::INT_TIGHT_LB:
+     case ProofRule::INT_TIGHT_UB:
+-    case ProofRule::SKOLEM_INTRO:
+     case ProofRule::SETS_SINGLETON_INJ:
+     case ProofRule::SETS_EXT:
+     case ProofRule::SETS_FILTER_UP:
+--
+2.34.1
+

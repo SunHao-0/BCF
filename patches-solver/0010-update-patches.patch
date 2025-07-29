@@ -1,0 +1,143 @@
+From 1e799999ad547d9237c9af85b98c932e95eee739 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Thu, 5 Dec 2024 13:55:51 +0100
+Subject: [PATCH 10/13] Sync bcf checker with the kernel
+
+Sync the BCF checker with the kernel.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ src/api/c/cvc5.cpp          |  1 +
+ src/proof/alf/alf_printer.h |  2 +-
+ src/proof/alf/bcf.c         | 27 ++++++++++++++++++---------
+ src/proof/alf/bcf_stubs.h   |  4 ++++
+ 4 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/src/api/c/cvc5.cpp b/src/api/c/cvc5.cpp
+index bdfe6ddddd..ab5e148732 100644
+--- a/src/api/c/cvc5.cpp
++++ b/src/api/c/cvc5.cpp
+@@ -5543,6 +5543,7 @@ const uint32_t* cvc5_proof_to_bcf(Cvc5* cvc5,
+   CVC5_CAPI_CHECK_NOT_NULL(cvc5);
+   CVC5_CAPI_CHECK_PROOF(proof);
+   auto p = proof->d_cvc5->d_solver.proofToBCF(proof->d_proof);
++  bcf.clear();
+   bcf.reserve(p.first.size() + p.second.size());
+   bcf.insert(bcf.end(), p.first.begin(), p.first.end());
+   bcf.insert(bcf.end(), p.second.begin(), p.second.end());
+diff --git a/src/proof/alf/alf_printer.h b/src/proof/alf/alf_printer.h
+index c77be509a6..9e3f2c251b 100644
+--- a/src/proof/alf/alf_printer.h
++++ b/src/proof/alf/alf_printer.h
+@@ -44,7 +44,7 @@ class AlfPrinter : protected EnvObj
+   AlfPrinter(Env& env,
+              BaseAlfNodeConverter& atp,
+              rewriter::RewriteDb* rdb,
+-             uint32_t letThresh = 1,
++             uint32_t letThresh = 2,
+              bool bcfFormat = false);
+   ~AlfPrinter() {}
+
+diff --git a/src/proof/alf/bcf.c b/src/proof/alf/bcf.c
+index 60416fce8b..411cdc8fa2 100644
+--- a/src/proof/alf/bcf.c
++++ b/src/proof/alf/bcf.c
+@@ -3,7 +3,7 @@
+
+ #define EXPR_BUF_LEN 255
+
+-#define CMP_STACK_SIZE 256
++#define CMP_STACK_SIZE 128
+ struct expr_cmp_state {
+ 	struct bcf_expr *e0;
+ 	struct bcf_expr *e1;
+@@ -621,7 +621,7 @@ static int add_expr(struct bcf_checker_env *env, struct bcf_expr *expr)
+ 		struct bcf_expr *exprs;
+
+ 		/* two slots for each of the rest steps */
+-		size += cnt + (env->step_cnt - env->cur_step) * 2;
++		size += cnt * (env->step_cnt - env->cur_step);
+ 		exprs = kvrealloc(env->exprs, size * sizeof(*expr), GFP_KERNEL);
+ 		if (!exprs) {
+ 			kvfree(env->exprs);
+@@ -775,6 +775,7 @@ static int ___expr_equiv(struct bcf_checker_env *env, struct bcf_expr *exprs0,
+ 		for (; cmp->cur_arg < e0->vlen; cmp->cur_arg++) {
+ 			u32 arg0 = e0->args[cmp->cur_arg];
+ 			u32 arg1 = e1->args[cmp->cur_arg];
++			struct bcf_expr *a0, *a1;
+
+ 			/* When expr0 is the same as expr1, the same bv
+ 			 * variable must always share same idx.
+@@ -782,15 +783,15 @@ static int ___expr_equiv(struct bcf_checker_env *env, struct bcf_expr *exprs0,
+ 			if (exprs0 == exprs1 && arg0 == arg1)
+ 				continue;
+
+-			e0 = exprs0 + arg0;
+-			e1 = exprs1 + arg1;
+-			if (!expr_node_equiv(e0, e1))
++			a0 = exprs0 + arg0;
++			a1 = exprs1 + arg1;
++			if (!expr_node_equiv(a0, a1))
+ 				return 0;
+
+-			if (is_bv_val(e0->code))
++			if (is_bv_val(a0->code))
+ 				continue;
+
+-			if (is_bv_var(e0->code)) {
++			if (is_bv_var(a0->code)) {
+ 				if (var_equiv(map, arg0, arg1))
+ 					continue;
+ 				return false;
+@@ -799,7 +800,7 @@ static int ___expr_equiv(struct bcf_checker_env *env, struct bcf_expr *exprs0,
+ 			if (stack_size == CMP_STACK_SIZE)
+ 				return -E2BIG;
+ 			cmp_stack[stack_size++] =
+-				(struct expr_cmp_state){ e0, e1, 0 };
++				(struct expr_cmp_state){ a0, a1, 0 };
+ 			cmp->cur_arg++; /* skip cur arg */
+ 			break;
+ 		}
+@@ -2159,6 +2160,13 @@ static int check_proof(struct bcf_checker_env *env,
+ 		u16 rule = BCF_STEP_RULE(step->rule);
+ 		u32 sz = step->vlen + 1;
+
++		err = -EAGAIN;
++		if (signal_pending(current))
++			goto err_free;
++
++		if (need_resched())
++			cond_resched();
++
+ 		pr_debug("step#%d at %d...", env->cur_step, idx);
+
+ 		err = -EINVAL;
+@@ -2199,9 +2207,10 @@ static int check_goal(struct bcf_checker_env *env)
+ 	struct bcf_expr *goal, *proved;
+ 	struct bpf_verifier_env *venv;
+ 	struct bcf_expr *exprs0, *exprs1;
+-	struct bcf_var_map map;
++	struct bcf_var_map map = {0};
+ 	int err;
+
++	pr_debug("checking goal\n");
+ 	venv = env->verifier_env;
+ 	exprs0 = venv->bcf.exprs;
+ 	goal = exprs0 + venv->bcf.formula;
+diff --git a/src/proof/alf/bcf_stubs.h b/src/proof/alf/bcf_stubs.h
+index eba84f7923..e2a8d7e30d 100644
+--- a/src/proof/alf/bcf_stubs.h
++++ b/src/proof/alf/bcf_stubs.h
+@@ -324,4 +324,8 @@ static inline bool bcf_requested(struct bpf_verifier_env *env)
+ #define BUILD_BUG_ON(COND)
+ #define BUG_ON(COND)
+
++#define signal_pending(V) false
++#define need_resched() false
++#define cond_resched()
++
+ #endif /* __BCF_CHECKER_H__ */
+--
+2.34.1
+

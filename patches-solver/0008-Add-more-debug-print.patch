@@ -1,0 +1,312 @@
+From 46912989c57ff5adbcdb47e89124c9b03731ea17 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Tue, 3 Dec 2024 20:13:58 +0100
+Subject: [PATCH 08/13] Add more debug print
+
+Add debug code to print BCF proof.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ src/proof/alf/alf_print_channel.cpp |  13 ++-
+ src/proof/alf/alf_printer.cpp       |  71 ++++++++++++++-
+ src/proof/alf/bcf.h                 | 136 ++++++++++++++++++++++++++++
+ 3 files changed, 214 insertions(+), 6 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 84d293847d..c92489ef50 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -303,8 +303,8 @@ static_assert(sizeof(struct bcf_proof_step) == sizeof(u32));
+ u32 AlfPrintChannelBCF::addStep(struct bcf_proof_step* step)
+ {
+   u32 ret = d_steps.size();
+-  d_exprs.push_back(*(u32*)step);
+-  for (int i = 0; i < step->vlen; i++) d_exprs.push_back(step->args[i]);
++  d_steps.push_back(*(u32*)step);
++  for (int i = 0; i < step->vlen; i++) d_steps.push_back(step->args[i]);
+   return ret;
+ }
+
+@@ -370,6 +370,7 @@ u32 AlfPrintChannelBCF::addNode(Node node)
+   encodeExpr(node, expr, true);
+   if (!d_ok) return 0;
+   u32 idx = addExpr(expr);
++  if (std::getenv("BCF_DEBUG")) std::cerr << idx << ": " << node << std::endl;
+   if (l_id)
+     d_letIdMap[l_id] = idx;
+   else
+@@ -592,7 +593,9 @@ void AlfPrintChannelBCF::encodeExpr(Node op,
+     case Kind::AND:
+     case Kind::OR:
+     case Kind::XOR: Assert(!expr->params && expr->vlen >= 2); break;
+-    case Kind::ITE: Assert(expr->vlen == 3); break;
++    case Kind::ITE:
++      Assert(expr->vlen == 3);
++      break;
+
+     case Kind::BITVECTOR_BIT:
+     {
+@@ -731,7 +734,7 @@ void AlfPrintChannelBCF::encodeExpr(Node op,
+       TypeNode eq_ty = args[0].getType();
+       if (eq_ty.isBitVector() || eq_ty.isInteger())
+       {
+-        expr->code = BCF_BV_ALU | BPF_JEQ;
++        expr->code = BCF_BV_PRED | BPF_JEQ;
+         expr->params = eq_ty.isInteger() ? 64 : eq_ty.getBitVectorSize();
+       }
+       else if (eq_ty.isBoolean())
+@@ -944,7 +947,7 @@ void AlfPrintChannelBCF::encodeStep(u16 code,
+   }
+
+   for (size_t i = 0; i < premises.size(); i++)
+-    step->args[step->vlen++] = premises[i];
++    step->args[step->vlen++] = premises[i] - 1;
+
+   switch (code)
+   {
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index 4223b1ec22..4719f334bd 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -15,7 +15,11 @@
+
+ #include "proof/alf/alf_printer.h"
+
++#include <errno.h>
++#include <unistd.h>
++
+ #include <cctype>
++#include <cstring>
+ #include <iostream>
+ #include <memory>
+ #include <ostream>
+@@ -625,6 +629,70 @@ void AlfPrinter::printDslRule(std::ostream& out, ProofRewriteRule r)
+
+ LetBinding* AlfPrinter::getLetBinding() { return d_lbindUse; }
+
++static void test_bcf_proof_checker(std::vector<u32> exprs,
++                                   std::vector<u32> steps)
++{
++  if (exprs.empty())
++  {
++    std::cerr << "exprs empty" << std::endl;
++    return;
++  }
++  if (steps.empty())
++  {
++    std::cerr << "steps empty" << std::endl;
++    return;
++  }
++
++  std::vector<u32> proof;
++  struct bcf_proof_header hdr = {.magic = BCF_MAGIC,
++                                 .expr_cnt = (u32)exprs.size(),
++                                 .step_cnt = (u32)steps.size()};
++
++  proof.reserve(exprs.size() + steps.size() + sizeof(hdr));
++  proof.push_back(hdr.magic);
++  proof.push_back(hdr.expr_cnt);
++  proof.push_back(hdr.step_cnt);
++  proof.insert(proof.end(), exprs.begin(), exprs.end());
++  proof.insert(proof.end(), steps.begin(), steps.end());
++
++  u32 proof_size = proof.size() * sizeof(u32);
++  u32* proof_data = proof.data();
++  union __bpf_attr attr = {0};
++  attr.bcf_flags |= BCF_F_TEST_PROOF_CHECK;
++  attr.bcf_buf = (u64)(void*)proof_data;
++  attr.bcf_buf_size = proof_size;
++
++#ifndef __NR_bpf
++#if defined(__i386__)
++#define __NR_bpf 357
++#elif defined(__x86_64__)
++#define __NR_bpf 321
++#elif defined(__aarch64__)
++#define __NR_bpf 280
++#elif defined(__sparc__)
++#define __NR_bpf 349
++#elif defined(__s390__)
++#define __NR_bpf 351
++#elif defined(__arc__)
++#define __NR_bpf 280
++#elif defined(__mips__) && defined(_ABIO32)
++#define __NR_bpf 4355
++#elif defined(__mips__) && defined(_ABIN32)
++#define __NR_bpf 6319
++#elif defined(__mips__) && defined(_ABI64)
++#define __NR_bpf 5315
++#else
++#error __NR_bpf not defined. libbpf does not support your arch.
++#endif
++#endif
++  int err = syscall(__NR_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
++  if (err < 0)
++    std::cerr << "proof rejected: " << std::strerror(errno) << std::endl;
++  else
++    std::cerr << "proof accetped" << std::endl;
++  return;
++}
++
+ void AlfPrinter::print(std::ostream& out,
+                        std::shared_ptr<ProofNode> pfn,
+                        ProofScopeMode psm)
+@@ -637,7 +705,8 @@ void AlfPrinter::print(std::ostream& out,
+   AlfPrintChannelOut aprint(out, d_lbindUse, d_termLetPrefix, true);
+   print(aprint, pfn, psm);
+   auto p = aprint.bcf.getEncodedProof();
+-  std::cout << "binary proof size: "
++  test_bcf_proof_checker(p.first, p.second);
++  std::cerr << "binary proof size: "
+             << (p.first.size() + p.second.size()) * sizeof(uint32_t)
+             << std::endl;
+ }
+diff --git a/src/proof/alf/bcf.h b/src/proof/alf/bcf.h
+index 3a09b06db9..57a77883bc 100644
+--- a/src/proof/alf/bcf.h
++++ b/src/proof/alf/bcf.h
+@@ -299,4 +299,140 @@ struct bcf_expr_ternary {
+ #define BCF_PRED32(OP, ARG0, ARG1) BCF_PRED(OP, ARG0, ARG1, 32)
+ #define BCF_PRED64(OP, ARG0, ARG1) BCF_PRED(OP, ARG0, ARG1, 64)
+
++enum {
++	BCF_F_PROOF_REQUESTED = (1U << 0),
++	BCF_F_PROOF_PROVIDED = (1U << 1),
++	BCF_F_TEST_PROOF_CHECK = (1U << 2),
++};
++
++union __bpf_attr {
++	struct { /* anonymous struct used by BPF_MAP_CREATE command */
++		__u32	map_type;	/* one of enum bpf_map_type */
++		__u32	key_size;	/* size of key in bytes */
++		__u32	value_size;	/* size of value in bytes */
++		__u32	max_entries;	/* max number of entries in a map */
++		__u32	map_flags;	/* BPF_MAP_CREATE related
++					 * flags defined above.
++					 */
++		__u32	inner_map_fd;	/* fd pointing to the inner map */
++		__u32	numa_node;	/* numa node (effective only if
++					 * BPF_F_NUMA_NODE is set).
++					 */
++		char	map_name[BPF_OBJ_NAME_LEN];
++		__u32	map_ifindex;	/* ifindex of netdev to create on */
++		__u32	btf_fd;		/* fd pointing to a BTF type data */
++		__u32	btf_key_type_id;	/* BTF type_id of the key */
++		__u32	btf_value_type_id;	/* BTF type_id of the value */
++		__u32	btf_vmlinux_value_type_id;/* BTF type_id of a kernel-
++						   * struct stored as the
++						   * map value
++						   */
++		/* Any per-map-type extra fields
++		 *
++		 * BPF_MAP_TYPE_BLOOM_FILTER - the lowest 4 bits indicate the
++		 * number of hash functions (if 0, the bloom filter will default
++		 * to using 5 hash functions).
++		 *
++		 * BPF_MAP_TYPE_ARENA - contains the address where user space
++		 * is going to mmap() the arena. It has to be page aligned.
++		 */
++		__u64	map_extra;
++
++		__s32   value_type_btf_obj_fd;	/* fd pointing to a BTF
++						 * type data for
++						 * btf_vmlinux_value_type_id.
++						 */
++		/* BPF token FD to use with BPF_MAP_CREATE operation.
++		 * If provided, map_flags should have BPF_F_TOKEN_FD flag set.
++		 */
++		__s32	map_token_fd;
++	};
++
++	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
++		__u32		map_fd;
++		__aligned_u64	key;
++		union {
++			__aligned_u64 value;
++			__aligned_u64 next_key;
++		};
++		__u64		flags;
++	};
++
++	struct { /* struct used by BPF_MAP_*_BATCH commands */
++		__aligned_u64	in_batch;	/* start batch,
++						 * NULL to start from beginning
++						 */
++		__aligned_u64	out_batch;	/* output: next start batch */
++		__aligned_u64	keys;
++		__aligned_u64	values;
++		__u32		count;		/* input/output:
++						 * input: # of key/value
++						 * elements
++						 * output: # of filled elements
++						 */
++		__u32		map_fd;
++		__u64		elem_flags;
++		__u64		flags;
++	} batch;
++
++	struct { /* anonymous struct used by BPF_PROG_LOAD command */
++		__u32		prog_type;	/* one of enum bpf_prog_type */
++		__u32		insn_cnt;
++		__aligned_u64	insns;
++		__aligned_u64	license;
++		__u32		log_level;	/* verbosity level of verifier */
++		__u32		log_size;	/* size of user buffer */
++		__aligned_u64	log_buf;	/* user supplied buffer */
++		__u32		kern_version;	/* not used */
++		__u32		prog_flags;
++		char		prog_name[BPF_OBJ_NAME_LEN];
++		__u32		prog_ifindex;	/* ifindex of netdev to prep for */
++		/* For some prog types expected attach type must be known at
++		 * load time to verify attach type specific parts of prog
++		 * (context accesses, allowed helpers, etc).
++		 */
++		__u32		expected_attach_type;
++		__u32		prog_btf_fd;	/* fd pointing to BTF type data */
++		__u32		func_info_rec_size;	/* userspace bpf_func_info size */
++		__aligned_u64	func_info;	/* func info */
++		__u32		func_info_cnt;	/* number of bpf_func_info records */
++		__u32		line_info_rec_size;	/* userspace bpf_line_info size */
++		__aligned_u64	line_info;	/* line info */
++		__u32		line_info_cnt;	/* number of bpf_line_info records */
++		__u32		attach_btf_id;	/* in-kernel BTF type id to attach to */
++		union {
++			/* valid prog_fd to attach to bpf prog */
++			__u32		attach_prog_fd;
++			/* or valid module BTF object fd or 0 to attach to vmlinux */
++			__u32		attach_btf_obj_fd;
++		};
++		__u32		core_relo_cnt;	/* number of bpf_core_relo */
++		__aligned_u64	fd_array;	/* array of FDs */
++		__aligned_u64	core_relos;
++		__u32		core_relo_rec_size; /* sizeof(struct bpf_core_relo) */
++		/* output: actual total log contents size (including termintaing zero).
++		 * It could be both larger than original log_size (if log was
++		 * truncated), or smaller (if log buffer wasn't filled completely).
++		 */
++		__u32		log_true_size;
++		/* BPF token FD to use with BPF_PROG_LOAD operation.
++		 * If provided, prog_flags should have BPF_F_TOKEN_FD flag set.
++		 */
++		__s32		prog_token_fd;
++		/* output: bcf fd for loading proof, set by the verifier when
++		 * bcf_flags & BCF_F_PROOF_REQUESTED
++		 */
++		__u32		bcf_fd;
++		/* bcf buf for storing both the formula to be proved from the
++		 * verifier and the proof provided from the user.
++		 */
++		__aligned_u64	bcf_buf;
++		__u32		bcf_buf_size; /* size of bcf_buf */
++		/* input/output: the size of actual proof or formula */
++		__u32		bcf_buf_true_size;
++		/* input/output: proof requested or provided */
++		__u32		bcf_flags;
++	};
++} __attribute__((aligned(8)));
++
+ #endif /* __LINUX_BCF_H__ */
+--
+2.34.1
+

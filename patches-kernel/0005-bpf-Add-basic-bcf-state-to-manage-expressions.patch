@@ -1,0 +1,92 @@
+From 58f28e2bad1c56b5eb6d1d80f804a9561a077d85 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 09:29:33 +0100
+Subject: [PATCH 05/32] bpf: Add bcf_state to manage expressions
+
+Collect BCF related state into a struct bcf_state, which is a part of
+verifier_env. This state is irrelevant for normal analysis, but is only
+used during BCF's symbolic tracking.
+
+The symbolic expressions for each register are stored in bcf_state.exprs,
+which is allocated/reallocated during the tracking. The path_conds stores
+the path constraint for the current path, while path_cond refers to the
+conjunction of all path_conds.
+
+The available flag is used to indicate if the bcf_state is available.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h | 15 +++++++++++++++
+ kernel/bpf/verifier.c        |  2 ++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 91e205874099..0a97c3aea3c4 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -8,6 +8,7 @@
+ #include <linux/btf.h> /* for struct btf and btf_id() */
+ #include <linux/filter.h> /* for MAX_BPF_STACK */
+ #include <linux/tnum.h>
++#include <linux/bcf.h>
+
+ /* Maximum variable offset umax_value permitted when resolving memory accesses.
+  * In practice this is far bigger than any realistic pointer offset; this limit
+@@ -221,6 +222,8 @@ struct bpf_reg_state {
+ 	enum bpf_reg_liveness live;
+ 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
+ 	bool precise;
++	/* bcf expression, index to bcf_exprs in bcf_state */
++	int bcf_expr;
+ };
+
+ enum bpf_stack_slot_type {
+@@ -690,6 +693,17 @@ struct bpf_idset {
+ 	u32 ids[BPF_ID_MAP_SIZE];
+ };
+
++struct bcf_state {
++	struct bcf_expr *exprs;
++	u32 expr_size;
++	u32 expr_cnt;
++	u32 *path_conds;	/* path condition */
++	u32 cond_cnt;
++	int path_cond;		/* conjunction of path_conds */
++	int refine_cond;	/* refinement condition */
++	bool available;		/* if bcf buf is provided */
++};
++
+ /* single container for all structs
+  * one verifier_env per bpf_check() call
+  */
+@@ -773,6 +787,7 @@ struct bpf_verifier_env {
+ 	u64 prev_log_pos, prev_insn_print_pos;
+ 	/* buffer used to temporary hold constants as scalar registers */
+ 	struct bpf_reg_state fake_reg[2];
++	struct bcf_state bcf;
+ 	/* buffer used to generate temporary string representations,
+ 	 * e.g., in reg_type_str() to generate reg_type string
+ 	 */
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 331024a3413a..90ab45979a49 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1811,6 +1811,7 @@ static void ___mark_reg_known(struct bpf_reg_state *reg, u64 imm)
+ 	reg->s32_max_value = (s32)imm;
+ 	reg->u32_min_value = (u32)imm;
+ 	reg->u32_max_value = (u32)imm;
++	reg->bcf_expr = -1;
+ }
+
+ /* Mark the unknown part of a register (variable offset or scalar value) as
+@@ -2391,6 +2392,7 @@ static void __mark_reg_unknown_imprecise(struct bpf_reg_state *reg)
+ 	reg->var_off = tnum_unknown;
+ 	reg->frameno = 0;
+ 	reg->precise = false;
++	reg->bcf_expr = -1;
+ 	__mark_reg_unbounded(reg);
+ }
+
+--
+2.34.1
+

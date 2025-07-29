@@ -1,0 +1,58 @@
+From 013611f53265970277d45c45664d3ff0e375fb4d Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 21:19:44 +0100
+Subject: [PATCH 0/6] bpf: Add loader support for BCF
+
+This patch modifies bpftool and libbpf to support BCF.
+
+At the libbpf level, add check to see if BCF is requested and
+add support to invoke an external prover to reason the requested
+condition. The check-refine loop is implemented as this level.
+bpftool is solver-aware, and registers the chosen solver (cvc5)
+as the prover to libbpf and converts the requested condition
+into the SMTlib format. Collectively, they implement the loader
+support for BCF.
+
+The first two patches are the same as the kernel patches, they
+are here to make this patch set self-contained. They import
+the BCF uapi definitions and kernel helpers. The rest patches
+implement the real loader logic.
+
+Hao Sun (6):
+  bpf: Add bcf uapi arguments
+  bpf: Add bcf expression and formula definitions
+  libbpf: Add bcf proof load support
+  bpftool: Check cvc5 prover feature
+  bpftool: Copy bcf header to tools
+  bpftool: Add cvc5 prover support
+
+ include/linux/bcf.h                    | 177 +++++++++++++
+ include/uapi/linux/bcf.h               | 167 +++++++++++++
+ include/uapi/linux/bpf.h               |  23 ++
+ kernel/bpf/syscall.c                   |  17 +-
+ tools/bpf/bpftool/Makefile             |   9 +
+ tools/bpf/bpftool/bcf.c                | 327 +++++++++++++++++++++++++
+ tools/bpf/bpftool/bcf.h                |   8 +
+ tools/bpf/bpftool/prog.c               |   2 +
+ tools/build/Makefile.feature           |   3 +-
+ tools/build/feature/Makefile           |   6 +-
+ tools/build/feature/test-cvc5_prover.c | 129 ++++++++++
+ tools/include/uapi/linux/bcf.h         | 167 +++++++++++++
+ tools/include/uapi/linux/bpf.h         |  23 ++
+ tools/lib/bpf/bpf.c                    |  29 ++-
+ tools/lib/bpf/bpf.h                    |  11 +-
+ tools/lib/bpf/libbpf.c                 |  22 ++
+ tools/lib/bpf/libbpf.h                 |   5 +
+ tools/lib/bpf/libbpf.map               |   2 +
+ tools/lib/bpf/libbpf_internal.h        |   2 +
+ 19 files changed, 1124 insertions(+), 5 deletions(-)
+ create mode 100644 include/linux/bcf.h
+ create mode 100644 include/uapi/linux/bcf.h
+ create mode 100644 tools/bpf/bpftool/bcf.c
+ create mode 100644 tools/bpf/bpftool/bcf.h
+ create mode 100644 tools/build/feature/test-cvc5_prover.c
+ create mode 100644 tools/include/uapi/linux/bcf.h
+
+-- 
+2.34.1
+

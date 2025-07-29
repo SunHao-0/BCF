@@ -1,0 +1,15 @@
+diff --git a/tools/bpf/bpftool/Makefile b/tools/bpf/bpftool/Makefile
+index 9e9a5f006cd2..839b0d88f1be 100644
+--- a/tools/bpf/bpftool/Makefile
++++ b/tools/bpf/bpftool/Makefile
+@@ -149,6 +149,10 @@ all: $(OUTPUT)bpftool
+ 
+ SRCS := $(wildcard *.c)
+ 
++feature-llvm=0
++feature-libbfd=0
++feature-libbfd-liberty=0
++feature-libbfd-liberty-z=0
+ ifeq ($(feature-llvm),1)
+   # If LLVM is available, use it for JIT disassembly
+   CFLAGS  += -DHAVE_LLVM_SUPPORT

@@ -1,0 +1,287 @@
+From 2ffd48d8628f21c22b482a2f8666b366f8c024dc Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 12:12:23 +0100
+Subject: [PATCH 08/32] bpf: Tracking alu operations in BCF
+
+Add routines to track alu operations in BCF. This essentially maps
+BPF ALU operations into SMT bitvec operations. The sequence of BPF_ALU
+insns are captured as a structured bcf_expr for each register, and
+as a result, the computation is captured as is in expr without any
+over-approximation.
+
+The verifier's knowledge is reused: if the range is within u32, then
+a smaller bitvec is used. This reduces the complexity of the formula
+for the SMT solver.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bcf.h   |   7 ++
+ kernel/bpf/verifier.c | 146 ++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 140 insertions(+), 13 deletions(-)
+
+diff --git a/include/linux/bcf.h b/include/linux/bcf.h
+index 8fcfcc865fcc..8e9b94a412ee 100644
+--- a/include/linux/bcf.h
++++ b/include/linux/bcf.h
+@@ -90,6 +90,13 @@ static_assert(sizeof(struct bcf_expr_ternary) == sizeof(u32) * 4);
+ #define BCF_PRED_XOR(ARG0, ARG1) BCF_BOOL_EXPR(BCF_XOR, ARG0, ARG1)
+ #define BCF_PRED_IMPLES(ARG0, ARG1) BCF_BOOL_EXPR(BCF_IMPLIES, ARG0, ARG1)
+
++#define BCF_BV_VAR_SZ(SZ)					\
++	((struct bcf_expr){                                \
++		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR, \
++		.vlen = 0,                                 \
++		.params = SZ,                              \
++	})
++
+ #define BCF_BV_VAR32                                       \
+ 	((struct bcf_expr){                                \
+ 		.code = BCF_BV_ALU | BCF_EXT | BCF_BV_VAR, \
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 2cac69849642..7ae12351ab09 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1856,12 +1856,9 @@ static int bcf_add_val(struct bpf_verifier_env *env, u64 imm, bool bit32)
+ 		return bcf_add_expr(env, BCF_BV_VAL64(imm));
+ }
+
+-static int bcf_add_var(struct bpf_verifier_env *env, bool bit32)
++static int bcf_add_var(struct bpf_verifier_env *env, u32 sz)
+ {
+-	if (bit32)
+-		return bcf_add_exprs(env, &BCF_BV_VAR32, 1);
+-	else
+-		return bcf_add_exprs(env, &BCF_BV_VAR64, 1);
++	return bcf_add_exprs(env, &BCF_BV_VAR_SZ(sz), 1);
+ }
+
+ static int bcf_add_pred(struct bpf_verifier_env *env, u8 op, int arg0, u64 imm,
+@@ -1976,14 +1973,14 @@ static int bcf_reg_expr(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
+
+ 	if (tnum_is_const(reg->var_off)) {
+ 		reg->bcf_expr = bcf_add_val(env, reg->var_off.value, false);
+-	} else if (fit_u32(reg)) {
+-		reg->bcf_expr = bcf_add_var(env, true);
++	}else if (fit_u32(reg)) {
++		reg->bcf_expr = bcf_add_var(env, 32);
+ 		bcf_zext_32_to_64(env, reg);
+ 	} else if (fit_s32(reg)) {
+-		reg->bcf_expr = bcf_add_var(env, true);
++		reg->bcf_expr = bcf_add_var(env, 32);
+ 		bcf_sext_32_to_64(env, reg);
+ 	} else {
+-		reg->bcf_expr = bcf_add_var(env, false);
++		reg->bcf_expr = bcf_add_var(env, 64);
+ 	}
+ out:
+ 	if (!subreg)
+@@ -13451,6 +13448,106 @@ static int bcf_mov32(struct bpf_verifier_env *env,
+ 	return dst_reg->bcf_expr < 0 ? dst_reg->bcf_expr : 0;
+ }
+
++struct bcf_alu_info {
++	bool fit_u32;
++	bool fit_s32;
++	int dst_expr;
++};
++
++static int bcf_collect_reg_info(struct bpf_verifier_env *env,
++				struct bpf_reg_state *dst,
++				struct bpf_reg_state *src,
++				struct bcf_alu_info *info)
++{
++	if (!bcf_requested(env))
++		return 0;
++
++	if (!tnum_is_const(dst->var_off) || !tnum_is_const(src->var_off)) {
++		bcf_reg_expr(env, dst, false);
++		if (dst->bcf_expr < 0)
++			return info->dst_expr;
++	}
++	info->dst_expr = dst->bcf_expr;
++
++	info->fit_u32 = fit_u32(dst) && fit_u32(src);
++	info->fit_s32 = fit_s32(dst) && fit_s32(src);
++
++	return 0;
++}
++
++static bool is_extract(struct bcf_expr *expr)
++{
++	struct bcf_expr_unary extract = BCF_BV_EXTRACT(32, 0);
++
++	return expr->code == extract.code;
++}
++
++static bool is_bv_zero(struct bpf_verifier_env *env, u32 expr_idx)
++{
++	struct bcf_expr *expr = env->bcf.exprs + expr_idx;
++	int i;
++
++	if (is_zext_32_to_64(expr) || is_sext_32_to_64(expr) ||
++	    is_extract(expr))
++		expr = env->bcf.exprs + expr->args[0];
++
++	if (expr->code != (BCF_BV_ALU | BCF_EXT | BCF_BV_VAL))
++		return false;
++
++	for (i = 0; i < expr->vlen && expr->args[i] == 0; i++)
++		;
++
++	return i == expr->vlen;
++}
++
++static int bcf_alu(struct bpf_verifier_env *env, u8 op,
++		   struct bpf_reg_state *dst_reg,
++		   struct bpf_reg_state *src_reg,
++		   bool alu32, struct bcf_alu_info *info)
++{
++	bool op32 = alu32, zext = false, sext = false;
++	struct bcf_expr_binary alu;
++	int dst, src, bits;
++
++	if (!bcf_requested(env))
++		return 0;
++
++	if (op == BPF_DIV || op == BPF_MOD || tnum_is_const(dst_reg->var_off)) {
++		dst_reg->bcf_expr = -1;
++		return 0;
++	}
++
++	dst_reg->bcf_expr = info->dst_expr;
++	if (fit_u32(dst_reg) && info->fit_u32) {
++		op32 = true;
++		zext = true;
++	} else if (fit_s32(dst_reg) && info->fit_s32) {
++		op32 = true;
++		sext = true;
++	};
++
++	dst = bcf_reg_expr(env, dst_reg, op32);
++	src = bcf_reg_expr(env, src_reg, op32);
++	if (dst < 0 || src < 0)
++		return -EFAULT;
++
++	if (op == BPF_ADD && is_bv_zero(env, dst)) {
++		dst_reg->bcf_expr = src;
++		goto out;
++	}
++
++	bits = op32 ? 32 : 64;
++	alu = BCF_ALU(op, dst, src, bits);
++	dst_reg->bcf_expr = bcf_add_expr(env, alu);
++out:
++	if (alu32 || zext)
++		bcf_zext_32_to_64(env, dst_reg);
++	else if (sext)
++		bcf_sext_32_to_64(env, dst_reg);
++
++	return dst_reg->bcf_expr < 0 ? dst_reg->bcf_expr : 0;
++}
++
+ static bool check_reg_sane_offset(struct bpf_verifier_env *env,
+ 				  const struct bpf_reg_state *reg,
+ 				  enum bpf_reg_type type)
+@@ -13812,18 +13909,19 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
+  */
+ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 				   struct bpf_insn *insn,
+-				   const struct bpf_reg_state *ptr_reg,
+-				   const struct bpf_reg_state *off_reg)
++				   struct bpf_reg_state *ptr_reg,
++				   struct bpf_reg_state *off_reg)
+ {
+ 	struct bpf_verifier_state *vstate = env->cur_state;
+ 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
+-	struct bpf_reg_state *regs = state->regs, *dst_reg;
++	struct bpf_reg_state *regs = state->regs, *dst_reg, *src_reg;
+ 	bool known = tnum_is_const(off_reg->var_off);
+ 	s64 smin_val = off_reg->smin_value, smax_val = off_reg->smax_value,
+ 	    smin_ptr = ptr_reg->smin_value, smax_ptr = ptr_reg->smax_value;
+ 	u64 umin_val = off_reg->umin_value, umax_val = off_reg->umax_value,
+ 	    umin_ptr = ptr_reg->umin_value, umax_ptr = ptr_reg->umax_value;
+ 	struct bpf_sanitize_info info = {};
++	struct bcf_alu_info bcf_info;
+ 	u8 opcode = BPF_OP(insn->code);
+ 	u32 dst = insn->dst_reg;
+ 	int ret;
+@@ -13897,6 +13995,11 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 	    !check_reg_sane_offset(env, ptr_reg, ptr_reg->type))
+ 		return -EINVAL;
+
++	src_reg = dst_reg == ptr_reg ? off_reg : ptr_reg;
++	ret = bcf_collect_reg_info(env, dst_reg, src_reg, &bcf_info);
++	if (ret)
++		return ret;
++
+ 	/* pointer types do not carry 32-bit bounds at the moment. */
+ 	__mark_reg32_unbounded(dst_reg);
+
+@@ -13922,6 +14025,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			dst_reg->var_off = ptr_reg->var_off;
+ 			dst_reg->off = ptr_reg->off + smin_val;
+ 			dst_reg->raw = ptr_reg->raw;
++			dst_reg->bcf_expr = ptr_reg->bcf_expr;
+ 			break;
+ 		}
+ 		/* A new variable offset is created.  Note that off_reg->off
+@@ -13951,6 +14055,9 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			/* something was added to pkt_ptr, set range to zero */
+ 			memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
+ 		}
++		ret = bcf_alu(env, opcode, dst_reg, src_reg, false, &bcf_info);
++		if (ret)
++			return ret;
+ 		break;
+ 	case BPF_SUB:
+ 		if (dst_reg == off_reg) {
+@@ -13979,6 +14086,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			dst_reg->id = ptr_reg->id;
+ 			dst_reg->off = ptr_reg->off - smin_val;
+ 			dst_reg->raw = ptr_reg->raw;
++			dst_reg->bcf_expr = ptr_reg->bcf_expr;
+ 			break;
+ 		}
+ 		/* A new variable offset is created.  If the subtrahend is known
+@@ -14008,6 +14116,9 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			if (smin_val < 0)
+ 				memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
+ 		}
++		ret = bcf_alu(env, opcode, dst_reg, src_reg, false, &bcf_info);
++		if (ret)
++			return ret;
+ 		break;
+ 	case BPF_AND:
+ 	case BPF_OR:
+@@ -14624,11 +14735,16 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+ {
+ 	u8 opcode = BPF_OP(insn->code);
+ 	bool alu32 = (BPF_CLASS(insn->code) != BPF_ALU64);
++	struct bcf_alu_info bcf_info;
+ 	int ret;
+
++	ret = bcf_collect_reg_info(env, dst_reg, &src_reg, &bcf_info);
++	if (ret)
++		return ret;
++
+ 	if (!is_safe_to_compute_dst_reg_range(insn, &src_reg)) {
+ 		__mark_reg_unknown(env, dst_reg);
+-		return 0;
++		return bcf_alu(env, opcode, dst_reg, &src_reg, alu32, &bcf_info);
+ 	}
+
+ 	if (sanitize_needed(opcode)) {
+@@ -14708,6 +14824,10 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+ 	if (alu32)
+ 		zext_32_to_64(dst_reg);
+ 	reg_bounds_sync(dst_reg);
++
++	ret = bcf_alu(env, opcode, dst_reg, &src_reg, alu32, &bcf_info);
++	if (ret)
++		return ret;
+ 	return 0;
+ }
+
+--
+2.34.1
+

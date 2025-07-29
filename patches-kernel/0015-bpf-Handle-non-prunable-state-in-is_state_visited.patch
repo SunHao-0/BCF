@@ -1,0 +1,29 @@
+From 4b4d146b75237c98c5a9326bea3a4a631f6594cb Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 09:29:51 +0100
+Subject: [PATCH 15/32] bpf: Handle non-prunable state in is_state_visited()
+
+If the state is non_prunable, deem it as a miss so that the heuristic
+at that "miss" branch can be triggered to reclaim it.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 55fb06f6adb3..baefbe41987e 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -18648,6 +18648,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 		states_cnt++;
+ 		if (sl->state.insn_idx != insn_idx)
+ 			goto next;
++		if (sl->state.non_prunable)
++			goto miss;
+ 
+ 		if (sl->state.branches) {
+ 			struct bpf_func_state *frame = sl->state.frame[sl->state.curframe];
+-- 
+2.34.1
+

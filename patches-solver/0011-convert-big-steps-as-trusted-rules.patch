@@ -1,0 +1,97 @@
+From d43063d5e13d021c0f7ef730edb3e0c750b311d4 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Thu, 12 Dec 2024 19:18:28 +0100
+Subject: [PATCH 11/13] convert big steps as trusted rules
+
+Convert big steps as trusted rules.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ src/proof/alf/alf_print_channel.cpp | 22 +++++++++++++---------
+ src/proof/alf/bcf.c                 |  6 ++++--
+ 2 files changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 67368d849d..619f06e112 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -853,18 +853,28 @@ void AlfPrintChannelBCF::printStep(ProofRule r,
+
+   struct bcf_proof_step_args step_buf = {0};
+   struct bcf_proof_step* step = (struct bcf_proof_step*)&step_buf;
++  bool trust = false;
+   u16 code;
+
+   if (isPop) d_ok = false;
+   if (!d_ok) return;
+
++  if (premises.size() + args.size() > UINT8_MAX)
++  {
++    std::cerr << r << ": too many premises/args: " << premises.size() + args.size()
++              << std::endl;
++    std::cerr << "fallback to trusted" << std::endl;
++    trust = true;
++  }
++
+   auto it = rule_table.find(r);
+-  if (it != rule_table.end())
+-    code = it->second;
+-  else
++  if (it == rule_table.end() || trust)
+   {
+     if (d_trusted.insert(r).second) std::cout << "trusted: " << r << std::endl;
+     code = BCF_RULE_REWRITE | BCF_RULE_BUILTIN;
++  } else {
++    code = it->second;
++
+   }
+
+   encodeStep(code, r, n, i, premises, args, step);
+@@ -910,12 +920,6 @@ void AlfPrintChannelBCF::encodeStep(u16 code,
+   step->rule = code;
+   step->vlen = 0;
+   step->params = 0;
+-  if (premises.size() + args.size() > UINT8_MAX)
+-  {
+-    std::cerr << "too many premises/args: " << premises.size() + args.size()
+-              << std::endl;
+-    goto err_out;
+-  }
+
+   if (code == (BCF_RULE_BUILTIN | BCF_RULE_REWRITE)
+       || code == (BCF_RULE_BV | BCF_RULE_BITBLAST)
+diff --git a/src/proof/alf/bcf.c b/src/proof/alf/bcf.c
+index 411cdc8fa2..5f1b533032 100644
+--- a/src/proof/alf/bcf.c
++++ b/src/proof/alf/bcf.c
+@@ -831,7 +831,7 @@ static void dump_expr(struct bcf_expr *expr, char *name)
+ {
+ 	int i;
+
+-	pr_debug("\t >> %s (%x, %d, %x):", name, expr->code, expr->vlen,
++	pr_debug("\t\t>> %s (%x, %d, %x):", name, expr->code, expr->vlen,
+ 		 expr->params);
+ 	for (i = 0; i < expr->vlen; i++)
+ 		pr_debug(" %d", expr->args[i]);
+@@ -842,7 +842,7 @@ static void dump_step(struct bcf_proof_step *step, const char *name)
+ {
+ 	int i;
+
+-	pr_debug("\t> %s (%d, %d, %x):", name, BCF_STEP_RULE(step->rule),
++	pr_debug("> %s (%d, %d, %x):", name, BCF_STEP_RULE(step->rule),
+ 		 step->vlen, step->params);
+ 	for (i = 0; i < step->vlen; i++)
+ 		pr_debug(" %d", step->args[i]);
+@@ -2197,6 +2197,8 @@ static int check_proof(struct bcf_checker_env *env,
+ 	 * but its negation holds.
+ 	 */
+ 	err = env->goal >= 0 && is_pred_false(expr) ? 0 : -EINVAL;
++	if (!err)
++		pr_info("\t\t>> conclusion: FALSE\n");
+ err_free:
+ 	kvfree(env->step_facts);
+ 	return err;
+--
+2.34.1
+

@@ -1,0 +1,164 @@
+From da4f50afdcaf6a721570da280e7ce380f4c45fcd Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 17:59:23 +0100
+Subject: [PATCH 01/32] bpf: Add UAPI fields for BCF proof interaction
+
+Introduce new UAPI fields in `union bpf_attr` to support integration
+with the BCF proof infrastructure. These fields allow the verifier to
+communicate with userspace for refinement proofs when abstraction
+precision is insufficient.
+
+Specifically:
+- Add `bcf_fd` for referencing an in-kernel verifier env.
+- Add `bcf_buf`, `bcf_buf_size`, and `bcf_buf_true_size` to transfer
+  the refinement condition and the corresponding user-space proof.
+- Introduce `bcf_flags` to track verifier requests and user responses.
+  New flags include:
+    - `BCF_F_PROOF_REQUESTED` (output: set by the verifier)
+    - `BCF_F_PROOF_PROVIDED`
+    - `BCF_F_PROOF_PATH_UNREACHABLE`
+
+The bcf_fd will allow the verifier to pause analysis, and resume its
+last analysis. The buffer allows the verifier to export conditions to
+userspace, accept a user-generated proof. This is the first step in
+integrating abstraction refinement into the verifier workflow.
+
+The syscall handler is updated to validate BCF-related fields during
+`BPF_PROG_LOAD`. The `tools/include` is also updated. Full BCF support
+will be added in subsequent patches.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+
+---
+ include/uapi/linux/bpf.h       | 23 +++++++++++++++++++++++
+ kernel/bpf/syscall.c           | 17 ++++++++++++++++-
+ tools/include/uapi/linux/bpf.h | 23 +++++++++++++++++++++++
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 4162afc6b5d0..61a923e73efa 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -1459,6 +1459,15 @@ struct bpf_stack_build_id {
+
+ #define BPF_OBJ_NAME_LEN 16U
+
++/* bcf_flags used in BPF_PROG_LOAD command to indicate that the verifier
++ * has requested or the user has provided proof.
++ */
++enum {
++	BCF_F_PROOF_REQUESTED		= (1U << 0),
++	BCF_F_PROOF_PROVIDED		= (1U << 1),
++	BCF_F_PROOF_PATH_UNREACHABLE	= (1U << 2),
++};
++
+ union bpf_attr {
+ 	struct { /* anonymous struct used by BPF_MAP_CREATE command */
+ 		__u32	map_type;	/* one of enum bpf_map_type */
+@@ -1573,6 +1582,20 @@ union bpf_attr {
+ 		 * If provided, prog_flags should have BPF_F_TOKEN_FD flag set.
+ 		 */
+ 		__s32		prog_token_fd;
++		/* output: bcf fd for loading proof, set by the verifier when
++		 * bcf_flags & BCF_F_PROOF_REQUESTED.
++		 */
++		__u32		bcf_fd;
++		/* bcf buf for storing both the formula to be proved from the
++		 * verifier and the proof provided.
++		 */
++		__aligned_u64	bcf_buf;
++		/* size of bcf_buf */
++		__u32		bcf_buf_size;
++		/* input/output: the size of actual proof or formula */
++		__u32		bcf_buf_true_size;
++		/* input/output: proof requested or provided */
++		__u32		bcf_flags;
+ 	};
+
+ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 5684e8ce132d..1d44889189e1 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2730,7 +2730,7 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
+ }
+
+ /* last field in 'union bpf_attr' used by this command */
+-#define BPF_PROG_LOAD_LAST_FIELD prog_token_fd
++#define BPF_PROG_LOAD_LAST_FIELD bcf_flags
+
+ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ {
+@@ -2745,6 +2745,18 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ 	if (CHECK_ATTR(BPF_PROG_LOAD))
+ 		return -EINVAL;
+
++	if (!!attr->bcf_buf != !!attr->bcf_buf_size ||
++	    (attr->bcf_flags & ~(BCF_F_PROOF_PROVIDED |
++				 BCF_F_PROOF_PATH_UNREACHABLE)))
++		return -EINVAL;
++
++	/* check proof and resume the last verifier env */
++	if (attr->bcf_flags & BCF_F_PROOF_PROVIDED)
++		return -ENOTSUPP;
++
++	if (attr->bcf_fd || attr->bcf_buf_true_size || attr->bcf_flags)
++		return -EINVAL;
++
+ 	if (attr->prog_flags & ~(BPF_F_STRICT_ALIGNMENT |
+ 				 BPF_F_ANY_ALIGNMENT |
+ 				 BPF_F_TEST_STATE_FREQ |
+@@ -2777,6 +2789,9 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ 	bpf_cap = bpf_token_capable(token, CAP_BPF);
+ 	err = -EPERM;
+
++	if (attr->bcf_buf_size && !bpf_cap)
++		goto put_token;
++
+ 	if (!IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) &&
+ 	    (attr->prog_flags & BPF_F_ANY_ALIGNMENT) &&
+ 	    !bpf_cap)
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 4162afc6b5d0..61a923e73efa 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -1459,6 +1459,15 @@ struct bpf_stack_build_id {
+
+ #define BPF_OBJ_NAME_LEN 16U
+
++/* bcf_flags used in BPF_PROG_LOAD command to indicate that the verifier
++ * has requested or the user has provided proof.
++ */
++enum {
++	BCF_F_PROOF_REQUESTED		= (1U << 0),
++	BCF_F_PROOF_PROVIDED		= (1U << 1),
++	BCF_F_PROOF_PATH_UNREACHABLE	= (1U << 2),
++};
++
+ union bpf_attr {
+ 	struct { /* anonymous struct used by BPF_MAP_CREATE command */
+ 		__u32	map_type;	/* one of enum bpf_map_type */
+@@ -1573,6 +1582,20 @@ union bpf_attr {
+ 		 * If provided, prog_flags should have BPF_F_TOKEN_FD flag set.
+ 		 */
+ 		__s32		prog_token_fd;
++		/* output: bcf fd for loading proof, set by the verifier when
++		 * bcf_flags & BCF_F_PROOF_REQUESTED.
++		 */
++		__u32		bcf_fd;
++		/* bcf buf for storing both the formula to be proved from the
++		 * verifier and the proof provided.
++		 */
++		__aligned_u64	bcf_buf;
++		/* size of bcf_buf */
++		__u32		bcf_buf_size;
++		/* input/output: the size of actual proof or formula */
++		__u32		bcf_buf_true_size;
++		/* input/output: proof requested or provided */
++		__u32		bcf_flags;
+ 	};
+
+ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
+--
+2.34.1
+

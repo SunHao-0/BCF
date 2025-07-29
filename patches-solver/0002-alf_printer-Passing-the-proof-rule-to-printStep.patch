@@ -1,0 +1,115 @@
+From ea88a4d86dd3450ad5b0414c75fc309557f43b52 Mon Sep 17 00:00:00 2001
+From: Hao Sun <sunhao.th@gmail.com>
+Date: Wed, 27 Nov 2024 10:48:14 +0100
+Subject: [PATCH 02/13] alf_printer: Passing the proof rule to printStep()
+
+Rule name does not matter in BCF format, instead the rule is used
+for encoding. So passing this to printStep()
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ src/proof/alf/alf_print_channel.cpp | 6 ++++--
+ src/proof/alf/alf_print_channel.h   | 9 ++++++---
+ src/proof/alf/alf_printer.cpp       | 8 ++++----
+ 3 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/src/proof/alf/alf_print_channel.cpp b/src/proof/alf/alf_print_channel.cpp
+index 1cef40eb42..2a92d92ed3 100644
+--- a/src/proof/alf/alf_print_channel.cpp
++++ b/src/proof/alf/alf_print_channel.cpp
+@@ -61,7 +61,8 @@ void AlfPrintChannelOut::printAssume(TNode n, size_t i, bool isPush)
+   d_out << ")" << std::endl;
+ }
+
+-void AlfPrintChannelOut::printStep(const std::string& rname,
++void AlfPrintChannelOut::printStep(ProofRule r,
++                                   const std::string& rname,
+                                    TNode n,
+                                    size_t i,
+                                    const std::vector<size_t>& premises,
+@@ -227,7 +228,8 @@ void AlfPrintChannelPre::printAssume(TNode n, size_t i, bool isPush)
+   processInternal(n);
+ }
+
+-void AlfPrintChannelPre::printStep(const std::string& rname,
++void AlfPrintChannelPre::printStep(ProofRule r,
++                                   const std::string& rname,
+                                    TNode n,
+                                    size_t i,
+                                    const std::vector<size_t>& premises,
+diff --git a/src/proof/alf/alf_print_channel.h b/src/proof/alf/alf_print_channel.h
+index dd097df718..a52c1984ec 100644
+--- a/src/proof/alf/alf_print_channel.h
++++ b/src/proof/alf/alf_print_channel.h
+@@ -54,7 +54,8 @@ class AlfPrintChannel
+    * @param args The arguments of the proof rule.
+    * @param isPop Whether this is a step-pop command.
+    */
+-  virtual void printStep(const std::string& rname,
++  virtual void printStep(ProofRule r,
++                         const std::string& rname,
+                          TNode n,
+                          size_t i,
+                          const std::vector<size_t>& premises,
+@@ -81,7 +82,8 @@ class AlfPrintChannelOut : public AlfPrintChannel
+   void printNode(TNode n) override;
+   void printTypeNode(TypeNode tn) override;
+   void printAssume(TNode n, size_t i, bool isPush) override;
+-  void printStep(const std::string& rname,
++  void printStep(ProofRule r,
++                 const std::string& rname,
+                  TNode n,
+                  size_t i,
+                  const std::vector<size_t>& premises,
+@@ -144,7 +146,8 @@ class AlfPrintChannelPre : public AlfPrintChannel
+   void printNode(TNode n) override;
+   void printTypeNode(TypeNode tn) override;
+   void printAssume(TNode n, size_t i, bool isPush) override;
+-  void printStep(const std::string& rname,
++  void printStep(ProofRule r,
++                 const std::string& rname,
+                  TNode n,
+                  size_t i,
+                  const std::vector<size_t>& premises,
+diff --git a/src/proof/alf/alf_printer.cpp b/src/proof/alf/alf_printer.cpp
+index d0b5a1a277..080b16ae06 100644
+--- a/src/proof/alf/alf_printer.cpp
++++ b/src/proof/alf/alf_printer.cpp
+@@ -724,7 +724,7 @@ void AlfPrinter::print(AlfPrintChannelOut& aout,
+       size_t id = allocateAssumeId(n, wasAlloc);
+       Node f = d_tproc.convert(n[0]);
+       Node lam = d_tproc.convert(n[1]);
+-      ao->printStep("refl", f.eqNode(lam), id, {}, {lam});
++      ao->printStep(ProofRule::REFL, "refl", f.eqNode(lam), id, {}, {lam});
+     }
+     // [5] print proof body
+     printProofInternal(ao, pnBody, i == 1);
+@@ -1030,7 +1030,7 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+         // used locally here to chain together the pops mentioned above.
+         tmpId = d_pfIdCounter;
+         d_pfIdCounter++;
+-        out->printStep(rname, Node::null(), tmpId, premises, {}, true);
++        out->printStep(r, rname, Node::null(), tmpId, premises, {}, true);
+         // The current id is the premises of the next.
+         premises.clear();
+         premises.push_back(tmpId);
+@@ -1038,14 +1038,14 @@ void AlfPrinter::printStepPost(AlfPrintChannel* out, const ProofNode* pn)
+       // Finish with the process scope step.
+       std::vector<Node> pargs;
+       pargs.push_back(d_tproc.convert(children[0]->getResult()));
+-      out->printStep("process_scope", conclusionPrint, id, premises, pargs);
++      out->printStep(r, "process_scope", conclusionPrint, id, premises, pargs);
+     }
+     // We are done with the assumptions in scope, pop a context.
+     d_passumeCtx.pop();
+   }
+   else
+   {
+-    out->printStep(rname, conclusionPrint, id, premises, args);
++    out->printStep(r, rname, conclusionPrint, id, premises, args);
+   }
+ }
+
+--
+2.34.1
+

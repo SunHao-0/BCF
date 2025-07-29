@@ -1,0 +1,58 @@
+From 13ece2601918fd9d7c039f2470b627697fc650da Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 24 Feb 2025 15:47:01 +0100
+Subject: [PATCH 03/32] bpf: Add a flag to indicate if BCF is requested
+
+Introduce a flag to indicate if BCF is requested by the verifier. This will
+be used in the following patches to check if the analysis should be paused
+or the last verifier_env should be resumed.
+
+The associated helpers are added for checking and setting the flag.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf.h          |  1 +
+ include/linux/bpf_verifier.h | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 6e63dd3443b9..633767f80987 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1528,6 +1528,7 @@ struct bpf_prog_aux {
+ 	bool jits_use_priv_stack;
+ 	bool priv_stack_requested;
+ 	bool changes_pkt_data;
++	bool bcf_requested;	/* bcf proof is requested by the verifier */
+ 	u64 prog_array_member_cnt; /* counts how many times as member of prog_array */
+ 	struct mutex ext_mutex; /* mutex for is_extended and prog_array_member_cnt */
+ 	struct bpf_arena *arena;
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 48b7b2eeb7e2..91e205874099 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -818,6 +818,21 @@ static inline struct bpf_reg_state *cur_regs(struct bpf_verifier_env *env)
+ 	return cur_func(env)->regs;
+ }
+
++static inline bool bcf_requested(const struct bpf_verifier_env *env)
++{
++	return env->prog->aux->bcf_requested;
++}
++
++static inline void mark_bcf_requested(struct bpf_verifier_env *env)
++{
++	env->prog->aux->bcf_requested = true;
++}
++
++static inline void unmark_bcf_requested(struct bpf_verifier_env *env)
++{
++	env->prog->aux->bcf_requested = false;
++}
++
+ int bpf_prog_offload_verifier_prep(struct bpf_prog *prog);
+ int bpf_prog_offload_verify_insn(struct bpf_verifier_env *env,
+ 				 int insn_idx, int prev_insn_idx);
+--
+2.34.1
+

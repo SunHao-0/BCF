@@ -1,0 +1,165 @@
+From e792e974bc7314d4bcff05ddeb138c8a6a31918a Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 11:34:59 +0100
+Subject: [PATCH 21/32] bpf: Resume from last env if bcf_fd is provided
+
+If the bcf_fd is provided, resume the analysis from the last env. The
+env is stored in the private_data of the anonymous file, and it is
+retrieved if bcf_fd is valid.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bcf.h          |  1 +
+ include/linux/bpf_verifier.h |  2 ++
+ kernel/bpf/syscall.c         | 11 ++++++++---
+ kernel/bpf/verifier.c        | 33 +++++++++++++++++++++++++++++++--
+ 4 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bcf.h b/include/linux/bcf.h
+index 8e9b94a412ee..a922449b60d3 100644
+--- a/include/linux/bcf.h
++++ b/include/linux/bcf.h
+@@ -181,4 +181,5 @@ static_assert(__MAX_BCF_BUILTIN_RULES <= MAX_BCF_CLASS_RULES);
+ static_assert(__MAX_BCF_BOOLEAN_RULES <= MAX_BCF_CLASS_RULES);
+ static_assert(__MAX_BCF_EQUALITY_RULES <= MAX_BCF_CLASS_RULES);
+ static_assert(__MAX_BCF_BV_RULES <= MAX_BCF_CLASS_RULES);
++
+ #endif /* __LINUX_BCF_H__ */
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 14353e8761dd..b9bc4cbb6f79 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -9,6 +9,7 @@
+ #include <linux/filter.h> /* for MAX_BPF_STACK */
+ #include <linux/tnum.h>
+ #include <linux/bcf.h>
++#include <linux/types.h>
+
+ /* Maximum variable offset umax_value permitted when resolving memory accesses.
+  * In practice this is far bigger than any realistic pointer offset; this limit
+@@ -716,6 +717,7 @@ struct bcf_state {
+ 	u32 cur_vstate;
+ 	u32 cur_jmp_entry;	/* the current jump history entry followed */
+ 	bool available;		/* if bcf buf is provided */
++	atomic_t in_use;	/* the current env is in use */
+ };
+
+ /* single container for all structs
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 1d44889189e1..726252c5f01b 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2751,8 +2751,11 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ 		return -EINVAL;
+
+ 	/* check proof and resume the last verifier env */
+-	if (attr->bcf_flags & BCF_F_PROOF_PROVIDED)
+-		return -ENOTSUPP;
++	if (attr->bcf_flags & BCF_F_PROOF_PROVIDED) {
++		prog = NULL;
++		memset(attr, 0, offsetof(union bpf_attr, bcf_fd));
++		goto verifier_check;
++	}
+
+ 	if (attr->bcf_fd || attr->bcf_buf_true_size || attr->bcf_flags)
+ 		return -EINVAL;
+@@ -2957,9 +2960,11 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ 	err = security_bpf_prog_load(prog, attr, token);
+ 	if (err)
+ 		goto free_prog_sec;
+-
++verifier_check:
+ 	/* run eBPF verifier */
+ 	err = bpf_check(&prog, attr, uattr, uattr_size);
++	if (!prog || prog->aux->bcf_requested)
++		return err;
+ 	if (err < 0)
+ 		goto free_used_maps;
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index aa9b1026132b..7823d90a79e2 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -22868,6 +22868,8 @@ static int bcf_release(struct inode *inode, struct file *filp)
+
+ 	if (!env)
+ 		return 0;
++	if (atomic_read(&env->bcf.in_use))
++		return -EBUSY;
+
+ 	kvfree(env->bcf.exprs);
+ 	free_states(env);
+@@ -22924,6 +22926,8 @@ static int do_request_bcf(struct bpf_verifier_env *env, union bpf_attr *attr,
+
+ 	/* fd already exists if proof is provided*/
+ 	if (!(attr->bcf_flags & BCF_F_PROOF_PROVIDED)) {
++		atomic_set(&env->bcf.in_use, 1);
++
+ 		bcf_fd = anon_inode_getfd("bcf", &bcf_fops, env, O_RDONLY | O_CLOEXEC);
+ 		if (bcf_fd < 0)
+ 			return bcf_fd;
+@@ -23636,12 +23640,30 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	struct bpf_verifier_env *env;
+ 	int i, len, ret = -EINVAL, err;
+ 	u32 log_true_size;
+-	bool is_priv;
++	bool is_priv, resume;
++	struct fd bcf_fd;
+
+ 	/* no program is valid */
+ 	if (ARRAY_SIZE(bpf_verifier_ops) == 0)
+ 		return -EINVAL;
+
++	resume = !!(attr->bcf_flags & BCF_F_PROOF_PROVIDED);
++	if (resume) {
++		struct file *f;
++
++		bcf_fd = fdget(attr->bcf_fd);
++		f = fd_file(bcf_fd);
++		if (!f)
++			return -EBADF;
++		env = f->private_data;
++		if (f->f_op != &bcf_fops || !env ||
++		    atomic_cmpxchg(&env->bcf.in_use, 0, 1)) {
++			fdput(bcf_fd);
++			return -EINVAL;
++		}
++		is_priv = env->bpf_capable;
++		goto verifier_check;
++	}
+ 	/* 'struct bpf_verifier_env' can be global, but since it's not small,
+ 	 * allocate/free it every time bpf_check() is called
+ 	 */
+@@ -23748,7 +23770,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	ret = mark_fastcall_patterns(env);
+ 	if (ret < 0)
+ 		goto skip_full_check;
+-
++verifier_check:
+ 	ret = do_check_main(env);
+ 	ret = ret ?: do_check_subprogs(env);
+
+@@ -23757,6 +23779,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 			goto skip_full_check;
+
+ 		env->verification_time += ktime_get_ns() - start_time;
++		if (resume)
++			fdput(bcf_fd);
++		atomic_set(&env->bcf.in_use, 0);
+ 		return ret;
+ 	}
+
+@@ -23764,6 +23789,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 		ret = bpf_prog_offload_finalize(env);
+
+ skip_full_check:
++	if (resume) {
++		fd_file(bcf_fd)->private_data = NULL;
++		fdput(bcf_fd);
++	}
+ 	/* in bcf mode, the last check states maybe preserved, free now */
+ 	free_states(env);
+ 	kvfree(env->bcf.exprs);
+--
+2.34.1
+

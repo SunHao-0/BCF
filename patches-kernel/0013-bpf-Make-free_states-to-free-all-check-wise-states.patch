@@ -1,0 +1,53 @@
+From afdca06b492076622b9f64db4dc93979c4a295da Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 25 Feb 2025 17:58:50 +0100
+Subject: [PATCH 13/32] bpf: Make free_states() to free check-wise states
+
+If BCF is requested, do not free the verifier state on exiting the analysis,
+but preserve the state and use it the next time when the verifier resumes.
+
+The free_states() routine is modified to free all check-wise states.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 2662a3f13f25..22046ccd5ba5 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -22353,6 +22353,15 @@ static void free_states(struct bpf_verifier_env *env)
+ 	struct bpf_verifier_state_list *sl, *sln;
+ 	int i;
+
++	/* check for NULL is necessary, since cur_state can be freed inside
++	 * do_check() under memory pressure.
++	 */
++	if (env->cur_state) {
++		free_verifier_state(env->cur_state, true);
++		env->cur_state = NULL;
++	}
++	while (!pop_stack(env, NULL, NULL, false));
++
+ 	sl = env->free_list;
+ 	while (sl) {
+ 		sln = sl->next;
+@@ -22494,14 +22503,6 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	if (bcf_requested(env))
+ 		return ret;
+ out:
+-	/* check for NULL is necessary, since cur_state can be freed inside
+-	 * do_check() under memory pressure.
+-	 */
+-	if (env->cur_state) {
+-		free_verifier_state(env->cur_state, true);
+-		env->cur_state = NULL;
+-	}
+-	while (!pop_stack(env, NULL, NULL, false));
+ 	if (!ret && pop_log)
+ 		bpf_vlog_reset(&env->log, 0);
+ 	free_states(env);
+--
+2.34.1
+

@@ -1,0 +1,136 @@
+From c7c145fab2a9bf11c47caa8fa9736d810e1e4cbb Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 10:52:32 +0100
+Subject: [PATCH 20/32] bpf: Copy bcf expressions to user if requested
+
+At the end of bpf_check(), if BCF is requested, copy the bcf expressions
+to user, which contains the refinement condition and the path condition.
+
+The user can prove either the refinement or path unreachable.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 89 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 27aad6e12691..aa9b1026132b 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -16,6 +16,8 @@
+ #include <linux/filter.h>
+ #include <net/netlink.h>
+ #include <linux/file.h>
++#include <linux/anon_inodes.h>
++#include <linux/fdtable.h>
+ #include <linux/vmalloc.h>
+ #include <linux/stringify.h>
+ #include <linux/bsearch.h>
+@@ -22859,6 +22861,82 @@ static int bcf_refine(struct bpf_verifier_env *env, u32 reg_masks,
+ 	return err;
+ }
+
++/* release the verifier env */
++static int bcf_release(struct inode *inode, struct file *filp)
++{
++	struct bpf_verifier_env *env = filp->private_data;
++
++	if (!env)
++		return 0;
++
++	kvfree(env->bcf.exprs);
++	free_states(env);
++	kvfree(env->explored_states);
++
++	if (!env->prog->aux->used_maps)
++		release_maps(env);
++	if (!env->prog->aux->used_btfs)
++		release_btfs(env);
++	bpf_prog_put(env->prog);
++
++	module_put(env->attach_btf_mod);
++	vfree(env->insn_aux_data);
++	kvfree(env->insn_hist);
++	kvfree(env);
++	return 0;
++}
++
++static const struct file_operations bcf_fops = {
++	.release = bcf_release,
++};
++
++static int do_request_bcf(struct bpf_verifier_env *env, union bpf_attr *attr,
++		       bpfptr_t uattr)
++{
++	bpfptr_t bcf_buf = make_bpfptr(attr->bcf_buf, uattr.is_kernel);
++	int ret, bcf_fd = -1, flags = BCF_F_PROOF_REQUESTED;
++	struct bcf_state *bcf = &env->bcf;
++	u32 sz, sz_off, expr_sz;
++
++	static_assert(sizeof(attr->bcf_buf_true_size) == sizeof(sz));
++	static_assert(sizeof(bcf->refine_cond) == sizeof(u32));
++	static_assert(sizeof(bcf->path_cond) == sizeof(u32));
++
++	/* all exprs, followed by path_cond and refine_cond */
++	expr_sz = bcf->expr_cnt * sizeof(struct bcf_expr);
++	sz = expr_sz + sizeof(bcf->path_cond) + sizeof(bcf->refine_cond);
++	sz_off = offsetof(union bpf_attr, bcf_buf_true_size);
++
++	ret = -EFAULT;
++	if(copy_to_bpfptr_offset(uattr, sz_off, &sz, sizeof(sz)))
++		return ret;
++	if (sz > attr->bcf_buf_size)
++		return -ENOSPC;
++
++	if (copy_to_bpfptr_offset(bcf_buf, 0, bcf->exprs, expr_sz) ||
++	    copy_to_bpfptr_offset(bcf_buf, expr_sz, &bcf->path_cond, sizeof(u32)) ||
++	    copy_to_bpfptr_offset(bcf_buf, expr_sz + sizeof(u32), &bcf->refine_cond, sizeof(u32)))
++		return ret;
++
++	if (copy_to_bpfptr_offset(uattr, offsetof(union bpf_attr, bcf_flags),
++				  &flags, sizeof(flags)))
++		return ret;
++
++	/* fd already exists if proof is provided*/
++	if (!(attr->bcf_flags & BCF_F_PROOF_PROVIDED)) {
++		bcf_fd = anon_inode_getfd("bcf", &bcf_fops, env, O_RDONLY | O_CLOEXEC);
++		if (bcf_fd < 0)
++			return bcf_fd;
++		if (copy_to_bpfptr_offset(uattr, offsetof(union bpf_attr, bcf_fd),
++					  &bcf_fd, sizeof(bcf_fd))) {
++			close_fd(bcf_fd);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ /* Lazily verify all global functions based on their BTF, if they are called
+  * from main BPF program or any of subprograms transitively.
+  * BPF global subprogs called from dead code are not validated.
+@@ -23674,10 +23752,21 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	ret = do_check_main(env);
+ 	ret = ret ?: do_check_subprogs(env);
+
++	if (ret && bcf_requested(env)) {
++		if (do_request_bcf(env, attr, uattr) != 0)
++			goto skip_full_check;
++
++		env->verification_time += ktime_get_ns() - start_time;
++		return ret;
++	}
++
+ 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
+ 		ret = bpf_prog_offload_finalize(env);
+
+ skip_full_check:
++	/* in bcf mode, the last check states maybe preserved, free now */
++	free_states(env);
++	kvfree(env->bcf.exprs);
+ 	kvfree(env->explored_states);
+
+ 	/* might decrease stack depth, keep it before passes that
+--
+2.34.1
+

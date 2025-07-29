@@ -1,0 +1,73 @@
+From 0f0f7b06aa1f5a113fafcfda48a37ce858c705ee Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Thu, 24 Jul 2025 14:08:07 +0200
+Subject: [PATCH 00/32] Add eBPF Certificate Framework (BCF)
+
+This patch set introduces abstraction refinement to the eBPF verifier and
+integrates the BCF proof checker into the kernel.
+
+It includes:
+- Triggers refinement when the verifier is overly imprecise
+- Backtracks and captures program state as symbolic expressions
+- Refines abstraction and generates a refinement condition
+- Pauses verifier, delivers condition to user space for proof
+- Receives proof from user space, validates it with the BCF checker
+- If valid, continues with refined abstraction; otherwise, stops
+
+Note that the current version is not ideal in the sense that the patch
+structure is not explicit and the changes are not evenly distributed.
+However, it is a complete and functional implementation. Please refer
+to our latest patch set when it's avaliable.
+
+Hao Sun (32):
+  bpf: Add bcf uapi arguments
+  bpf: Add bcf expression and formula definitions
+  bpf: Add a flag to indicate if BCF is requested
+  bpf: Skip irrelevant rontines when bcf is requested
+  bpf: Add basic bcf state to manage expressions
+  bpf: Add basic bcf expression binding and bound
+  bpf: Tracking mov and signed-ext operations in bcf
+  bpf: Tracking alu operations in bcf
+  bpf: Tracking stack state in bcf
+  bpf: Match tracking path with jump history
+  bpf: Add path constraint tracking
+  bpf: Refactor basic check rontines
+  bpf: Make free_states() to free all check-wise states
+  bpf: Add bcf_refine()
+  bpf: Handle non-prunable state in is_state_visited()
+  bpf: Make do_check_subprogs() resumable from last env
+  bpf: Make do_check_main() resumable from last env
+  bpf: Make do_check_common() resumable from last env
+  bpf: Make bpf_check() resumable from last env
+  bpf: Copy bcf expressions to user if requested
+  bpf: Resume from last env if bcf_fd is provided
+  bpf: Add bcf proof checker
+  bpf: Perform proof check before resuming env
+  bpf: Mark state as refined after bcf
+  bpf: Refactor check_stack_slot_within_bounds()
+  bpf: Add mem access bound refinement
+  bpf: Add refinement in check_mem_region_access()
+  bpf: Add mem size access refinement
+  bpf: Add general path unreachable refinement
+  bpf: Enable bcf when bcf_buf provided for priv users
+  bpf: Add debug log
+  bpf: Add bcf proof check count
+
+ include/linux/bcf.h            |  188 +++
+ include/linux/bpf.h            |    1 +
+ include/linux/bpf_verifier.h   |   62 +
+ include/uapi/linux/bcf.h       |  167 +++
+ include/uapi/linux/bpf.h       |   23 +
+ kernel/bpf/Makefile            |    2 +-
+ kernel/bpf/bcf.c               | 2337 ++++++++++++++++++++++++++++++++
+ kernel/bpf/syscall.c           |   24 +-
+ kernel/bpf/verifier.c          | 1663 +++++++++++++++++++++--
+ tools/include/uapi/linux/bpf.h |   23 +
+ 10 files changed, 4405 insertions(+), 85 deletions(-)
+ create mode 100644 include/linux/bcf.h
+ create mode 100644 include/uapi/linux/bcf.h
+ create mode 100644 kernel/bpf/bcf.c
+
+--
+2.34.1
+

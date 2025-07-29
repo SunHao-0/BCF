@@ -1,0 +1,90 @@
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# Core dumps
+core
+*.core
+
+# Build directories
+build/
+bin/
+obj/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Compiler generated files
+*.i
+*.s
+*.d
+
+# Static analysis
+*.gcno
+*.gcda
+*.gcov
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Executables
+bcf-checker
+encoding_test
+*_test
+compile_commands.json
+*.plist
+.cache

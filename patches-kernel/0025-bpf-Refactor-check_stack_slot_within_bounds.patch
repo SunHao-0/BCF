@@ -1,0 +1,50 @@
+From fdc7f91dd87cfc0de5d0af68008166071c42663d Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 15:10:40 +0100
+Subject: [PATCH 25/32] bpf: Refactor check_stack_slot_within_bounds()
+
+Refactor check_stack_slot_within_bounds() for the incoming stack offset
+refinement. The new stack_min_off() routine is used to compute the minimum
+valid offset for the stack access.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index b44b62f64ba7..4dfd8812b644 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -7281,6 +7281,15 @@ static int check_ptr_to_map_access(struct bpf_verifier_env *env,
+ 	return 0;
+ }
+
++static int stack_min_off(struct bpf_verifier_env *env, struct bpf_func_state *state,
++			 enum bpf_access_type t)
++{
++	if (t == BPF_WRITE || env->allow_uninit_stack)
++		return -MAX_BPF_STACK;
++	else
++		return -state->allocated_stack;
++}
++
+ /* Check that the stack access at the given offset is within bounds. The
+  * maximum valid offset is -1.
+  *
+@@ -7294,11 +7303,7 @@ static int check_stack_slot_within_bounds(struct bpf_verifier_env *env,
+ {
+ 	int min_valid_off;
+
+-	if (t == BPF_WRITE || env->allow_uninit_stack)
+-		min_valid_off = -MAX_BPF_STACK;
+-	else
+-		min_valid_off = -state->allocated_stack;
+-
++	min_valid_off = stack_min_off(env, state, t);
+ 	if (off < min_valid_off || off > -1)
+ 		return -EACCES;
+ 	return 0;
+--
+2.34.1
+

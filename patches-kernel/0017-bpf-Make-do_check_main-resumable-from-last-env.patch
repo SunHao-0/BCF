@@ -1,0 +1,32 @@
+From 68c9c11d175d95122110cff345bac94b478dbc05 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 26 Feb 2025 09:45:32 +0100
+Subject: [PATCH 17/32] bpf: Make do_check_main() resumable
+
+Make do_check_main() resumable from the last env. This is used for resuming
+the analysis from the last subprog when the verifier is resumed.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 32d6091608a3..a5a30512dd75 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -22937,7 +22937,10 @@ static int do_check_main(struct bpf_verifier_env *env)
+ {
+ 	int ret;
+
+-	env->insn_idx = 0;
++	if (env->subprog)
++		return 0;
++	if (!env->cur_state)
++		env->insn_idx = 0;
+ 	ret = do_check_common(env, 0);
+ 	if (!ret)
+ 		env->prog->aux->stack_depth = env->subprog_info[0].stack_depth;
+--
+2.34.1
+
