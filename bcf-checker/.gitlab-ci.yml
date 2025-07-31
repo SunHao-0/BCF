@@ -1,0 +1,60 @@
+stages:
+  - build
+  - test
+  - check
+  - format
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+
+before_script:
+  - apt-get update -qq
+  - apt-get install -y clang gcc make libc6-dev sparse clang-format
+
+.build_template: &build_template
+  stage: build
+  script:
+    - make clean
+    - make all
+  artifacts:
+    paths:
+      - bcf-checker
+      - build/
+    expire_in: 1 hour
+
+.test_template: &test_template
+  stage: test
+  script:
+    - make test
+
+build:clang:
+  <<: *build_template
+  variables:
+    CC: clang
+
+build:gcc:
+  <<: *build_template
+  variables:
+    CC: gcc
+
+test:clang:
+  <<: *test_template
+  variables:
+    CC: clang
+  needs: ["build:clang"]
+
+test:gcc:
+  <<: *test_template
+  variables:
+    CC: gcc
+  needs: ["build:gcc"]
+
+check:
+  stage: check
+  script:
+    - make check || echo "sparse not available or check failed"
+
+format:
+  stage: format
+  script:
+    - make format-check || echo "clang-format not available or check failed"

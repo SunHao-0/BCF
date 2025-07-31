@@ -1,6 +1,9 @@
-# eBPF Certificate Framework (BCF)
+<p align="center">
+  <img src="./scripts/BCF.png" alt="BCF Logo" width="240"><br>
+</p>
+<h2 align="center" style="margin-top: -20px;">eBPF Certificate Framework</h2>
 
-BCF is a framework that enhances the eBPF verifier's precision via proof-guided abstraction refinement. It enables the verifier to achieve high precision through user-space reasoning while maintaining soundness through formal proof checking. BCF addresses the precision limitations by:
+**BCF** is a framework designed to enhance the precision of the eBPF verifier through proof-guided abstraction refinement. By combining user-space reasoning with formal proof checking, BCF enables the verifier to achieve high precision while maintaining soundness and low complexity. The framework addresses precision limitations by:
 
 - **Refinement**: Making the verifier's knowledge about program state more precise
 - **Delegation**: Delegating refinement reasoning to user space (low kernel complexity)
@@ -18,6 +21,10 @@ BCF is a framework that enhances the eBPF verifier's precision via proof-guided 
 ├── build/              # Build artifacts (generated)
 └── output/             # Results and binaries (generated)
 ```
+
+**Note**: For the initial full implementation of BCF (as well as the SOSP AE process), please refer to the [artifact-evaluation](https://github.com/SunHao-0/BCF/tree/artifact-evaluation) branch.
+
+The `main` branch currently contains the updated proof checker. As we continue to improve the checker, updates are needed for each patch set (e.g., kernel patches). We will release the updated patches soon.
 
 ## Key Components
 
@@ -77,6 +84,8 @@ The following script will install most of the dependencies for the project autom
 ```
 
 ## Quick Start
+
+(The following instructions are currently for the artifact-evaluation branch, and they will be updated for the main branch soon.)
 
 Please refer to the [scripts/README.md](scripts/README.md) for more details.
 
