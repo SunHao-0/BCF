@@ -70,11 +70,13 @@ Please refer to [bcf-checker/README.md](bcf-checker/README.md) for more details 
 
 - Linux environment (tested on Debian Bookworm)
 - QEMU with KVM support
-- virtiofsd for file sharing
+- [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) for file sharing
 - Standard build tools (make, gcc/clang, git)
 - Python3 with standard libraries
 
-The following script will install most of the dependencies for the project automatically. The script should be run as non-root, but with sudo privileges to install packages.
+First, download the disk image (`bookworm.img`) following the instructions in [imgs/README.md](imgs/README.md). The image is used to boot the modified kernel and run all the evaluation scripts.
+
+Next, use the following script to install most of the dependencies for the project automatically. The script should be run as non-root, but with sudo privileges to install packages.
 
 ```bash
 ./scripts/install-deps.sh
@@ -125,7 +127,6 @@ The evaluation uses structured program indices:
 - `prog_index.json`: Program metadata and grouping
 - `obj_prog_type.json`: Program type information
 - `accepted_prog_index.json`: Successfully loaded programs
-
 
 Results are stored in `output/` with the following structure:
 - `load.log`: Detailed loading process log

@@ -104,6 +104,7 @@ install_vm_deps() {
         source "$HOME/.cargo/env"
     fi
     if ! command_exists virtiofsd; then
+        # source: https://gitlab.com/virtio-fs/virtiofsd
         cargo install virtiofsd &>/dev/null || fatal "Failed to install virtiofsd"
         ack "Installed virtiofsd"
     fi
