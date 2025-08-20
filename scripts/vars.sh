@@ -89,6 +89,7 @@ vmcmd() {
 
 vmstop() {
     _vmcmd "shutdown -h now"
-    wait "$(cat ${VM_PIDFILE})"
-    do_log "Stopped VM."
+    rm -f ${VM_PIDFILE}
+    rm -f ${RESULT_DIR}/bpf-test.sock ${RESULT_DIR}/bpf-test.sock.pid
+    ack "Stopped VM."
 }

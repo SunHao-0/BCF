@@ -42,7 +42,7 @@ build_kernel() {
     local kernel_skips=("0000-cover-letter.patch")
 
     if [[ -d "$kernel_dir" || -f "$KERNEL_PATH" ]]; then
-        do_log "Kernel already built, skipping"
+        echo "Kernel already built, skipping"
         return
     fi
 
@@ -95,7 +95,7 @@ build_solver() {
     local solver_skips=("cvc5.patch")
 
     if [[ -d "$solver_dir" || -f "$SOLVER_PATH" ]]; then
-        do_log "Solver already built, skipping"
+        echo "Solver already built, skipping"
         return
     fi
 
