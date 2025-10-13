@@ -9,6 +9,10 @@
 - **Delegation**: Delegating refinement reasoning to user space (low kernel complexity)
 - **Proof**: Requiring formal proofs that are validated by an in-kernel proof checker
 
+**Note**: For the initial full implementation of BCF (as well as the SOSP AE process), please refer to the [artifact-evaluation](https://github.com/SunHao-0/BCF/tree/artifact-evaluation) branch.
+
+The `main` branch currently contains the updated proof checker. As we continue to improve the checker, updates are needed for each patch set (e.g., kernel patches). We will release the updated patches soon.
+
 ## Project Structure
 
 ```
@@ -21,10 +25,6 @@
 ├── build/              # Build artifacts (generated)
 └── output/             # Results and binaries (generated)
 ```
-
-**Note**: For the initial full implementation of BCF (as well as the SOSP AE process), please refer to the [artifact-evaluation](https://github.com/SunHao-0/BCF/tree/artifact-evaluation) branch.
-
-The `main` branch currently contains the updated proof checker. As we continue to improve the checker, updates are needed for each patch set (e.g., kernel patches). We will release the updated patches soon.
 
 ## Key Components
 
