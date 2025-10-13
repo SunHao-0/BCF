@@ -2,7 +2,7 @@
 #ifndef _TOOLS_LINUX_PANIC_H
 #define _TOOLS_LINUX_PANIC_H
 
-#include <stdarg.h>
+#include <linux/stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 

@@ -1,86 +1,365 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _TOOLS_LINUX_COMPILER_H_
-#define _TOOLS_LINUX_COMPILER_H_
+#ifndef __LINUX_COMPILER_H
+#define __LINUX_COMPILER_H
+
+#include <linux/compiler_types.h>
 
 #ifndef __ASSEMBLY__
 
-#include <linux/compiler_types.h>
-#include <linux/compiler_attributes.h>
+#ifdef __KERNEL__
 
-#ifndef __compiletime_error
-# define __compiletime_error(message)
-#endif
-
-#ifdef __OPTIMIZE__
-# define __compiletime_assert(condition, msg, prefix, suffix)		\
-	do {								\
-		extern void prefix ## suffix(void) __compiletime_error(msg); \
-		if (!(condition))					\
-			prefix ## suffix();				\
-	} while (0)
-#else
-# define __compiletime_assert(condition, msg, prefix, suffix) do { } while (0)
-#endif
-
-#define _compiletime_assert(condition, msg, prefix, suffix) \
-	__compiletime_assert(condition, msg, prefix, suffix)
-
-/**
- * compiletime_assert - break build and emit msg if condition is false
- * @condition: a compile-time constant condition to check
- * @msg:       a message to emit if condition is false
- *
- * In tradition of POSIX assert, this macro will break the build if the
- * supplied condition is *false*, emitting the supplied error message if the
- * compiler has support to do so.
+/*
+ * Note: DISABLE_BRANCH_PROFILING can be used by special lowlevel code
+ * to disable branch tracing on a per file basis.
  */
-#define compiletime_assert(condition, msg) \
-	_compiletime_assert(condition, msg, __compiletime_assert_, __COUNTER__)
+void ftrace_likely_update(struct ftrace_likely_data *f, int val, int expect,
+			  int is_constant);
+#if defined(CONFIG_TRACE_BRANCH_PROFILING) && \
+	!defined(DISABLE_BRANCH_PROFILING) && !defined(__CHECKER__)
+#define likely_notrace(x) __builtin_expect(!!(x), 1)
+#define unlikely_notrace(x) __builtin_expect(!!(x), 0)
+
+#define __branch_check__(x, expect, is_constant)                              \
+	({                                                                    \
+		long ______r;                                                 \
+		static struct ftrace_likely_data __aligned(4)                 \
+			__section("_ftrace_annotated_branch") ______f = {     \
+				.data.func = __func__,                        \
+				.data.file = __FILE__,                        \
+				.data.line = __LINE__,                        \
+			};                                                    \
+		______r = __builtin_expect(!!(x), expect);                    \
+		ftrace_likely_update(&______f, ______r, expect, is_constant); \
+		______r;                                                      \
+	})
+
+/*
+ * Using __builtin_constant_p(x) to ignore cases where the return
+ * value is always the same.  This idea is taken from a similar patch
+ * written by Daniel Walker.
+ */
+#ifndef likely
+#define likely(x) (__branch_check__(x, 1, __builtin_constant_p(x)))
+#endif
+#ifndef unlikely
+#define unlikely(x) (__branch_check__(x, 0, __builtin_constant_p(x)))
+#endif
+
+#ifdef CONFIG_PROFILE_ALL_BRANCHES
+/*
+ * "Define 'is'", Bill Clinton
+ * "Define 'if'", Steven Rostedt
+ */
+#define if(cond, ...) if (__trace_if_var(!!(cond, ##__VA_ARGS__)))
+
+#define __trace_if_var(cond) \
+	(__builtin_constant_p(cond) ? (cond) : __trace_if_value(cond))
+
+#define __trace_if_value(cond)                                     \
+	({                                                         \
+		static struct ftrace_branch_data __aligned(4)      \
+			__section("_ftrace_branch") __if_trace = { \
+				.func = __func__,                  \
+				.file = __FILE__,                  \
+				.line = __LINE__,                  \
+			};                                         \
+		(cond) ? (__if_trace.miss_hit[1]++, 1) :           \
+			 (__if_trace.miss_hit[0]++, 0);            \
+	})
+
+#endif /* CONFIG_PROFILE_ALL_BRANCHES */
+
+#else
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#define likely_notrace(x) likely(x)
+#define unlikely_notrace(x) unlikely(x)
+#endif
 
 /* Optimization barrier */
+#ifndef barrier
 /* The "volatile" is due to gcc bugs */
-#define barrier() __asm__ __volatile__("": : :"memory")
-
-#ifndef __always_inline
-# define __always_inline	inline __attribute__((always_inline))
+#define barrier() __asm__ __volatile__("" : : : "memory")
 #endif
 
-#ifndef __always_unused
-#define __always_unused __attribute__((__unused__))
+#ifndef barrier_data
+/*
+ * This version is i.e. to prevent dead stores elimination on @ptr
+ * where gcc and llvm may behave differently when otherwise using
+ * normal barrier(): while gcc behavior gets along with a normal
+ * barrier(), llvm needs an explicit input variable to be assumed
+ * clobbered. The issue is as follows: while the inline asm might
+ * access any memory it wants, the compiler could have fit all of
+ * @ptr into memory registers instead, and since @ptr never escaped
+ * from that, it proved that the inline asm wasn't touching any of
+ * it. This version works well with both compilers, i.e. we're telling
+ * the compiler that the inline asm absolutely may see the contents
+ * of @ptr. See also: https://llvm.org/bugs/show_bug.cgi?id=15495
+ */
+#define barrier_data(ptr) __asm__ __volatile__("" : : "r"(ptr) : "memory")
 #endif
 
-#ifndef __noreturn
-#define __noreturn __attribute__((__noreturn__))
+/* workaround for GCC PR82365 if needed */
+#ifndef barrier_before_unreachable
+#define barrier_before_unreachable() \
+	do {                         \
+	} while (0)
 #endif
 
-#ifndef unreachable
-#define unreachable() __builtin_unreachable()
+/* Unreachable code */
+#ifdef CONFIG_OBJTOOL
+/* Annotate a C jump table to allow objtool to follow the code flow */
+#define __annotate_jump_table __section(".data.rel.ro.c_jump_table")
+#else /* !CONFIG_OBJTOOL */
+#define __annotate_jump_table
+#endif /* CONFIG_OBJTOOL */
+
+/*
+ * Mark a position in code as unreachable.  This can be used to
+ * suppress control flow warnings after asm blocks that transfer
+ * control elsewhere.
+ */
+#define unreachable()                         \
+	do {                                  \
+		barrier_before_unreachable(); \
+		__builtin_unreachable();      \
+	} while (0)
+
+/*
+ * KENTRY - kernel entry point
+ * This can be used to annotate symbols (functions or data) that are used
+ * without their linker symbol being referenced explicitly. For example,
+ * interrupt vector handlers, or functions in the kernel image that are found
+ * programatically.
+ *
+ * Not required for symbols exported with EXPORT_SYMBOL, or initcalls. Those
+ * are handled in their own way (with KEEP() in linker scripts).
+ *
+ * KENTRY can be avoided if the symbols in question are marked as KEEP() in the
+ * linker script. For example an architecture could KEEP() its entire
+ * boot/exception vector code rather than annotate each function and data.
+ */
+#ifndef KENTRY
+#define KENTRY(sym)                                               \
+	extern typeof(sym) sym;                                   \
+	static const unsigned long __kentry_##sym __used          \
+		__attribute__((__section__("___kentry+" #sym))) = \
+			(unsigned long)&sym;
 #endif
 
-#ifndef noinline
-#define noinline
+#ifndef RELOC_HIDE
+#define RELOC_HIDE(ptr, off)                  \
+	({                                    \
+		unsigned long __ptr;          \
+		__ptr = (unsigned long)(ptr); \
+		(typeof(ptr))(__ptr + (off)); \
+	})
 #endif
 
-#ifndef __nocf_check
-#define __nocf_check __attribute__((nocf_check))
+#define absolute_pointer(val) RELOC_HIDE((void *)(val), 0)
+
+#ifndef OPTIMIZER_HIDE_VAR
+/* Make the optimizer believe the variable can be manipulated arbitrarily. */
+#define OPTIMIZER_HIDE_VAR(var) __asm__("" : "=r"(var) : "0"(var))
 #endif
 
-#ifndef __naked
-#define __naked __attribute__((__naked__))
+#define __UNIQUE_ID(prefix) __PASTE(__PASTE(__UNIQUE_ID_, prefix), __COUNTER__)
+
+/**
+ * data_race - mark an expression as containing intentional data races
+ *
+ * This data_race() macro is useful for situations in which data races
+ * should be forgiven.  One example is diagnostic code that accesses
+ * shared variables but is not a part of the core synchronization design.
+ * For example, if accesses to a given variable are protected by a lock,
+ * except for diagnostic code, then the accesses under the lock should
+ * be plain C-language accesses and those in the diagnostic code should
+ * use data_race().  This way, KCSAN will complain if buggy lockless
+ * accesses to that variable are introduced, even if the buggy accesses
+ * are protected by READ_ONCE() or WRITE_ONCE().
+ *
+ * This macro *does not* affect normal code generation, but is a hint
+ * to tooling that data races here are to be ignored.  If the access must
+ * be atomic *and* KCSAN should ignore the access, use both data_race()
+ * and READ_ONCE(), for example, data_race(READ_ONCE(x)).
+ */
+#define data_race(expr)                    \
+	({                                 \
+		__kcsan_disable_current(); \
+		__auto_type __v = (expr);  \
+		__kcsan_enable_current();  \
+		__v;                       \
+	})
+
+#ifdef __CHECKER__
+#define __BUILD_BUG_ON_ZERO_MSG(e, msg, ...) (0)
+#else /* __CHECKER__ */
+#define __BUILD_BUG_ON_ZERO_MSG(e, msg, ...) \
+	((int)sizeof(struct { _Static_assert(!(e), msg); }))
+#endif /* __CHECKER__ */
+
+/* &a[0] degrades to a pointer: a different type from an array */
+#define __is_array(a) (!__same_type((a), &(a)[0]))
+#define __must_be_array(a) \
+	__BUILD_BUG_ON_ZERO_MSG(!__is_array(a), "must be array")
+
+#define __is_byte_array(a) (__is_array(a) && sizeof((a)[0]) == 1)
+#define __must_be_byte_array(a) \
+	__BUILD_BUG_ON_ZERO_MSG(!__is_byte_array(a), "must be byte array")
+
+/*
+ * If the "nonstring" attribute isn't available, we have to return true
+ * so the __must_*() checks pass when "nonstring" isn't supported.
+ */
+#if __has_attribute(__nonstring__) && defined(__annotated)
+#define __is_cstr(a) (!__annotated(a, nonstring))
+#define __is_noncstr(a) (__annotated(a, nonstring))
+#else
+#define __is_cstr(a) (true)
+#define __is_noncstr(a) (true)
 #endif
 
-/* Are two types/vars the same type (ignoring qualifiers)? */
-#ifndef __same_type
-# define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
+/* Require C Strings (i.e. NUL-terminated) lack the "nonstring" attribute. */
+#define __must_be_cstr(p)                      \
+	__BUILD_BUG_ON_ZERO_MSG(!__is_cstr(p), \
+				"must be C-string (NUL-terminated)")
+#define __must_be_noncstr(p)                      \
+	__BUILD_BUG_ON_ZERO_MSG(!__is_noncstr(p), \
+				"must be non-C-string (not NUL-terminated)")
+
+/*
+ * Use __typeof_unqual__() when available.
+ *
+ * XXX: Remove test for __CHECKER__ once
+ * sparse learns about __typeof_unqual__().
+ */
+#if CC_HAS_TYPEOF_UNQUAL && !defined(__CHECKER__)
+#define USE_TYPEOF_UNQUAL 1
 #endif
+
+/*
+ * Define TYPEOF_UNQUAL() to use __typeof_unqual__() as typeof
+ * operator when available, to return an unqualified type of the exp.
+ */
+#if defined(USE_TYPEOF_UNQUAL)
+#define TYPEOF_UNQUAL(exp) __typeof_unqual__(exp)
+#else
+#define TYPEOF_UNQUAL(exp) __typeof__(exp)
+#endif
+
+#endif /* __KERNEL__ */
+
+#if defined(CONFIG_CFI_CLANG) && !defined(__DISABLE_EXPORTS) && \
+	!defined(BUILD_VDSO)
+/*
+ * Force a reference to the external symbol so the compiler generates
+ * __kcfi_typid.
+ */
+#define KCFI_REFERENCE(sym) __ADDRESSABLE(sym)
+#else
+#define KCFI_REFERENCE(sym)
+#endif
+
+/**
+ * offset_to_ptr - convert a relative memory offset to an absolute pointer
+ * @off:	the address of the 32-bit offset value
+ */
+static inline void *offset_to_ptr(const int *off)
+{
+	return (void *)((unsigned long)off + *off);
+}
+
+#endif /* __ASSEMBLY__ */
+
+#ifdef CONFIG_64BIT
+#define ARCH_SEL(a, b) a
+#else
+#define ARCH_SEL(a, b) b
+#endif
+
+/*
+ * Force the compiler to emit 'sym' as a symbol, so that we can reference
+ * it from inline assembler. Necessary in case 'sym' could be inlined
+ * otherwise, or eliminated entirely due to lack of references that are
+ * visible to the compiler.
+ */
+#define ___ADDRESSABLE(sym, __attrs)             \
+	static void *__used __attrs __UNIQUE_ID( \
+		__PASTE(__addressable_, sym)) = (void *)(uintptr_t) & sym;
+
+#define __ADDRESSABLE(sym) \
+	___ADDRESSABLE(sym, __section(".discard.addressable"))
+
+#define __ADDRESSABLE_ASM(sym)                   \
+	.pushsection.discard.addressable, "aw";  \
+	.align ARCH_SEL(8, 4);                   \
+	ARCH_SEL(.quad, .long) __stringify(sym); \
+	.popsection;
+
+#define __ADDRESSABLE_ASM_STR(sym) __stringify(__ADDRESSABLE_ASM(sym))
 
 /*
  * This returns a constant expression while determining if an argument is
  * a constant expression, most importantly without evaluating the argument.
  * Glory to Martin Uecker <Martin.Uecker@med.uni-goettingen.de>
+ *
+ * Details:
+ * - sizeof() return an integer constant expression, and does not evaluate
+ *   the value of its operand; it only examines the type of its operand.
+ * - The results of comparing two integer constant expressions is also
+ *   an integer constant expression.
+ * - The first literal "8" isn't important. It could be any literal value.
+ * - The second literal "8" is to avoid warnings about unaligned pointers;
+ *   this could otherwise just be "1".
+ * - (long)(x) is used to avoid warnings about 64-bit types on 32-bit
+ *   architectures.
+ * - The C Standard defines "null pointer constant", "(void *)0", as
+ *   distinct from other void pointers.
+ * - If (x) is an integer constant expression, then the "* 0l" resolves
+ *   it into an integer constant expression of value 0. Since it is cast to
+ *   "void *", this makes the second operand a null pointer constant.
+ * - If (x) is not an integer constant expression, then the second operand
+ *   resolves to a void pointer (but not a null pointer constant: the value
+ *   is not an integer constant 0).
+ * - The conditional operator's third operand, "(int *)8", is an object
+ *   pointer (to type "int").
+ * - The behavior (including the return type) of the conditional operator
+ *   ("operand1 ? operand2 : operand3") depends on the kind of expressions
+ *   given for the second and third operands. This is the central mechanism
+ *   of the macro:
+ *   - When one operand is a null pointer constant (i.e. when x is an integer
+ *     constant expression) and the other is an object pointer (i.e. our
+ *     third operand), the conditional operator returns the type of the
+ *     object pointer operand (i.e. "int *"). Here, within the sizeof(), we
+ *     would then get:
+ *       sizeof(*((int *)(...))  == sizeof(int)  == 4
+ *   - When one operand is a void pointer (i.e. when x is not an integer
+ *     constant expression) and the other is an object pointer (i.e. our
+ *     third operand), the conditional operator returns a "void *" type.
+ *     Here, within the sizeof(), we would then get:
+ *       sizeof(*((void *)(...)) == sizeof(void) == 1
+ * - The equality comparison to "sizeof(int)" therefore depends on (x):
+ *     sizeof(int) == sizeof(int)     (x) was a constant expression
+ *     sizeof(int) != sizeof(void)    (x) was not a constant expression
  */
 #define __is_constexpr(x) \
 	(sizeof(int) == sizeof(*(8 ? ((void *)((long)(x) * 0l)) : (int *)8)))
+
+/*
+ * Whether 'type' is a signed type or an unsigned type. Supports scalar types,
+ * bool and also pointer types.
+ */
+#define is_signed_type(type) (((type)(-1)) < (__force type)1)
+#define is_unsigned_type(type) (!is_signed_type(type))
+
+/*
+ * Useful shorthand for "is this condition known at compile-time?"
+ *
+ * Note that the condition may involve non-constant values,
+ * but the compiler may know enough about the details of the
+ * values to determine that the condition is statically true.
+ */
+#define statically_true(x) (__builtin_constant_p(x) && (x))
 
 /*
  * Similar to statically_true() but produces a constant expression
@@ -104,49 +383,13 @@
  */
 #define const_true(x) __builtin_choose_expr(__is_constexpr(x), x, false)
 
-#ifdef __ANDROID__
 /*
- * FIXME: Big hammer to get rid of tons of:
- *   "warning: always_inline function might not be inlinable"
- *
- * At least on android-ndk-r12/platforms/android-24/arch-arm
+ * This is needed in functions which generate the stack canary, see
+ * arch/x86/kernel/smpboot.c::start_secondary() for an example.
  */
-#undef __always_inline
-#define __always_inline	inline
-#endif
-
-#define __read_mostly
-
-#ifndef __maybe_unused
-# define __maybe_unused		__attribute__((unused))
-#endif
-
-#ifndef __used
-# define __used		__attribute__((__unused__))
-#endif
-
-#ifndef __packed
-# define __packed		__attribute__((__packed__))
-#endif
-
-#ifndef __force
-# define __force
-#endif
-
-#ifndef __weak
-# define __weak			__attribute__((weak))
-#endif
-
-#ifndef likely
-# define likely(x)		__builtin_expect(!!(x), 1)
-#endif
-
-#ifndef unlikely
-# define unlikely(x)		__builtin_expect(!!(x), 0)
-#endif
+#define prevent_tail_call_optimization() mb()
 
 #include <linux/types.h>
-
 /*
  * Following functions are taken from kernel sources and
  * break aliasing rules in their original form.
@@ -158,18 +401,27 @@
  * Using extra __may_alias__ type to allow aliasing
  * in this case.
  */
-typedef __u8  __attribute__((__may_alias__))  __u8_alias_t;
+typedef __u8 __attribute__((__may_alias__)) __u8_alias_t;
 typedef __u16 __attribute__((__may_alias__)) __u16_alias_t;
 typedef __u32 __attribute__((__may_alias__)) __u32_alias_t;
 typedef __u64 __attribute__((__may_alias__)) __u64_alias_t;
 
-static __always_inline void __read_once_size(const volatile void *p, void *res, int size)
+static __always_inline void __read_once_size(const volatile void *p, void *res,
+					     int size)
 {
 	switch (size) {
-	case 1: *(__u8_alias_t  *) res = *(volatile __u8_alias_t  *) p; break;
-	case 2: *(__u16_alias_t *) res = *(volatile __u16_alias_t *) p; break;
-	case 4: *(__u32_alias_t *) res = *(volatile __u32_alias_t *) p; break;
-	case 8: *(__u64_alias_t *) res = *(volatile __u64_alias_t *) p; break;
+	case 1:
+		*(__u8_alias_t *)res = *(volatile __u8_alias_t *)p;
+		break;
+	case 2:
+		*(__u16_alias_t *)res = *(volatile __u16_alias_t *)p;
+		break;
+	case 4:
+		*(__u32_alias_t *)res = *(volatile __u32_alias_t *)p;
+		break;
+	case 8:
+		*(__u64_alias_t *)res = *(volatile __u64_alias_t *)p;
+		break;
 	default:
 		barrier();
 		__builtin_memcpy((void *)res, (const void *)p, size);
@@ -177,13 +429,22 @@ static __always_inline void __read_once_size(const volatile void *p, void *res, 
 	}
 }
 
-static __always_inline void __write_once_size(volatile void *p, void *res, int size)
+static __always_inline void __write_once_size(volatile void *p, void *res,
+					      int size)
 {
 	switch (size) {
-	case 1: *(volatile  __u8_alias_t *) p = *(__u8_alias_t  *) res; break;
-	case 2: *(volatile __u16_alias_t *) p = *(__u16_alias_t *) res; break;
-	case 4: *(volatile __u32_alias_t *) p = *(__u32_alias_t *) res; break;
-	case 8: *(volatile __u64_alias_t *) p = *(__u64_alias_t *) res; break;
+	case 1:
+		*(volatile __u8_alias_t *)p = *(__u8_alias_t *)res;
+		break;
+	case 2:
+		*(volatile __u16_alias_t *)p = *(__u16_alias_t *)res;
+		break;
+	case 4:
+		*(volatile __u32_alias_t *)p = *(__u32_alias_t *)res;
+		break;
+	case 8:
+		*(volatile __u64_alias_t *)p = *(__u64_alias_t *)res;
+		break;
 	default:
 		barrier();
 		__builtin_memcpy((void *)p, (const void *)res, size);
@@ -192,66 +453,44 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
 }
 
 /*
- * Prevent the compiler from merging or refetching reads or writes. The
- * compiler is also forbidden from reordering successive instances of
- * READ_ONCE and WRITE_ONCE, but only when the compiler is aware of some
- * particular ordering. One way to make the compiler aware of ordering is to
- * put the two invocations of READ_ONCE or WRITE_ONCE in different C
- * statements.
- *
- * These two macros will also work on aggregate data types like structs or
- * unions. If the size of the accessed data type exceeds the word size of
- * the machine (e.g., 32 bits or 64 bits) READ_ONCE() and WRITE_ONCE() will
- * fall back to memcpy and print a compile-time warning.
- *
- * Their two major use cases are: (1) Mediating communication between
- * process-level code and irq/NMI handlers, all running on the same CPU,
- * and (2) Ensuring that the compiler does not fold, spindle, or otherwise
- * mutilate accesses that either do not require ordering or that interact
- * with an explicit memory barrier or atomic instruction that provides the
- * required ordering.
- */
+  * Prevent the compiler from merging or refetching reads or writes. The
+  * compiler is also forbidden from reordering successive instances of
+  * READ_ONCE and WRITE_ONCE, but only when the compiler is aware of some
+  * particular ordering. One way to make the compiler aware of ordering is to
+  * put the two invocations of READ_ONCE or WRITE_ONCE in different C
+  * statements.
+  *
+  * These two macros will also work on aggregate data types like structs or
+  * unions. If the size of the accessed data type exceeds the word size of
+  * the machine (e.g., 32 bits or 64 bits) READ_ONCE() and WRITE_ONCE() will
+  * fall back to memcpy and print a compile-time warning.
+  *
+  * Their two major use cases are: (1) Mediating communication between
+  * process-level code and irq/NMI handlers, all running on the same CPU,
+  * and (2) Ensuring that the compiler does not fold, spindle, or otherwise
+  * mutilate accesses that either do not require ordering or that interact
+  * with an explicit memory barrier or atomic instruction that provides the
+  * required ordering.
+  */
 
-#define READ_ONCE(x)					\
-({							\
-	union { typeof(x) __val; char __c[1]; } __u =	\
-		{ .__c = { 0 } };			\
-	__read_once_size(&(x), __u.__c, sizeof(x));	\
-	__u.__val;					\
-})
+#define READ_ONCE(x)                                        \
+	({                                                  \
+		union {                                     \
+			typeof(x) __val;                    \
+			char __c[1];                        \
+		} __u = { .__c = { 0 } };                   \
+		__read_once_size(&(x), __u.__c, sizeof(x)); \
+		__u.__val;                                  \
+	})
 
-#define WRITE_ONCE(x, val)				\
-({							\
-	union { typeof(x) __val; char __c[1]; } __u =	\
-		{ .__val = (val) }; 			\
-	__write_once_size(&(x), __u.__c, sizeof(x));	\
-	__u.__val;					\
-})
+#define WRITE_ONCE(x, val)                                   \
+	({                                                   \
+		union {                                      \
+			typeof(x) __val;                     \
+			char __c[1];                         \
+		} __u = { .__val = (val) };                  \
+		__write_once_size(&(x), __u.__c, sizeof(x)); \
+		__u.__val;                                   \
+	})
 
-
-/* Indirect macros required for expanded argument pasting, eg. __LINE__. */
-#define ___PASTE(a, b) a##b
-#define __PASTE(a, b) ___PASTE(a, b)
-
-#ifndef OPTIMIZER_HIDE_VAR
-/* Make the optimizer believe the variable can be manipulated arbitrarily. */
-#define OPTIMIZER_HIDE_VAR(var)						\
-	__asm__ ("" : "=r" (var) : "0" (var))
-#endif
-
-#ifdef __CHECKER__
-#define __BUILD_BUG_ON_ZERO_MSG(e, msg, ...) (0)
-#else /* __CHECKER__ */
-#define __BUILD_BUG_ON_ZERO_MSG(e, msg, ...) ((int)sizeof(struct {_Static_assert(!(e), msg);}))
-#endif /* __CHECKER__ */
-
-/* &a[0] degrades to a pointer: a different type from an array */
-#define __is_array(a)		(!__same_type((a), &(a)[0]))
-#define __must_be_array(a)	__BUILD_BUG_ON_ZERO_MSG(!__is_array(a), \
-							"must be array")
-
-#endif /* __ASSEMBLY__ */
-
-#define __annotate_jump_table
-
-#endif /* _TOOLS_LINUX_COMPILER_H */
+#endif /* __LINUX_COMPILER_H */

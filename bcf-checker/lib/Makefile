@@ -7,14 +7,15 @@ LIBOBJDIR := $(BUILDDIR)/libobj
 LIBDEPDIR := $(BUILDDIR)/libdeps
 
 CC ?= gcc
-CFLAGS_BASE := -static -Wall -Wextra -Werror -Wundef -Wstrict-prototypes -Wno-pointer-sign \
+CFLAGS_BASE := -static -D__KERNEL__ -DCONFIG_FUNCTION_ALIGNMENT=0 -Wall -Wextra -Werror -Wundef -Wstrict-prototypes -Wno-pointer-sign \
                -Wno-trigraphs -fno-strict-aliasing -fno-common -Wno-type-limits\
                -Werror-implicit-function-declaration -Wno-format-security \
                -Wno-unused-parameter -Wno-sign-compare -std=gnu11 -I$(INCDIR) \
 	       -DCONFIG_XARRAY_MULTI
 
-ifdef DEBUG
-    CFLAGS := $(CFLAGS_BASE) -O0 -g -DDEBUG -fno-omit-frame-pointer
+SANITIZER_FLAGS := -g -fno-omit-frame-pointer -fsanitize=address -fsanitize=undefined -fsanitize=leak -fsanitize-undefined-trap-on-error
+ifndef RELEASE
+    CFLAGS := $(CFLAGS_BASE) -O0 -g -DDEBUG -fno-omit-frame-pointer $(SANITIZER_FLAGS)
     BUILD_TYPE := debug
     BUILDCONFIG := $(BUILDDIR)/.debug
 else

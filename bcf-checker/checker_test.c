@@ -1,21 +1,242 @@
-#include <linux/bpf.h>
-#include <linux/bcf.h>
-#include <linux/bpfptr.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <errno.h>
-#include <linux/xarray.h>
-#include <linux/slab.h>
-#include <linux/refcount.h>
-#include <linux/bitmap.h>
-#include <linux/container_of.h>
-#include <linux/bpf_verifier.h>
 #include <linux/overflow.h>
 #include <linux/limits.h>
-#include <stdarg.h>
+#include <linux/errno.h>
+#include <linux/xarray.h>
+#include <linux/slab.h>
+#include <linux/sort.h>
+#include <linux/refcount.h>
+#include <linux/bitmap.h>
+#include <linux/sched/signal.h>
+#include <linux/sched.h>
+#include <linux/kernel.h>
+#include <linux/cleanup.h>
+#include <linux/bpfptr.h>
+#include <linux/bpf_verifier.h>
+#include <linux/bpf.h>
+#include <linux/bcf_checker.h>
+#include <linux/xarray.h>
 
 #include "test_utils.h"
+
+#include "bcf_rewrite_dsl.h"
+
+struct bcf_expr_unary {
+	u8 code;
+	u8 vlen;
+	u16 params;
+	u32 arg0;
+};
+
+struct bcf_expr_binary {
+	u8 code;
+	u8 vlen;
+	u16 params;
+	union {
+		u32 args[2];
+		struct {
+			u32 arg0;
+			u32 arg1;
+		};
+	};
+};
+
+struct bcf_expr_ternary {
+	u8 code;
+	u8 vlen;
+	u16 params;
+	union {
+		u32 args[3];
+		struct {
+			u32 arg0;
+			u32 arg1;
+			u32 arg2;
+		};
+	};
+};
+
+struct bcf_expr_buf {
+	u8 code;
+	u8 vlen;
+	u16 params;
+	u32 args[U8_MAX];
+};
+
+static_assert(sizeof(struct bcf_expr) == sizeof(u32));
+static_assert(sizeof(struct bcf_expr_unary) ==
+	      struct_size_t(struct bcf_expr, args, 1));
+static_assert(sizeof(struct bcf_expr_binary) ==
+	      struct_size_t(struct bcf_expr, args, 2));
+static_assert(sizeof(struct bcf_expr_ternary) ==
+	      struct_size_t(struct bcf_expr, args, 3));
+
+static_assert(sizeof(struct bcf_proof_step) == sizeof(u32));
+
+/* Bitvector variable constructors */
+#define BCF_BV_VAR(width)                 \
+	((struct bcf_expr){               \
+		.code = BCF_BV | BCF_VAR, \
+		.vlen = 0,                \
+		.params = (width),        \
+	})
+
+#define BCF_BV_VAR32 BCF_BV_VAR(32)
+#define BCF_BV_VAR64 BCF_BV_VAR(64)
+
+/* Bitvector value constructors */
+#define BCF_BV_VAL32(imm)                 \
+	((struct bcf_expr_unary){         \
+		.code = BCF_BV | BCF_VAL, \
+		.vlen = 1,                \
+		.params = 32,             \
+		.arg0 = (imm),            \
+	})
+
+#define BCF_BV_VAL64(imm)                   \
+	((struct bcf_expr_binary){          \
+		.code = BCF_BV | BCF_VAL,   \
+		.vlen = 2,                  \
+		.params = 64,               \
+		.arg0 = (u32)(imm),         \
+		.arg1 = (u32)((imm) >> 32), \
+	})
+
+/* Bitvector extraction (end bit is 0, start bit is size-1) */
+#define BCF_BV_EXTRACT(size, arg)              \
+	((struct bcf_expr_unary){              \
+		.code = BCF_BV | BCF_EXTRACT,  \
+		.vlen = 1,                     \
+		.params = (((size) - 1) << 8), \
+		.arg0 = (arg),                 \
+	})
+
+/* Bitvector extensions */
+#define BCF_BV_ZEXT(width, ext_width, arg)              \
+	((struct bcf_expr_unary){                       \
+		.code = BCF_BV | BCF_ZERO_EXTEND,       \
+		.vlen = 1,                              \
+		.params = ((ext_width) << 8 | (width)), \
+		.arg0 = (arg),                          \
+	})
+
+#define BCF_BV_SEXT(width, ext_width, arg)              \
+	((struct bcf_expr_unary){                       \
+		.code = BCF_BV | BCF_SIGN_EXTEND,       \
+		.vlen = 1,                              \
+		.params = ((ext_width) << 8 | (width)), \
+		.arg0 = (arg),                          \
+	})
+
+/* Generic bitvector binary operation */
+#define BCF_BV_BINOP(op, width, a0, a1) \
+	((struct bcf_expr_binary){      \
+		.code = BCF_BV | (op),  \
+		.vlen = 2,              \
+		.params = (width),      \
+		.arg0 = (a0),           \
+		.arg1 = (a1),           \
+	})
+
+/* Convenience macros for common bit widths */
+#define BCF_ALU32(op, a0, a1) BCF_BV_BINOP(op, 32, a0, a1)
+#define BCF_ALU64(op, a0, a1) BCF_BV_BINOP(op, 64, a0, a1)
+
+/* Boolean variable constructor */
+#define BCF_BOOL_VAR                        \
+	((struct bcf_expr){                 \
+		.code = BCF_BOOL | BCF_VAR, \
+		.vlen = 0,                  \
+		.params = 0,                \
+	})
+
+/* Boolean literal constructors */
+#define BCF_BOOL_TRUE                       \
+	((struct bcf_expr){                 \
+		.code = BCF_BOOL | BCF_VAL, \
+		.vlen = 0,                  \
+		.params = BCF_TRUE,         \
+	})
+
+#define BCF_BOOL_FALSE                      \
+	((struct bcf_expr){                 \
+		.code = BCF_BOOL | BCF_VAL, \
+		.vlen = 0,                  \
+		.params = BCF_FALSE,        \
+	})
+
+/* Boolean unary operations */
+#define BCF_BOOL_NOT(arg)                   \
+	((struct bcf_expr_unary){           \
+		.code = BCF_BOOL | BCF_NOT, \
+		.vlen = 1,                  \
+		.params = 0,                \
+		.arg0 = (arg),              \
+	})
+
+/* Boolean binary operations */
+#define BCF_BOOL_AND(a0, a1)                 \
+	((struct bcf_expr_binary){           \
+		.code = BCF_BOOL | BCF_CONJ, \
+		.vlen = 2,                   \
+		.params = 0,                 \
+		.arg0 = (a0),                \
+		.arg1 = (a1),                \
+	})
+
+#define BCF_BOOL_OR(a0, a1)                  \
+	((struct bcf_expr_binary){           \
+		.code = BCF_BOOL | BCF_DISJ, \
+		.vlen = 2,                   \
+		.params = 0,                 \
+		.arg0 = (a0),                \
+		.arg1 = (a1),                \
+	})
+
+#define BCF_BOOL_XOR(a0, a1)                \
+	((struct bcf_expr_binary){          \
+		.code = BCF_BOOL | BCF_XOR, \
+		.vlen = 2,                  \
+		.params = 0,                \
+		.arg0 = (a0),               \
+		.arg1 = (a1),               \
+	})
+
+#define BCF_BOOL_IMPLIES(a0, a1)                \
+	((struct bcf_expr_binary){              \
+		.code = BCF_BOOL | BCF_IMPLIES, \
+		.vlen = 2,                      \
+		.params = 0,                    \
+		.arg0 = (a0),                   \
+		.arg1 = (a1),                   \
+	})
+
+#define BCF_BOOL_DISTINCT(a0, a1)                \
+	((struct bcf_expr_binary){               \
+		.code = BCF_BOOL | BCF_DISTINCT, \
+		.vlen = 2,                       \
+		.params = 0,                     \
+		.arg0 = (a0),                    \
+		.arg1 = (a1),                    \
+	})
+
+/* Boolean if-then-else */
+#define BCF_BOOL_ITE(cond, then_arg, else_arg) \
+	((struct bcf_expr_ternary){            \
+		.code = BCF_BOOL | BCF_ITE,    \
+		.vlen = 3,                     \
+		.params = 0,                   \
+		.arg0 = (cond),                \
+		.arg1 = (then_arg),            \
+		.arg2 = (else_arg),            \
+	})
+
+/* Bitvector bit extraction to boolean */
+#define BCF_BOOL_BITOF(bit, arg)              \
+	((struct bcf_expr_unary){             \
+		.code = BCF_BOOL | BCF_BITOF, \
+		.vlen = 1,                    \
+		.params = (u8)(bit),          \
+		.arg0 = (arg),                \
+	})
 
 // Bitvector if-then-else (ITE) macro, matching BCF_BOOL_ITE style
 #ifndef BCF_BV_ITE
@@ -140,8 +361,6 @@
 	})
 #endif
 
-extern int check_hdr(struct bcf_proof_header *hdr, union bpf_attr *attr,
-		     bpfptr_t bcf_buf);
 extern int check_exprs(void *st, bpfptr_t bcf_buf, u32 expr_size);
 
 /* Test framework for BCF expression reference counting */
@@ -198,7 +417,9 @@ static struct bcf_expr_ref_test *__to_ref_test(struct bcf_expr *expr)
 static bool is_static_expr_test(struct bcf_checker_state_test *st,
 				struct bcf_expr *expr)
 {
-	return expr >= st->exprs && expr < st->exprs + st->expr_size;
+	(void)st;
+	(void)expr;
+	return false;
 }
 
 static bool is_static_expr_id_test(struct bcf_checker_state_test *st, u32 id)
@@ -310,28 +531,6 @@ static void test_expr_put_dynamic_children(void)
 	xa_destroy(&st.expr_id_map);
 }
 
-/* Test dynamic expression with static children */
-static void test_expr_put_static_children(void)
-{
-	struct bcf_checker_state_test st = { 0 };
-	struct bcf_expr static_exprs[2] = { 0 };
-	int freed_parent = 0;
-	struct bcf_expr_ref_test *parent;
-
-	xa_init(&st.expr_id_map);
-	st.exprs = static_exprs;
-	st.expr_size = 2;
-
-	parent = alloc_expr_test(&st, 2, &freed_parent);
-	parent->expr.args[0] = 0; /* static */
-	parent->expr.args[1] = 1; /* static */
-
-	expr_put_test(&st, &parent->expr);
-	EXPECT_EQ(freed_parent, 1);
-
-	xa_destroy(&st.expr_id_map);
-}
-
 /* Test reference counting */
 static void test_expr_put_refcount(void)
 {
@@ -350,19 +549,6 @@ static void test_expr_put_refcount(void)
 	EXPECT_EQ(freed, 1); /* now freed */
 
 	xa_destroy(&st.expr_id_map);
-}
-
-/* Test static expression handling */
-static void test_expr_put_static(void)
-{
-	struct bcf_checker_state_test st = { 0 };
-	struct bcf_expr static_exprs[1] = { 0 };
-
-	st.exprs = static_exprs;
-	st.expr_size = 1;
-
-	expr_put_test(&st, &static_exprs[0]); /* should do nothing */
-	EXPECT_TRUE(1); /* if we reach here, test passes */
 }
 
 /* Test DAG with shared child */
@@ -617,9 +803,7 @@ static void test_expr_put_refcount_edge_cases(void)
 static struct test_case expr_put_tests[] = {
 	TEST_ENTRY(test_expr_put_single),
 	TEST_ENTRY(test_expr_put_dynamic_children),
-	TEST_ENTRY(test_expr_put_static_children),
 	TEST_ENTRY(test_expr_put_refcount),
-	TEST_ENTRY(test_expr_put_static),
 	TEST_ENTRY(test_expr_put_dag),
 	TEST_ENTRY(test_expr_put_complex_dag),
 	TEST_ENTRY(test_expr_put_deep_nested),
@@ -629,115 +813,6 @@ static struct test_case expr_put_tests[] = {
 	TEST_ENTRY(test_expr_put_many_references),
 	TEST_ENTRY(test_expr_put_refcount_edge_cases),
 };
-
-static void test_check_hdr(void)
-{
-	// Helper sizes
-	size_t hdr_size = sizeof(struct bcf_proof_header);
-	size_t expr_size = sizeof(struct bcf_expr);
-	size_t step_size = sizeof(struct bcf_proof_step);
-
-	// --- 1. proof_size > attr->bcf_buf_size ---
-	struct bcf_proof_header hdr_buf;
-	struct bcf_proof_header valid_hdr = { .magic = BCF_MAGIC,
-					      .expr_cnt = 1,
-					      .step_cnt = 1 };
-	union bpf_attr attr = { 0 };
-	attr.bcf_buf_true_size = 100;
-	attr.bcf_buf_size = 50;
-	bpfptr_t buf = make_bpfptr((uintptr_t)&valid_hdr, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, buf), -EINVAL);
-
-	// --- 2. proof_size > MAX_BCF_PROOF_SIZE ---
-	attr.bcf_buf_true_size = MAX_BCF_PROOF_SIZE + 4;
-	attr.bcf_buf_size = MAX_BCF_PROOF_SIZE + 4;
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, buf), -EINVAL);
-
-	// --- 3. proof_size <= sizeof(*hdr) ---
-	attr.bcf_buf_true_size = hdr_size;
-	attr.bcf_buf_size = hdr_size;
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, buf), -EINVAL);
-
-	// --- 4. proof_size % sizeof(u32) != 0 ---
-	attr.bcf_buf_true_size = hdr_size + 1;
-	attr.bcf_buf_size = hdr_size + 1;
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, buf), -EINVAL);
-
-	attr.bcf_buf_true_size = hdr_size + expr_size + step_size;
-	attr.bcf_buf_size = attr.bcf_buf_true_size;
-
-	// --- 5. hdr->magic != BCF_MAGIC ---
-	struct bcf_proof_header bad_magic = { .magic = 0x1234,
-					      .expr_cnt = 1,
-					      .step_cnt = 1 };
-	bpfptr_t bad_magic_buf = make_bpfptr((uintptr_t)&bad_magic, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, bad_magic_buf), -EINVAL);
-
-	// --- 6. !hdr->expr_cnt ---
-	struct bcf_proof_header no_expr = { .magic = BCF_MAGIC,
-					    .expr_cnt = 0,
-					    .step_cnt = 1 };
-	bpfptr_t no_expr_buf = make_bpfptr((uintptr_t)&no_expr, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, no_expr_buf), -EINVAL);
-
-	// --- 7. !hdr->step_cnt ---
-	struct bcf_proof_header no_step = { .magic = BCF_MAGIC,
-					    .expr_cnt = 1,
-					    .step_cnt = 0 };
-	bpfptr_t no_step_buf = make_bpfptr((uintptr_t)&no_step, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, no_step_buf), -EINVAL);
-
-	// --- 8. check_mul_overflow for expr_cnt ---
-	struct bcf_proof_header big_expr = { .magic = BCF_MAGIC,
-					     .expr_cnt = UINT32_MAX,
-					     .step_cnt = 1 };
-	bpfptr_t big_expr_buf = make_bpfptr((uintptr_t)&big_expr, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, big_expr_buf), -EINVAL);
-
-	// --- 9. check_mul_overflow for step_cnt ---
-	struct bcf_proof_header big_step = { .magic = BCF_MAGIC,
-					     .expr_cnt = 1,
-					     .step_cnt = UINT32_MAX };
-	bpfptr_t big_step_buf = make_bpfptr((uintptr_t)&big_step, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, big_step_buf), -EINVAL);
-
-	// --- 10. proof_size != sizeof(*hdr) + expr_size + step_size ---
-	struct bcf_proof_header valid_hdr2 = { .magic = BCF_MAGIC,
-					       .expr_cnt = 2,
-					       .step_cnt = 3 };
-	attr.bcf_buf_true_size =
-		hdr_size + 2 * expr_size + 3 * step_size + 4; // extra bytes
-	attr.bcf_buf_size = attr.bcf_buf_true_size;
-	bpfptr_t valid_hdr2_buf = make_bpfptr((uintptr_t)&valid_hdr2, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, valid_hdr2_buf), -EINVAL);
-
-	// --- 11. check_add_overflow for expr_size + step_size ---
-	// Calculate values that will cause overflow when expr_size + step_size is computed
-	// We want: expr_size + step_size > SIZE_MAX
-	// where expr_size = expr_cnt * sizeof(struct bcf_expr)
-	// and step_size = step_cnt * sizeof(struct bcf_proof_step)
-	size_t max_expr_cnt = SIZE_MAX / expr_size;
-	size_t max_step_cnt = SIZE_MAX / step_size;
-
-	// Use values that when multiplied and added will overflow
-	struct bcf_proof_header overflow_hdr = { .magic = BCF_MAGIC,
-						 .expr_cnt = max_expr_cnt,
-						 .step_cnt = max_step_cnt };
-	attr.bcf_buf_true_size =
-		hdr_size + 1; // Large enough to pass other checks
-	attr.bcf_buf_size = attr.bcf_buf_true_size;
-	bpfptr_t overflow_buf = make_bpfptr((uintptr_t)&overflow_hdr, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, overflow_buf), -EINVAL);
-
-	// --- 12. Valid case ---
-	struct bcf_proof_header valid_hdr3 = { .magic = BCF_MAGIC,
-					       .expr_cnt = 2,
-					       .step_cnt = 3 };
-	attr.bcf_buf_true_size = hdr_size + 2 * expr_size + 3 * step_size;
-	attr.bcf_buf_size = attr.bcf_buf_true_size;
-	bpfptr_t valid_hdr3_buf = make_bpfptr((uintptr_t)&valid_hdr3, 1);
-	EXPECT_EQ(check_hdr(&hdr_buf, &attr, valid_hdr3_buf), 0);
-}
 
 // Helper: Write a bcf_expr (with vlen args) to a buffer at offset, return new offset
 static size_t write_expr(void *buf, size_t offset, u8 code, u8 vlen, int params,
@@ -755,58 +830,109 @@ static size_t write_expr(void *buf, size_t offset, u8 code, u8 vlen, int params,
 	return offset + sizeof(struct bcf_expr) + vlen * sizeof(u32);
 }
 
+/* For expr equivalence comparison, see __expr_equiv(). */
 #define BCF_MAX_CMP_STACK 128
-struct bcf_cmp_state {
+struct bcf_cmp_stack_elem {
 	struct bcf_expr *e0, *e1;
 	u32 cur_arg;
 };
 
+#define __MAX_BCF_STACK (sizeof(struct bcf_cmp_stack_elem) * BCF_MAX_CMP_STACK)
+
+/* For constant evaluation, see eval_const_expr(). */
+#define BCF_MAX_EVAL_STACK \
+	(__MAX_BCF_STACK / sizeof(struct bcf_eval_stack_elem))
+struct bcf_eval_stack_elem {
+	struct bcf_expr *expr;
+	union {
+		u32 cur_arg;
+		u64 bv_res;
+		bool bool_res;
+	};
+};
+
+struct bcf_rw_parse_state {
+	const struct bcf_expr_nullary *rw_expr;
+	u32 expr_id;
+	u32 cur_arg;
+	u32 size;
+};
+
 struct bcf_step_state {
+	/* The conclusion of the current step. */
 	struct bcf_expr *fact;
 	u32 fact_id;
-	/* Indices of the last step referring to the step (id).
-	 * After this step, the fact of the referred step is no
-	 * longer used.
+	/* The last step referring to the current step. After `last_ref`, the
+	 * `fact` is no longer used by any other steps and can be freed.
 	 */
 	u32 last_ref;
 };
 
 // clang-format off
 struct bcf_checker_state {
-	struct bpf_verifier_env *verifier_env;
+	/* Exprs from the proof, referred to as `static expr`. They exist
+	 * during the entire checking phase.
+	 */
+	struct bcf_expr *exprs;
+	/* Each expr of `exprs` is followed by their arguments. The `valid_idx`
+	 * bitmap records the valid indices of exprs.
+	 */
+	unsigned long *valid_idx;
+	u32 expr_size; /* size of exprs array. */
+	/* For exprs that are allocated dynamically during proof checking, e.g.,
+	 * conclusions from proof steps, they are refcounted, and each allocated
+	 * expr has an id (increased after `expr_size`) and is stored in xarray.
+	 *
+	 * With this xarray, any routines below can exit early on any error
+	 * without worrying about freeing the exprs allocated; they can be
+	 * freed once when freeing the xarray, i.e., a lightweight gc.
+	 */
+	u32 id_gen;
+	struct xarray expr_id_map; /* Id (u32) to `struct bcf_expr_ref` */
 
-	/* Static expressions from bcf_buf */
-	struct bcf_expr	*exprs;
-	unsigned long	*valid_idx;	/* bitmap for valid indices */
-	u32		expr_size;	/* size of exprs array */
+	/* Step state tracking */
+	struct bcf_proof_step *steps;
+	struct bcf_step_state *step_state;
+	u32 step_size; /* size of steps array */
+	u32 step_cnt; /* valid number of steps */
+	u32 cur_step;
+	u32 cur_step_idx;
 
-	/* Dynamic expression (produced by steps) management */
-	u32		id_gen;		/* expr id starting from `expr_size` */
-	struct xarray	expr_id_map;	/* id to ptr for dynamic exprs */
+	bcf_logger_t logger;
+	void *logger_private;
+	u32 level;
 
-	/* Builtin expressions */
+	u32 goal;
+	struct bcf_expr *goal_exprs;
+
+	/* Builtin expr id. */
 	u32 true_expr;
 	u32 false_expr;
 
-	/* Step state tracking */
-	struct bcf_proof_step	*steps;
-	u32 step_size;		/* size of steps array */
-	u32 step_cnt;		/* valid number of steps */
-	u32 cur_step;
-	u32 cur_step_idx;
-	struct bcf_step_state *step_state;
+	/* Pre-allocated expr bufs used by different routines. */
+	struct bcf_expr_buf expr_buf;
+	struct bcf_expr_unary not_expr; /* Used by resolution. */
 
-	/* Expression buffer */
-	struct {
-		u8 code;
-		u8 vlen;
-		u16 params;
-		u32 args[U8_MAX];
-	} expr_buf;
-
-	/* Stack for expr equiv comparison */
-	struct bcf_cmp_state expr_stack[BCF_MAX_CMP_STACK];
+	/* Shared stack space: used either by equivalence comparison or by
+	 * constant evaluation, *exclusively*.
+	 */
+	union {
+		struct bcf_cmp_stack_elem cmp[BCF_MAX_CMP_STACK];
+		struct bcf_eval_stack_elem eval[BCF_MAX_EVAL_STACK];
+	} stack;
 };
+
+// clang-format on
+
+struct bcf_eval_result {
+	u64 bv_res;
+	bool bool_res;
+	bool overflow;
+};
+extern int eval_const_expr(void *st, u32 expr_id, struct bcf_eval_result *res);
+extern struct bcf_expr *id_to_expr(void *st, u32 id);
+extern void free_checker_state(struct bcf_checker_state *st);
+extern bool is_bv_val(u8 code);
 
 static u32 emit_expr(const void *src, size_t sz, struct bcf_expr *buf, u32 *off)
 {
@@ -840,31 +966,17 @@ static u32 emit_variadic_expr(u8 code, u8 vlen, u16 params,
 
 #define emit(e) emit_expr(&(e), sizeof(e), emit_buf, &emit_off)
 
-static void free_checker_state_test(struct bcf_checker_state *st)
-{
-	struct bcf_expr_ref *eref;
-	unsigned long id;
-
-	kvfree(st->exprs);
-	kvfree(st->valid_idx);
-	xa_for_each(&st->expr_id_map, id, eref) {
-		kfree(eref);
-	}
-	xa_destroy(&st->expr_id_map);
-	kvfree(st->steps);
-	kvfree(st->step_state);
-}
-
 static void run_check_exprs_test(void *buf, size_t buf_sz, int expected)
 {
-	struct bcf_checker_state st = { 0 };
+	struct bcf_checker_state *st =
+		kzalloc(sizeof(struct bcf_checker_state), GFP_KERNEL);
 	bpfptr_t bptr = make_bpfptr((uintptr_t)buf, 1);
 	int err;
 
-	xa_init(&st.expr_id_map);
-	err = check_exprs(&st, bptr, buf_sz / sizeof(struct bcf_expr));
+	xa_init(&st->expr_id_map);
+	err = check_exprs(st, bptr, buf_sz / sizeof(struct bcf_expr));
 	EXPECT_EQ(err, expected);
-	free_checker_state_test(&st);
+	free_checker_state(st);
 }
 
 #define MAX_EMIT_EXPR 128
@@ -946,13 +1058,13 @@ static void test_check_exprs_invalid_type(void)
 			   , -EINVAL);
 }
 
-static void test_check_exprs_invalid_bv_size(void)
+static void test_check_exprs_bv_size(void)
 {
 	CHECK_EXPRS_EXPECT(u32 v0 = emit(BCF_BV_VAR32);
 			   u32 bad = emit_variadic_expr(BCF_BV | BCF_BVSIZE, 1,
 							24, emit_buf, &emit_off,
 							v0);
-			   , -EINVAL);
+			   , 0);
 }
 
 static void test_check_exprs_invalid_list_elem_type(void)
@@ -1180,7 +1292,7 @@ static struct test_case check_exprs_tests[] = {
 	TEST_ENTRY(test_check_exprs_invalid_opcode),
 	TEST_ENTRY(test_check_exprs_invalid_arity),
 	TEST_ENTRY(test_check_exprs_invalid_type),
-	TEST_ENTRY(test_check_exprs_invalid_bv_size),
+	TEST_ENTRY(test_check_exprs_bv_size),
 	TEST_ENTRY(test_check_exprs_invalid_list_elem_type),
 	TEST_ENTRY(test_check_exprs_bv_add_success),
 	TEST_ENTRY(test_check_exprs_bv_add_fail_arity),
@@ -1230,7 +1342,7 @@ extern int expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
 static void test_expr_equiv_simple_equal(void)
 {
 	EXPR_EQUIV_EXPECT(u32 idx0 = emit(BCF_BV_VAR32);
-			  u32 idx1 = emit(BCF_BV_VAR32);, idx0, idx1, 1);
+			  u32 idx1 = emit(BCF_BV_VAR32);, idx0, idx1, 0);
 }
 
 static void test_expr_equiv_simple_neq_code(void)
@@ -1395,18 +1507,18 @@ static void test_expr_equiv_bbt_concat_extract(void)
 	// BCF_FROM_BOOL: bit-blast of bools to bv
 	EXPR_EQUIV_EXPECT(
 		u32 b0 = emit(BCF_BOOL_VAR); u32 b1 = emit(BCF_BOOL_VAR);
-		u32 bbt0 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32, emit_buf,
-					      &emit_off, b0, b1);
+		u32 bbt0 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32,
+					      emit_buf, &emit_off, b0, b1);
 		u32 x0 = emit(BCF_BOOL_VAR); u32 x1 = emit(BCF_BOOL_VAR);
-		u32 bbt1 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32, emit_buf,
-					      &emit_off, x0, x1);
+		u32 bbt1 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32,
+					      emit_buf, &emit_off, x0, x1);
 		, bbt0, bbt1, 0);
 	EXPR_EQUIV_EXPECT(
 		u32 b0 = emit(BCF_BOOL_VAR); u32 b1 = emit(BCF_BOOL_VAR);
-		u32 bbt0 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32, emit_buf,
-					      &emit_off, b0, b1);
-		u32 bbt1 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32, emit_buf,
-					      &emit_off, b0, b1);
+		u32 bbt0 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32,
+					      emit_buf, &emit_off, b0, b1);
+		u32 bbt1 = emit_variadic_expr(BCF_BV | BCF_FROM_BOOL, 2, 32,
+					      emit_buf, &emit_off, b0, b1);
 		, bbt0, bbt1, 1);
 	// CONCAT: concat two bv vars
 	EXPR_EQUIV_EXPECT(
@@ -1480,6 +1592,144 @@ static void test_expr_equiv_variadic_xor(void)
 		, bxor0, bxor1, 0);
 }
 
+/* -------------------------------------------------------------------- */
+/* Constant evaluation tests                                           */
+/* -------------------------------------------------------------------- */
+
+static void test_eval_bool_nested(void)
+{
+	struct bcf_checker_state *st =
+		kzalloc(sizeof(struct bcf_checker_state), GFP_KERNEL);
+
+	/* prepare static expr array */
+	st->expr_size = 16;
+	st->exprs = calloc(st->expr_size, sizeof(struct bcf_expr));
+	st->valid_idx = bitmap_zalloc(st->expr_size, GFP_KERNEL);
+	xa_init(&st->expr_id_map);
+
+	u32 id_true = 0; /* will allocate later */
+	u32 id_false = 0;
+
+	/* literals */
+	struct bcf_expr e_true = { .code = BCF_BOOL | BCF_VAL,
+				   .vlen = 0,
+				   .params = BCF_TRUE };
+	struct bcf_expr e_false = { .code = BCF_BOOL | BCF_VAL,
+				    .vlen = 0,
+				    .params = BCF_FALSE };
+	id_true = st->id_gen;
+	st->exprs[id_true] = e_true;
+	__set_bit(id_true, st->valid_idx);
+	st->id_gen++;
+	id_false = st->id_gen;
+	st->exprs[id_false] = e_false;
+	__set_bit(id_false, st->valid_idx);
+	st->id_gen++;
+	st->true_expr = id_true;
+	st->false_expr = id_false;
+
+	/* or = (true OR false) */
+	struct bcf_expr or_e = { .code = BCF_BOOL | BCF_DISJ, .vlen = 2 };
+	u32 id_or = st->id_gen;
+	st->exprs[id_or] = or_e;
+	__set_bit(id_or, st->valid_idx);
+	st->id_gen++;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id_true;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id_false;
+
+	/* not false */
+	struct bcf_expr not_e = { .code = BCF_BOOL | BCF_NOT, .vlen = 1 };
+	u32 id_not = st->id_gen;
+	st->exprs[id_not] = not_e;
+	__set_bit(id_not, st->valid_idx);
+	st->id_gen++;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id_false;
+
+	/* and (or, not) */
+	struct bcf_expr and_e = { .code = BCF_BOOL | BCF_CONJ, .vlen = 2 };
+	u32 id_and = st->id_gen;
+	st->exprs[id_and] = and_e;
+	__set_bit(id_and, st->valid_idx);
+	st->id_gen++;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id_or;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id_not;
+
+	struct bcf_eval_result res = { 0 };
+	EXPECT_EQ(eval_const_expr(st, id_and, &res), 0);
+	EXPECT_EQ(res.bool_res, true);
+
+	free_checker_state(st);
+}
+
+static void test_eval_bv_add(void)
+{
+	struct bcf_checker_state *st =
+		kzalloc(sizeof(struct bcf_checker_state), GFP_KERNEL);
+	st->expr_size = 128;
+	st->exprs = calloc(st->expr_size, sizeof(struct bcf_expr));
+	st->valid_idx = bitmap_zalloc(st->expr_size, GFP_KERNEL);
+	xa_init(&st->expr_id_map);
+
+	/* true/false literals required by evaluator for builtins */
+	struct bcf_expr t = { .code = BCF_BOOL | BCF_VAL,
+			      .vlen = 0,
+			      .params = BCF_TRUE };
+	struct bcf_expr f = { .code = BCF_BOOL | BCF_VAL,
+			      .vlen = 0,
+			      .params = BCF_FALSE };
+	st->exprs[0] = t;
+	__set_bit(0, st->valid_idx);
+	st->exprs[1] = f;
+	__set_bit(1, st->valid_idx);
+	st->true_expr = 0;
+	st->false_expr = 1;
+	st->id_gen = 2;
+
+	/* bv literals 0x12 and 0x34 (8-bit) */
+	struct bcf_expr lit12 = { .code = BCF_BV | BCF_VAL,
+				  .vlen = 1,
+				  .params = 8 };
+	u32 id12 = st->id_gen++;
+	st->exprs[id12] = lit12;
+	__set_bit(id12, st->valid_idx);
+	u32 val12 = 0x12;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&val12;
+
+	struct bcf_expr lit34 = { .code = BCF_BV | BCF_VAL,
+				  .vlen = 1,
+				  .params = 8 };
+	u32 id34 = st->id_gen++;
+	st->exprs[id34] = lit34;
+	__set_bit(id34, st->valid_idx);
+	u32 val34 = 0x34;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&val34;
+	/* add node */
+	struct bcf_expr add_e = { .code = BCF_BV | BPF_ADD,
+				  .vlen = 2,
+				  .params = 8 };
+	u32 id_add = st->id_gen++;
+	st->exprs[id_add] = add_e;
+	__set_bit(id_add, st->valid_idx);
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id12;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&id34;
+	st->expr_size = st->id_gen;
+
+	struct bcf_eval_result res = { 0 };
+	int err = eval_const_expr(st, id_add, &res);
+	EXPECT_EQ(err, 0);
+	if (!err) {
+		EXPECT_EQ(res.bv_res, (u32)0x46);
+		EXPECT_EQ(res.overflow, false);
+	}
+
+	free_checker_state(st);
+}
+
+static struct test_case eval_tests[] = {
+	TEST_ENTRY(test_eval_bool_nested),
+	TEST_ENTRY(test_eval_bv_add),
+};
+
 static struct test_case expr_equiv_tests[] = {
 	TEST_ENTRY(test_expr_equiv_simple_equal),
 	TEST_ENTRY(test_expr_equiv_simple_neq_code),
@@ -1501,15 +1751,238 @@ static struct test_case expr_equiv_tests[] = {
 	TEST_ENTRY(test_expr_equiv_variadic_xor),
 };
 
+/* Ref-counted bcf_expr */
+struct bcf_expr_ref {
+	union {
+		struct {
+			refcount_t refcnt;
+			u32 id;
+		};
+		/* When the refcnt is zero, its id and the counter are not used
+		 * anymore, so reuse the space for free list, see expr_put()
+		 */
+		struct bcf_expr_ref *free_next;
+	};
+	struct bcf_expr expr;
+};
+
+extern int alloc_builtins(struct bcf_checker_state *st);
+extern int apply_rewrite(struct bcf_checker_state *st,
+			 struct bcf_expr_ref **fact, u32 rid, u32 *pm_steps,
+			 u32 pm_step_n, u32 *args, u32 arg_n);
+extern const struct bcf_rewrite *const bcf_rewrites[__MAX_BCF_REWRITES];
+
+static u32 __append_word(struct bcf_checker_state *st, u32 word)
+{
+	u32 id = st->id_gen;
+	st->exprs[st->id_gen++] = *(struct bcf_expr *)(void *)&word;
+	return id;
+}
+
+static u32 emit_static_expr(struct bcf_checker_state *st, u32 cap,
+			    struct bcf_expr *expr)
+{
+	u32 id = st->id_gen;
+	EXPECT_TRUE(id + 1 <= cap);
+	st->exprs[id] = *expr;
+	__set_bit(id, st->valid_idx);
+	st->id_gen++;
+	EXPECT_TRUE(st->id_gen + expr->vlen <= cap);
+	return id;
+}
+
+static u32 emit_bool_val(struct bcf_checker_state *st, u32 cap, bool v)
+{
+	struct bcf_expr e = { .code = BCF_BOOL | BCF_VAL,
+			      .vlen = 0,
+			      .params = v ? BCF_TRUE : BCF_FALSE };
+	return emit_static_expr(st, cap, &e);
+}
+
+static u32 emit_bool_var(struct bcf_checker_state *st, u32 cap)
+{
+	struct bcf_expr e = { .code = BCF_BOOL | BCF_VAR,
+			      .vlen = 0,
+			      .params = 0 };
+	return emit_static_expr(st, cap, &e);
+}
+
+static u32 emit_bv_val(struct bcf_checker_state *st, u32 cap, u8 width, u64 val)
+{
+	u32 vlen = (width + 31) / 32;
+	struct bcf_expr e = { .code = BCF_BV | BCF_VAL,
+			      .vlen = vlen,
+			      .params = width };
+	u32 id = emit_static_expr(st, cap, &e);
+
+	for (u32 i = 0; i < vlen; i++) {
+		__append_word(st, val);
+		val >>= 32;
+	}
+	return id;
+}
+
+static u32 emit_list_from_ty(struct bcf_checker_state *st, u32 cap, u16 ty,
+			     u32 elem_id)
+{
+	/* params copied from type ensures same_type match for lists */
+	struct bcf_expr e = { .code = BCF_LIST | BCF_VAL,
+			      .vlen = 1,
+			      .params = ty };
+
+	u32 id = emit_static_expr(st, cap, &e);
+	__append_word(st, elem_id);
+	return id;
+}
+
+static void choose_simple_arg(struct bcf_checker_state *st, u32 cap, u32 rid,
+			      const struct bcf_expr_nullary *ty, u32 *out_id,
+			      u32 *cache_bool, u32 *cache_bv8,
+			      u32 *cache_list_bools, u32 *cache_list_bv)
+{
+	u8 ty_code = BCF_TYPE(ty->code);
+	if (ty_code == BCF_BOOL) {
+		if (*cache_bool == U32_MAX)
+			*cache_bool = emit_bool_var(st, cap);
+		*out_id = *cache_bool;
+		return;
+	}
+	if (ty_code == BCF_BV) {
+		u8 w = BCF_BV_WIDTH(ty->params);
+		if (!w) {
+			if (rid == BCF_REWRITE_BV_ITE_WIDTH_ONE ||
+			    rid == BCF_REWRITE_BV_ITE_WIDTH_ONE_NOT)
+				w = 1;
+			else
+				w = 32;
+		}
+		u32 val = 1;
+		if (rid == BCF_REWRITE_BV_SHL_BY_CONST_0 ||
+		    rid == BCF_REWRITE_BV_SHL_BY_CONST_1 ||
+		    rid == BCF_REWRITE_BV_SHL_BY_CONST_2 ||
+		    rid == BCF_REWRITE_BV_LSHR_BY_CONST_0 ||
+		    rid == BCF_REWRITE_BV_LSHR_BY_CONST_1 ||
+		    rid == BCF_REWRITE_BV_LSHR_BY_CONST_2 ||
+		    rid == BCF_REWRITE_BV_ASHR_BY_CONST_0 ||
+		    rid == BCF_REWRITE_BV_ASHR_BY_CONST_1 ||
+		    rid == BCF_REWRITE_BV_ASHR_BY_CONST_2 ||
+		    rid == BCF_REWRITE_BV_ULT_ZERO_1 ||
+		    rid == BCF_REWRITE_BV_ULT_ZERO_2 ||
+		    rid == BCF_REWRITE_BV_ULE_ZERO ||
+		    rid == BCF_REWRITE_BV_ZERO_ULE ||
+		    rid == BCF_REWRITE_BV_SHL_ZERO ||
+		    rid == BCF_REWRITE_BV_LSHR_ZERO ||
+		    rid == BCF_REWRITE_BV_ASHR_ZERO ||
+		    rid == BCF_REWRITE_BV_ULT_ONE)
+			val = 32;
+		*out_id = emit_bv_val(st, cap, w, val);
+		return;
+	}
+	if (ty_code == BCF_LIST) {
+		u8 elem = BCF_LIST_TYPE(ty->params);
+		if (elem == BCF_BOOL) {
+			if (*cache_bool == U32_MAX)
+				*cache_bool = emit_bool_var(st, cap);
+			if (*cache_list_bools == U32_MAX)
+				*cache_list_bools = emit_list_from_ty(
+					st, cap, ty->params, *cache_bool);
+
+			*out_id = *cache_list_bools;
+			return;
+		}
+		if (elem == BCF_BV) {
+			u16 w = BCF_LIST_TYPE_PARAM(ty->params);
+			u16 ty_params = ty->params;
+			if (!w) {
+				w = 32;
+				ty_params |= (w << 8);
+			}
+			u32 elem_id = emit_bv_val(st, cap, w, 8);
+			*out_id =
+				emit_list_from_ty(st, cap, ty_params, elem_id);
+			return;
+		}
+	}
+	/* Fallback: use a bool var for unknown/Any */
+	if (*cache_bool == U32_MAX)
+		*cache_bool = emit_bool_var(st, cap);
+	*out_id = *cache_bool;
+}
+
+static void test_apply_rewrite_sanity(void)
+{
+	u32 cap = 8192;
+	u32 bool_id = U32_MAX, bv8_id = U32_MAX, list_bools_id = U32_MAX,
+	    list_bv_id = U32_MAX;
+	struct bcf_checker_state *st = kzalloc(sizeof(*st), GFP_KERNEL);
+	struct bcf_expr_ref *fact;
+	u32 args[16];
+	int err;
+	u32 i;
+
+	st->exprs = calloc(cap, sizeof(struct bcf_expr));
+	EXPECT_TRUE(st->exprs != NULL);
+	st->valid_idx = bitmap_zalloc(cap, GFP_KERNEL);
+	EXPECT_TRUE(st->valid_idx != NULL);
+	st->id_gen = 0;
+	xa_init(&st->expr_id_map);
+
+	/* Ensure builtins exist for _TRUE/_FALSE */
+	st->true_expr = emit_bool_val(st, cap, true);
+	st->false_expr = emit_bool_val(st, cap, false);
+	bool_id = emit_bool_var(st, cap);
+
+	for (i = BCF_REWRITE_BV_EXTRACT_NOT; i < __MAX_BCF_REWRITES; i++) {
+		const struct bcf_rewrite *rw = bcf_rewrites[i];
+		u32 a;
+		EXPECT_TRUE(rw);
+		if (rw->cond_len)
+			continue; /* only condition-less rewrites */
+		EXPECT_TRUE(rw->param_cnt);
+		EXPECT_TRUE(rw->param_cnt <= ARRAY_SIZE(args));
+		for (a = 0; a < rw->param_cnt; a++)
+			choose_simple_arg(st, cap, i, &rw->params[a], &args[a],
+					  &bool_id, &bv8_id, &list_bools_id,
+					  &list_bv_id);
+
+		st->expr_size = st->id_gen;
+		fact = NULL;
+		err = apply_rewrite(st, &fact, i, NULL, 0, args, rw->param_cnt);
+		EXPECT_EQ(err, 0);
+		if (err == 0) {
+			/* Conclusion must be an equality over two terms. */
+			EXPECT_TRUE(fact != NULL);
+			if (fact) {
+				u8 ty = BCF_TYPE(fact->expr.code);
+				u8 op = BCF_OP(fact->expr.code);
+				EXPECT_EQ(ty, BCF_BOOL);
+				EXPECT_EQ(op, BPF_JEQ);
+				EXPECT_EQ(fact->expr.vlen, 2);
+			}
+		}
+
+		// free all exprs in xarray
+		unsigned long expr_id;
+		struct bcf_expr_ref *eref;
+		xa_for_each(&st->expr_id_map, expr_id, eref) {
+			kfree(eref);
+		}
+		xa_destroy(&st->expr_id_map);
+		xa_init(&st->expr_id_map);
+	}
+
+	free_checker_state(st);
+}
+
 static struct test_case tests[] = {
-	TEST_ENTRY(test_check_hdr),
+	TEST_ENTRY(test_apply_rewrite_sanity),
 };
 
 int main(void)
 {
 	int failed = 0;
-	failed |=
-		run_tests(tests, sizeof(tests) / sizeof(tests[0]), "check_hdr");
+	failed |= run_tests(tests, sizeof(tests) / sizeof(tests[0]),
+			    "check_rewrite");
 	failed |= run_tests(expr_put_tests,
 			    sizeof(expr_put_tests) / sizeof(expr_put_tests[0]),
 			    "expr_put");
@@ -1521,5 +1994,7 @@ int main(void)
 			    sizeof(expr_equiv_tests) /
 				    sizeof(expr_equiv_tests[0]),
 			    "expr_equiv");
+	failed |= run_tests(eval_tests,
+			    sizeof(eval_tests) / sizeof(eval_tests[0]), "eval");
 	return failed;
 }

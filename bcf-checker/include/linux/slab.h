@@ -12,6 +12,7 @@
 #define kzalloc_node(size, flags, node) kmalloc(size, flags)
 
 void *kmalloc(size_t size, gfp_t gfp);
+void *krealloc(void *p, size_t new_size, gfp_t flags);
 void kfree(void *p);
 void *kmalloc_array(size_t n, size_t size, gfp_t gfp);
 

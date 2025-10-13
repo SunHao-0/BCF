@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __LINUX_STRINGIFY_H
 #define __LINUX_STRINGIFY_H
 
@@ -9,5 +8,7 @@
 
 #define __stringify_1(x...)	#x
 #define __stringify(x...)	__stringify_1(x)
+
+#define FILE_LINE	__FILE__ ":" __stringify(__LINE__)
 
 #endif	/* !__LINUX_STRINGIFY_H */

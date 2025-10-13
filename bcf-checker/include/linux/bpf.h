@@ -2,6 +2,6 @@
 #define __LINUX_BPF_H__
 
 #include <linux/types.h>
-#include <linux/bcf.h>
+#include <uapi/linux/bpf.h>
 
 #endif // __LINUX_BPF_H__

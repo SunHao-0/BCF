@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 #ifndef __SANE_USERSPACE_TYPES__
-#define __SANE_USERSPACE_TYPES__	/* For PPC64, to get LL64 types */
+#define __SANE_USERSPACE_TYPES__ /* For PPC64, to get LL64 types */
 #endif
 
 #include <asm/types.h>
@@ -16,12 +16,7 @@
 struct page;
 struct kmem_cache;
 
-typedef enum {
-	GFP_KERNEL,
-	GFP_ATOMIC,
-	__GFP_HIGHMEM,
-	__GFP_HIGH
-} gfp_t;
+typedef enum { GFP_KERNEL, GFP_ATOMIC, __GFP_HIGHMEM, __GFP_HIGH } gfp_t;
 
 /*
  * We define u64 as uint64_t for every architecture
@@ -39,20 +34,19 @@ typedef __s32 s32;
 typedef __u16 u16;
 typedef __s16 s16;
 
-typedef __u8  u8;
-typedef __s8  s8;
+typedef __u8 u8;
+typedef __s8 s8;
 
-typedef unsigned long long	ullong;
+typedef unsigned long long ullong;
 
 #ifdef __CHECKER__
-#define __bitwise	__attribute__((bitwise))
+#define __bitwise __attribute__((bitwise))
 #else
 #define __bitwise
 #endif
 
-
-#define __must_check  __attribute__((__warn_unused_result__))
-#define __cold
+#define __must_check __attribute__((__warn_unused_result__))
+// #define __cold
 
 typedef __u16 __bitwise __le16;
 typedef __u16 __bitwise __be16;
@@ -75,7 +69,7 @@ typedef struct {
 } atomic_long_t;
 
 #ifndef __aligned_u64
-# define __aligned_u64 __u64 __attribute__((aligned(8)))
+#define __aligned_u64 __u64 __attribute__((aligned(8)))
 #endif
 
 struct list_head {
@@ -92,7 +86,6 @@ struct hlist_node {
 
 #define EXPORT_SYMBOL(sym)
 
-
 typedef void (*swap_r_func_t)(void *a, void *b, int size, const void *priv);
 typedef void (*swap_func_t)(void *a, void *b, int size);
 
@@ -100,4 +93,3 @@ typedef int (*cmp_r_func_t)(const void *a, const void *b, const void *priv);
 typedef int (*cmp_func_t)(const void *a, const void *b);
 
 #endif /* _TOOLS_LINUX_TYPES_H_ */
-

@@ -1,44 +1,53 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef __TOOLS_LINUX_KERNEL_H
-#define __TOOLS_LINUX_KERNEL_H
+#ifndef _LINUX_KERNEL_H
+#define _LINUX_KERNEL_H
 
-#include <stdarg.h>
-#include <stddef.h>
 #include <linux/build_bug.h>
 #include <linux/compiler.h>
 #include <linux/math.h>
+#include <linux/math64.h>
+#include <linux/stringify.h>
+#include <linux/args.h>
 #include <linux/panic.h>
+#include <linux/printk.h>
+#include <linux/stdarg.h>
+#include <linux/stddef.h>
+#include <linux/log2.h>
 #include <endian.h>
 #include <byteswap.h>
 #include <linux/container_of.h>
 
 #ifndef UINT_MAX
-#define UINT_MAX	(~0U)
+#define UINT_MAX (~0U)
 #endif
 
-#define _RET_IP_		((unsigned long)__builtin_return_address(0))
+#define _RET_IP_ ((unsigned long)__builtin_return_address(0))
 
-#define PERF_ALIGN(x, a)	__PERF_ALIGN_MASK(x, (typeof(x))(a)-1)
-#define __PERF_ALIGN_MASK(x, mask)	(((x)+(mask))&~(mask))
+#define PERF_ALIGN(x, a) __PERF_ALIGN_MASK(x, (typeof(x))(a) - 1)
+#define __PERF_ALIGN_MASK(x, mask) (((x) + (mask)) & ~(mask))
 
 #ifndef offsetof
-#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+#define offsetof(TYPE, MEMBER) ((size_t) & ((TYPE *)0)->MEMBER)
 #endif
 
 #ifndef max
-#define max(x, y) ({				\
-	typeof(x) _max1 = (x);			\
-	typeof(y) _max2 = (y);			\
-	(void) (&_max1 == &_max2);		\
-	_max1 > _max2 ? _max1 : _max2; })
+#define max(x, y)                              \
+	({                                     \
+		typeof(x) _max1 = (x);         \
+		typeof(y) _max2 = (y);         \
+		(void)(&_max1 == &_max2);      \
+		_max1 > _max2 ? _max1 : _max2; \
+	})
 #endif
 
 #ifndef min
-#define min(x, y) ({				\
-	typeof(x) _min1 = (x);			\
-	typeof(y) _min2 = (y);			\
-	(void) (&_min1 == &_min2);		\
-	_min1 < _min2 ? _min1 : _min2; })
+#define min(x, y)                              \
+	({                                     \
+		typeof(x) _min1 = (x);         \
+		typeof(y) _min2 = (y);         \
+		(void)(&_min1 == &_min2);      \
+		_min1 < _min2 ? _min1 : _min2; \
+	})
 #endif
 
 /**
@@ -46,21 +55,33 @@
  * @a: first value
  * @b: second value
  */
-#define swap(a, b) \
-	do { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; } while (0)
+#define swap(a, b)                     \
+	do {                           \
+		typeof(a) __tmp = (a); \
+		(a) = (b);             \
+		(b) = __tmp;           \
+	} while (0)
 
-#define max_t(type, x, y)	max((type)x, (type)y)
-#define min_t(type, x, y)	min((type)x, (type)y)
-#define clamp(val, lo, hi)	min((typeof(val))max(val, lo), hi)
+#define max_t(type, x, y) max((type)x, (type)y)
+#define min_t(type, x, y) min((type)x, (type)y)
+#define clamp(val, lo, hi) min((typeof(val))max(val, lo), hi)
 
 #ifndef BUG_ON
 #ifdef NDEBUG
-#define BUG_ON(cond) do { if (cond) {} } while (0)
+#define BUG_ON(cond)        \
+	do {                \
+		if (cond) { \
+		}           \
+	} while (0)
 #else
-#define BUG_ON(cond) do { if (cond) abort(); } while (0)
+#define BUG_ON(cond)             \
+	do {                     \
+		if (cond)        \
+			abort(); \
+	} while (0)
 #endif
 #endif
-#define BUG()	BUG_ON(1)
+#define BUG() BUG_ON(1)
 
 #if __BYTE_ORDER == __BIG_ENDIAN
 #define cpu_to_le16 bswap_16
@@ -91,8 +112,8 @@
 #endif
 
 int vscnprintf(char *buf, size_t size, const char *fmt, va_list args);
-int scnprintf(char * buf, size_t size, const char * fmt, ...);
-int scnprintf_pad(char * buf, size_t size, const char * fmt, ...);
+int scnprintf(char *buf, size_t size, const char *fmt, ...);
+int scnprintf_pad(char *buf, size_t size, const char *fmt, ...);
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))

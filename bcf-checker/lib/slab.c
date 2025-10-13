@@ -40,6 +40,16 @@ void *kmalloc(size_t size, gfp_t gfp)
 	return ret;
 }
 
+void *krealloc(void *p, size_t new_size, gfp_t gfp)
+{
+	void *ret;
+
+	ret = realloc(p, new_size);
+	if (gfp & __GFP_ZERO)
+		memset(ret, 0, new_size);
+	return ret;
+}
+
 void kfree(void *p)
 {
 	if (!p)
