@@ -1,0 +1,2149 @@
+From 2d1317fe4c71a953f3803011f157e44d61dfa32e Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 13 Oct 2025 09:47:05 +0200
+Subject: [PATCH] proof: Add bcf proof format support
+
+Teach cvc5 to dump proof in bcf binary format.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/cvc5/cvc5_types.h      |    2 +
+ src/CMakeLists.txt             |    3 +
+ src/options/proof_options.toml |   12 +
+ src/proof/bcf/bcf_defs.h       |  508 +++++++++++++
+ src/proof/bcf/bcf_printer.cpp  | 1298 ++++++++++++++++++++++++++++++++
+ src/proof/bcf/bcf_printer.h    |  209 +++++
+ src/smt/proof_manager.cpp      |    6 +
+ src/smt/solver_engine.cpp      |    1 +
+ 8 files changed, 2039 insertions(+)
+ create mode 100644 src/proof/bcf/bcf_defs.h
+ create mode 100644 src/proof/bcf/bcf_printer.cpp
+ create mode 100644 src/proof/bcf/bcf_printer.h
+
+diff --git a/include/cvc5/cvc5_types.h b/include/cvc5/cvc5_types.h
+index 1897cab6f..f4a8114e9 100644
+--- a/include/cvc5/cvc5_types.h
++++ b/include/cvc5/cvc5_types.h
+@@ -484,6 +484,8 @@ enum ENUM(ProofFormat)
+   EVALUE(ALETHE),
+   /** Output Cooperating Proof Calculus proof based on Eunoia signatures. */
+   EVALUE(CPC),
++  /** Output BCF proof. */
++  EVALUE(BCF),
+   /** Use the proof format mode set in the solver options. */
+   EVALUE(DEFAULT),
+ #ifdef CVC5_API_USE_C_ENUMS
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 0a16e9c85..93a7c1964 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -248,6 +248,9 @@ libcvc5_add_sources(
+   proof/alethe/alethe_printer.cpp
+   proof/alethe/alethe_proof_rule.cpp
+   proof/alethe/alethe_proof_rule.h
++  proof/bcf/bcf_printer.cpp
++  proof/bcf/bcf_printer.h
++  proof/bcf/bcf_defs.h
+   prop/cadical.cpp
+   prop/cadical.h
+   prop/cnf_stream.cpp
+diff --git a/src/options/proof_options.toml b/src/options/proof_options.toml
+index b3c517734..dc3d9357e 100644
+--- a/src/options/proof_options.toml
++++ b/src/options/proof_options.toml
+@@ -24,6 +24,9 @@ name   = "Proof"
+ [[option.mode.CPC]]
+   name       = "cpc"
+   help       = "Output Cooperating Proof Calculus proof"
++[[option.mode.BCF]]
++  name       = "bcf"
++  help       = "Output BCF proof"
+ 
+ [[option]]
+   name       = "proofPrintConclusion"
+@@ -277,3 +280,12 @@ name   = "Proof"
+   type       = "uint64_t"
+   default    = "2"
+   help       = "the lookahead depth for merging proofs at previsit"
++
++[[option]]
++  name       = "bcfProofOut"
++  category   = "expert"
++  long       = "bcf-proof-out=output"
++  type       = "ManagedOut"
++  default    = "ManagedOut()"
++  includes   = ["<iostream>", "options/managed_streams.h"]
++  help       = "set the output channel for writing BCF proofs"
+\ No newline at end of file
+diff --git a/src/proof/bcf/bcf_defs.h b/src/proof/bcf/bcf_defs.h
+new file mode 100644
+index 000000000..040951893
+--- /dev/null
++++ b/src/proof/bcf/bcf_defs.h
+@@ -0,0 +1,508 @@
++/******************************************************************************
++ * Top contributors (to current version):
++ *   Hao Sun <hao.sun@inf.ethz.ch>
++ *
++ * This file is part of the cvc5 project.
++ *
++ * Copyright (c) 2009-2025 by the authors listed in the file AUTHORS
++ * in the top-level source directory and their institutional affiliations.
++ * All rights reserved.  See the file COPYING in the top-level source
++ * directory for licensing information.
++ * ****************************************************************************
++ *
++ * The definitions for the BCF format.
++ */
++#ifndef CVC5__PROOF__BCF__BCF_DEFS_H
++#define CVC5__PROOF__BCF__BCF_DEFS_H
++
++// clang-format off
++namespace cvc5::internal {
++namespace proof {
++
++/* Instruction classes */
++#define BPF_CLASS(code) ((code) & 0x07)
++#define		BPF_LD		0x00
++#define		BPF_LDX		0x01
++#define		BPF_ST		0x02
++#define		BPF_STX		0x03
++#define		BPF_ALU		0x04
++#define		BPF_JMP		0x05
++#define		BPF_RET		0x06
++#define		BPF_MISC        0x07
++
++/* ld/ldx fields */
++#define BPF_SIZE(code)  ((code) & 0x18)
++#define		BPF_W		0x00 /* 32-bit */
++#define		BPF_H		0x08 /* 16-bit */
++#define		BPF_B		0x10 /*  8-bit */
++/* eBPF		BPF_DW		0x18    64-bit */
++#define BPF_MODE(code)  ((code) & 0xe0)
++#define		BPF_IMM		0x00
++#define		BPF_ABS		0x20
++#define		BPF_IND		0x40
++#define		BPF_MEM		0x60
++#define		BPF_LEN		0x80
++#define		BPF_MSH		0xa0
++
++/* alu/jmp fields */
++#define BPF_OP(code)    ((code) & 0xf0)
++#define		BPF_ADD		0x00
++#define		BPF_SUB		0x10
++#define		BPF_MUL		0x20
++#define		BPF_DIV		0x30
++#define		BPF_OR		0x40
++#define		BPF_AND		0x50
++#define		BPF_LSH		0x60
++#define		BPF_RSH		0x70
++#define		BPF_NEG		0x80
++#define		BPF_MOD		0x90
++#define		BPF_XOR		0xa0
++
++#define		BPF_JA		0x00
++#define		BPF_JEQ		0x10
++#define		BPF_JGT		0x20
++#define		BPF_JGE		0x30
++#define		BPF_JSET        0x40
++#define BPF_SRC(code)   ((code) & 0x08)
++#define		BPF_K		0x00
++#define		BPF_X		0x08
++
++#ifndef BPF_MAXINSNS
++#define BPF_MAXINSNS 4096
++#endif
++
++/* Extended instruction set based on top of classic BPF */
++
++/* instruction classes */
++#define BPF_JMP32	0x06	/* jmp mode in word width */
++#define BPF_ALU64	0x07	/* alu mode in double word width */
++
++/* ld/ldx fields */
++#define BPF_DW		0x18	/* double word (64-bit) */
++#define BPF_MEMSX	0x80	/* load with sign extension */
++#define BPF_ATOMIC	0xc0	/* atomic memory ops - op type in immediate */
++#define BPF_XADD	0xc0	/* exclusive add - legacy name */
++
++/* alu/jmp fields */
++#define BPF_MOV		0xb0	/* mov reg to reg */
++#define BPF_ARSH	0xc0	/* sign extending arithmetic shift right */
++
++/* change endianness of a register */
++#define BPF_END		0xd0	/* flags for endianness conversion: */
++#define BPF_TO_LE	0x00	/* convert to little-endian */
++#define BPF_TO_BE	0x08	/* convert to big-endian */
++#define BPF_FROM_LE	BPF_TO_LE
++#define BPF_FROM_BE	BPF_TO_BE
++
++/* jmp encodings */
++#define BPF_JNE		0x50	/* jump != */
++#define BPF_JLT		0xa0	/* LT is unsigned, '<' */
++#define BPF_JLE		0xb0	/* LE is unsigned, '<=' */
++#define BPF_JSGT	0x60	/* SGT is signed '>', GT in x86 */
++#define BPF_JSGE	0x70	/* SGE is signed '>=', GE in x86 */
++#define BPF_JSLT	0xc0	/* SLT is signed, '<' */
++#define BPF_JSLE	0xd0	/* SLE is signed, '<=' */
++#define BPF_JCOND	0xe0	/* conditional pseudo jumps: may_goto, goto_or_nop */
++#define BPF_CALL	0x80	/* function call */
++#define BPF_EXIT	0x90	/* function return */
++
++/* atomic op type fields (stored in immediate) */
++#define BPF_FETCH	0x01	/* not an opcode on its own, used to build others */
++#define BPF_XCHG	(0xe0 | BPF_FETCH)	/* atomic exchange */
++#define BPF_CMPXCHG	(0xf0 | BPF_FETCH)	/* atomic compare-and-write */
++
++enum bpf_cond_pseudo_jmp {
++	BPF_MAY_GOTO = 0,
++};
++
++/* Register numbers */
++enum {
++	BPF_REG_0 = 0,
++	BPF_REG_1,
++	BPF_REG_2,
++	BPF_REG_3,
++	BPF_REG_4,
++	BPF_REG_5,
++	BPF_REG_6,
++	BPF_REG_7,
++	BPF_REG_8,
++	BPF_REG_9,
++	BPF_REG_10,
++	__MAX_BPF_REG,
++};
++
++/* BPF has 10 general purpose 64-bit registers and stack frame. */
++#define MAX_BPF_REG	__MAX_BPF_REG
++
++#if !defined(__u8) || !defined(__u16) || !defined(__u32)
++#include <stdint.h>
++#endif
++
++#ifndef __u8
++typedef uint8_t __u8;
++#endif
++
++#ifndef __u16
++typedef uint16_t __u16;
++#endif
++
++#ifndef __u32
++typedef uint32_t __u32;
++#endif
++
++/* Expression Types */
++#define BCF_TYPE(code)	((code) & 0x07)
++#define BCF_BV		0x00 /* Bitvector */
++#define BCF_BOOL	0x01 /* Boolean */
++#define BCF_LIST	0x02 /* List of vals */
++#define __MAX_BCF_TYPE	0x03
++
++#define BCF_OP(code)	((code) & 0xf8)
++/* Common Operations */
++#define BCF_VAL	0x08 /* Value/Constant */
++#define BCF_VAR	0x18 /* Variable */
++#define BCF_ITE	0x28 /* If-Then-Else */
++
++/* Bitvector Operations */
++#define BCF_SDIV	0xb0
++#define BCF_SMOD	0xd0
++#define BCF_EXTRACT	0x38 /* Bitvector extraction */
++#define BCF_SIGN_EXTEND 0x48 /* Sign extension */
++#define BCF_ZERO_EXTEND 0x58 /* Zero extension */
++#define BCF_BVSIZE	0x68 /* Bitvector size */
++#define BCF_BVNOT	0x78 /* Bitvector not */
++#define BCF_FROM_BOOL	0x88 /* Bool list to Bitvector */
++#define BCF_CONCAT	0x98 /* Concatenation */
++#define BCF_REPEAT	0xa8 /* Bitvector repeat */
++
++/* Boolean Operations */
++#define BCF_CONJ	0x00 /* Conjunction (AND) */
++#define BCF_DISJ	0x40 /* Disjunction (OR) */
++#define BCF_DISTINCT	0x50 /* Distinct predicate */
++#define BCF_NOT		0x80 /* Negation */
++#define BCF_IMPLIES	0x90 /* Implication */
++#define BCF_XOR		0x38 /* Exclusive OR */
++#define BCF_BITOF	0x48 /* Bitvector to Boolean */
++
++/* Boolean Literals/Vals */
++#define BCF_FALSE	0x00
++#define BCF_TRUE	0x01
++
++/*
++ * struct bcf_expr - BCF expression structure
++ * @code: Operation code (operation | type)
++ * @vlen: Argument count
++ * @params: Operation parameters
++ * @args: Argument indices
++ *
++ * Parameter encoding by type:
++ * - Bitvector: [7:0] bit width, except:
++ *	- [15:8] and [7:0] extract `start` and `end` for EXTRACT;
++ *	- [15:8] repeat count for REPEAT;
++ *	- [15:8] extension size for SIGN/ZERO_EXTEND
++ * - Boolean:
++ *	- [0] literal value for constants;
++ *	- [7:0] bit index for BITOF.
++ * - List: element type encoding:
++ *	- [7:0] for types;
++ *	- [15:8] for type parameters, e.g., bit width.
++ */
++struct bcf_expr {
++	__u8	code;
++	__u8	vlen;
++	__u16	params;
++	// u32 args[];
++};
++
++#define BCF_PARAM_LOW(p)	((p) & 0xff)
++#define BCF_PARAM_HIGH(p)	(((p) >> 8) & 0xff)
++
++/* Operation-specific parameter meanings */
++#define BCF_BV_WIDTH(p)		BCF_PARAM_LOW(p)
++#define BCF_EXT_LEN(p)		BCF_PARAM_HIGH(p)
++#define BCF_EXTRACT_START(p)	BCF_PARAM_HIGH(p)
++#define BCF_EXTRACT_END(p)	BCF_PARAM_LOW(p)
++#define BCF_REPEAT_N(p)		BCF_PARAM_HIGH(p)
++#define BCF_BOOL_LITERAL(p)	((p) & 1)
++#define BCF_BITOF_BIT(p)	BCF_PARAM_LOW(p)
++#define BCF_LIST_TYPE(p)	BCF_PARAM_LOW(p)
++#define BCF_LIST_TYPE_PARAM(p)	BCF_PARAM_HIGH(p)
++
++/* BCF proof format definitions */
++#define BCF_MAGIC	0x0BCF
++
++struct bcf_proof_header {
++	__u32	magic;
++	__u32	expr_cnt;
++	__u32	step_cnt;
++};
++
++/**
++ * struct bcf_proof_step - Proof step
++ * @rule: Rule identifier (class | rule)
++ * @premise_cnt: Number of premises
++ * @param_cnt: Number of parameters
++ * @args: Arguments (premises followed by parameters)
++ */
++struct bcf_proof_step {
++	__u16	rule;
++	__u8	premise_cnt;
++	__u8	param_cnt;
++	// __u32	args[];
++};
++
++/* Rule Class */
++#define BCF_RULE_CLASS(r)	((r) & 0xe000)
++#define BCF_RULE_CORE		0x0000
++#define BCF_RULE_BOOL		0x2000
++#define BCF_RULE_BV		0x4000
++
++#define BCF_STEP_RULE(r)	((r) & 0x1fff)
++
++/* Core proof rules */
++#define BCF_CORE_RULES(FN)  \
++	FN(ASSUME)          \
++	FN(EVALUATE)        \
++	FN(DISTINCT_VALUES) \
++	FN(ACI_NORM)        \
++	FN(ABSORB)          \
++	FN(REWRITE)         \
++	FN(REFL)            \
++	FN(SYMM)            \
++	FN(TRANS)           \
++	FN(CONG)            \
++	FN(TRUE_INTRO)      \
++	FN(TRUE_ELIM)       \
++	FN(FALSE_INTRO)     \
++	FN(FALSE_ELIM)
++
++#define BCF_RULE_NAME(x) BCF_RULE_##x
++#define BCF_RULE_ENUM_VARIANT(x) BCF_RULE_NAME(x),
++
++enum bcf_core_rule {
++	BCF_RULE_CORE_UNSPEC = 0,
++	BCF_CORE_RULES(BCF_RULE_ENUM_VARIANT)
++	__MAX_BCF_CORE_RULES,
++};
++
++/* Boolean proof rules */
++#define BCF_BOOL_RULES(FN)   \
++	FN(RESOLUTION)       \
++	FN(FACTORING)        \
++	FN(REORDERING)       \
++	FN(SPLIT)            \
++	FN(EQ_RESOLVE)       \
++	FN(MODUS_PONENS)     \
++	FN(NOT_NOT_ELIM)     \
++	FN(CONTRA)           \
++	FN(AND_ELIM)         \
++	FN(AND_INTRO)        \
++	FN(NOT_OR_ELIM)      \
++	FN(IMPLIES_ELIM)     \
++	FN(NOT_IMPLIES_ELIM) \
++	FN(EQUIV_ELIM)       \
++	FN(NOT_EQUIV_ELIM)   \
++	FN(XOR_ELIM)         \
++	FN(NOT_XOR_ELIM)     \
++	FN(ITE_ELIM)         \
++	FN(NOT_ITE_ELIM)     \
++	FN(NOT_AND)          \
++	FN(CNF_AND_POS)      \
++	FN(CNF_AND_NEG)      \
++	FN(CNF_OR_POS)       \
++	FN(CNF_OR_NEG)       \
++	FN(CNF_IMPLIES_POS)  \
++	FN(CNF_IMPLIES_NEG)  \
++	FN(CNF_EQUIV_POS)    \
++	FN(CNF_EQUIV_NEG)    \
++	FN(CNF_XOR_POS)      \
++	FN(CNF_XOR_NEG)      \
++	FN(CNF_ITE_POS)      \
++	FN(CNF_ITE_NEG)      \
++	FN(ITE_EQ)
++
++enum bcf_bool_rule {
++	BCF_RULE_BOOL_UNSPEC = 0,
++	BCF_BOOL_RULES(BCF_RULE_ENUM_VARIANT)
++	__MAX_BCF_BOOL_RULES,
++};
++
++/* Bitvector proof rules */
++#define BCF_BV_RULES(FN) \
++	FN(BITBLAST)     \
++	FN(POLY_NORM)    \
++	FN(POLY_NORM_EQ)
++
++enum bcf_bv_rule {
++	BCF_RULE_BV_UNSPEC = 0,
++	BCF_BV_RULES(BCF_RULE_ENUM_VARIANT)
++	__MAX_BCF_BV_RULES,
++};
++#undef BCF_RULE_ENUM_VARIANT
++
++#define BCF_REWRITE_NAME(x)	BCF_REWRITE_##x
++#define BCF_REWRITES_TABLE(FN)		\
++	FN(EQ_REFL)			\
++	FN(EQ_SYMM)			\
++	FN(EQ_COND_DEQ)			\
++	FN(EQ_ITE_LIFT)			\
++	FN(DISTINCT_BINARY_ELIM)	\
++	FN(ITE_TRUE_COND)		\
++	FN(ITE_FALSE_COND)		\
++	FN(ITE_NOT_COND)		\
++	FN(ITE_EQ_BRANCH)		\
++	FN(ITE_THEN_LOOKAHEAD)		\
++	FN(ITE_ELSE_LOOKAHEAD)		\
++	FN(ITE_THEN_NEG_LOOKAHEAD)	\
++	FN(ITE_ELSE_NEG_LOOKAHEAD)	\
++	FN(BOOL_DOUBLE_NOT_ELIM)	\
++	FN(BOOL_NOT_TRUE)		\
++	FN(BOOL_NOT_FALSE)		\
++	FN(BOOL_EQ_TRUE)		\
++	FN(BOOL_EQ_FALSE)		\
++	FN(BOOL_EQ_NREFL)		\
++	FN(BOOL_IMPL_FALSE1)		\
++	FN(BOOL_IMPL_FALSE2)		\
++	FN(BOOL_IMPL_TRUE1)		\
++	FN(BOOL_IMPL_TRUE2)		\
++	FN(BOOL_IMPL_ELIM)		\
++	FN(BOOL_DUAL_IMPL_EQ)		\
++	FN(BOOL_AND_CONF)		\
++	FN(BOOL_AND_CONF2)		\
++	FN(BOOL_OR_TAUT)		\
++	FN(BOOL_OR_TAUT2)		\
++	FN(BOOL_IMPLIES_DE_MORGAN)	\
++	FN(BOOL_XOR_REFL)		\
++	FN(BOOL_XOR_NREFL)		\
++	FN(BOOL_XOR_FALSE)		\
++	FN(BOOL_XOR_TRUE)		\
++	FN(BOOL_XOR_COMM)		\
++	FN(BOOL_XOR_ELIM)		\
++	FN(BOOL_NOT_XOR_ELIM)		\
++	FN(BOOL_NOT_EQ_ELIM1)		\
++	FN(BOOL_NOT_EQ_ELIM2)		\
++	FN(ITE_NEG_BRANCH)		\
++	FN(ITE_THEN_TRUE)		\
++	FN(ITE_ELSE_FALSE)		\
++	FN(ITE_THEN_FALSE)		\
++	FN(ITE_ELSE_TRUE)		\
++	FN(ITE_THEN_LOOKAHEAD_SELF)	\
++	FN(ITE_ELSE_LOOKAHEAD_SELF)	\
++	FN(ITE_THEN_LOOKAHEAD_NOT_SELF)	\
++	FN(ITE_ELSE_LOOKAHEAD_NOT_SELF)	\
++	FN(ITE_EXPAND)			\
++	FN(BOOL_NOT_ITE_ELIM)		\
++	FN(BV_CONCAT_EXTRACT_MERGE)	\
++	FN(BV_EXTRACT_EXTRACT)		\
++	FN(BV_EXTRACT_WHOLE)		\
++	FN(BV_EXTRACT_CONCAT_1)		\
++	FN(BV_EXTRACT_CONCAT_2)		\
++	FN(BV_EXTRACT_CONCAT_3)		\
++	FN(BV_EXTRACT_CONCAT_4)		\
++	FN(BV_EQ_EXTRACT_ELIM1)		\
++	FN(BV_EQ_EXTRACT_ELIM2)		\
++	FN(BV_EQ_EXTRACT_ELIM3)		\
++	FN(BV_EXTRACT_NOT)		\
++	FN(BV_EXTRACT_SIGN_EXTEND_1)	\
++	FN(BV_EXTRACT_SIGN_EXTEND_2)	\
++	FN(BV_EXTRACT_SIGN_EXTEND_3)	\
++	FN(BV_NOT_XOR)			\
++	FN(BV_AND_SIMPLIFY_1)		\
++	FN(BV_AND_SIMPLIFY_2)		\
++	FN(BV_OR_SIMPLIFY_1)		\
++	FN(BV_OR_SIMPLIFY_2)		\
++	FN(BV_XOR_SIMPLIFY_2)		\
++	FN(BV_XOR_SIMPLIFY_3)		\
++	FN(BV_ULT_ADD_ONE)		\
++	FN(BV_MULT_SLT_MULT_1)		\
++	FN(BV_MULT_SLT_MULT_2)		\
++	FN(BV_COMMUTATIVE_XOR)		\
++	FN(BV_ZERO_EXTEND_ELIMINATE_0)	\
++	FN(BV_SIGN_EXTEND_ELIMINATE_0)	\
++	FN(BV_NOT_NEQ)			\
++	FN(BV_ULT_ONES)			\
++	FN(BV_CONCAT_MERGE_CONST)	\
++	FN(BV_COMMUTATIVE_ADD)		\
++	FN(BV_SUB_ELIMINATE)		\
++	FN(BV_ITE_WIDTH_ONE)		\
++	FN(BV_ITE_WIDTH_ONE_NOT)	\
++	FN(BV_EQ_XOR_SOLVE)		\
++	FN(BV_EQ_NOT_SOLVE)		\
++	FN(BV_UGT_ELIMINATE)		\
++	FN(BV_UGE_ELIMINATE)		\
++	FN(BV_SGT_ELIMINATE)		\
++	FN(BV_SGE_ELIMINATE)		\
++	FN(BV_SLE_ELIMINATE)		\
++	FN(BV_ULE_ELIMINATE)		\
++	FN(BV_ZERO_EXTEND_ELIMINATE)	\
++	FN(BV_ITE_EQUAL_CHILDREN)	\
++	FN(BV_ITE_CONST_CHILDREN_1)	\
++	FN(BV_ITE_CONST_CHILDREN_2)	\
++	FN(BV_ITE_EQUAL_COND_1)		\
++	FN(BV_ITE_EQUAL_COND_2)		\
++	FN(BV_ITE_EQUAL_COND_3)		\
++	FN(BV_ITE_MERGE_THEN_IF)	\
++	FN(BV_ITE_MERGE_ELSE_IF)	\
++	FN(BV_ITE_MERGE_THEN_ELSE)	\
++	FN(BV_ITE_MERGE_ELSE_ELSE)	\
++	FN(BV_SHL_BY_CONST_0)		\
++	FN(BV_SHL_BY_CONST_1)		\
++	FN(BV_SHL_BY_CONST_2)		\
++	FN(BV_LSHR_BY_CONST_0)		\
++	FN(BV_LSHR_BY_CONST_1)		\
++	FN(BV_LSHR_BY_CONST_2)		\
++	FN(BV_ASHR_BY_CONST_0)		\
++	FN(BV_ASHR_BY_CONST_1)		\
++	FN(BV_ASHR_BY_CONST_2)		\
++	FN(BV_AND_CONCAT_PULLUP)	\
++	FN(BV_OR_CONCAT_PULLUP)		\
++	FN(BV_XOR_CONCAT_PULLUP)	\
++	FN(BV_AND_CONCAT_PULLUP2)	\
++	FN(BV_OR_CONCAT_PULLUP2)	\
++	FN(BV_XOR_CONCAT_PULLUP2)	\
++	FN(BV_AND_CONCAT_PULLUP3)	\
++	FN(BV_OR_CONCAT_PULLUP3)	\
++	FN(BV_XOR_CONCAT_PULLUP3)	\
++	FN(BV_XOR_DUPLICATE)		\
++	FN(BV_XOR_ONES)			\
++	FN(BV_ULE_MAX)			\
++	FN(BV_XOR_NOT)			\
++	FN(BV_NOT_IDEMP)		\
++	FN(BV_ULT_ZERO_1)		\
++	FN(BV_ULT_ZERO_2)		\
++	FN(BV_ULT_SELF)			\
++	FN(BV_LT_SELF)			\
++	FN(BV_ULE_SELF)			\
++	FN(BV_ULE_ZERO)			\
++	FN(BV_ZERO_ULE)			\
++	FN(BV_SLE_SELF)			\
++	FN(BV_NOT_ULT)			\
++	FN(BV_SHL_ZERO)			\
++	FN(BV_LSHR_ZERO)		\
++	FN(BV_ASHR_ZERO)		\
++	FN(BV_ULT_ONE)			\
++	FN(BV_MERGE_SIGN_EXTEND_1)	\
++	FN(BV_MERGE_SIGN_EXTEND_2)	\
++	FN(BV_SIGN_EXTEND_EQ_CONST_1)	\
++	FN(BV_SIGN_EXTEND_EQ_CONST_2)	\
++	FN(BV_ZERO_EXTEND_EQ_CONST_1)	\
++	FN(BV_ZERO_EXTEND_EQ_CONST_2)	\
++	FN(BV_ZERO_EXTEND_ULT_CONST_1)	\
++	FN(BV_ZERO_EXTEND_ULT_CONST_2)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_1)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_2)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_3)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_4)
++
++#define BCF_REWRITE_ENUM_VARIANT(x) BCF_REWRITE_NAME(x),
++enum bcf_rewrite_id {
++	BCF_REWRITE_UNSPEC = 0,
++	BCF_REWRITES_TABLE(BCF_REWRITE_ENUM_VARIANT)
++	__MAX_BCF_REWRITES,
++};
++
++// clang-format on
++}  // namespace proof
++}  // namespace cvc5::internal
++
++#endif /* CVC5__PROOF__BCF__BCF_DEFS_H */
+diff --git a/src/proof/bcf/bcf_printer.cpp b/src/proof/bcf/bcf_printer.cpp
+new file mode 100644
+index 000000000..1c87b1868
+--- /dev/null
++++ b/src/proof/bcf/bcf_printer.cpp
+@@ -0,0 +1,1298 @@
++/******************************************************************************
++ * Top contributors (to current version):
++ *   Hao Sun <hao.sun@inf.ethz.ch>
++ *
++ * This file is part of the cvc5 project.
++ *
++ * Copyright (c) 2009-2025 by the authors listed in the file AUTHORS
++ * in the top-level source directory and their institutional affiliations.
++ * All rights reserved.  See the file COPYING in the top-level source
++ * directory for licensing information.
++ * ****************************************************************************
++ *
++ * The printer for the BCF format.
++ */
++#include "proof/bcf/bcf_printer.h"
++
++#include <iostream>
++#include <limits>
++#include <optional>
++#include <ostream>
++#include <unordered_set>
++
++#include "expr/skolem_manager.h"
++#include "proof/bcf/bcf_defs.h"
++#include "proof/method_id.h"
++#include "proof/proof_node.h"
++#include "rewriter/rewrite_db.h"
++#include "rewriter/rewrite_proof_rule.h"
++#include "theory/builtin/generic_op.h"
++#include "theory/evaluator.h"
++#include "theory/theory.h"
++#include "util/bitvector.h"
++#include "util/rational.h"
++
++namespace cvc5::internal {
++namespace proof {
++
++using namespace cvc5::internal::kind;
++
++using std::map;
++using std::optional;
++using std::shared_ptr;
++using std::vector;
++using u8 = BCFPrinter::u8;
++using u16 = BCFPrinter::u16;
++using u32 = BCFPrinter::u32;
++
++optional<u8> BCFPrinter::getBCFCode(Kind k)
++{
++  const static map<Kind, u8> code_table = {
++
++      {Kind::BITVECTOR_ADD, BCF_BV | BPF_ADD},
++      {Kind::BITVECTOR_SUB, BCF_BV | BPF_SUB},
++      {Kind::BITVECTOR_MULT, BCF_BV | BPF_MUL},
++      // These semantics mismatch with the semantics of eBPF
++      // {Kind::BITVECTOR_UDIV, BCF_BV | BPF_DIV},
++      // {Kind::BITVECTOR_SDIV, BCF_BV | BCF_SDIV},
++      // {Kind::BITVECTOR_UREM, BCF_BV | BPF_MOD},
++      // {Kind::BITVECTOR_SMOD, BCF_BV | BCF_SMOD},
++      {Kind::BITVECTOR_OR, BCF_BV | BPF_OR},
++      {Kind::BITVECTOR_AND, BCF_BV | BPF_AND},
++      {Kind::BITVECTOR_SHL, BCF_BV | BPF_LSH},
++      {Kind::BITVECTOR_LSHR, BCF_BV | BPF_RSH},
++      {Kind::BITVECTOR_ASHR, BCF_BV | BPF_ARSH},
++      {Kind::BITVECTOR_NEG, BCF_BV | BPF_NEG},
++      {Kind::BITVECTOR_XOR, BCF_BV | BPF_XOR},
++
++      {Kind::BITVECTOR_EXTRACT, BCF_BV | BCF_EXTRACT},
++      {Kind::BITVECTOR_ZERO_EXTEND, BCF_BV | BCF_ZERO_EXTEND},
++      {Kind::BITVECTOR_SIGN_EXTEND, BCF_BV | BCF_SIGN_EXTEND},
++      {Kind::BITVECTOR_CONCAT, BCF_BV | BCF_CONCAT},
++      {Kind::CONST_BITVECTOR, BCF_BV | BCF_VAL},
++      {Kind::BITVECTOR_SIZE, BCF_BV | BCF_BVSIZE},
++      {Kind::CONST_BITVECTOR_SYMBOLIC, BCF_BV | BCF_VAL},
++      {Kind::BITVECTOR_FROM_BOOLS, BCF_BV | BCF_FROM_BOOL},
++      {Kind::BITVECTOR_REPEAT, BCF_BV | BCF_REPEAT},
++      {Kind::BITVECTOR_NOT, BCF_BV | BCF_BVNOT},
++      {Kind::BITVECTOR_ITE, BCF_BV | BCF_ITE},
++
++      {Kind::EQUAL, BCF_BOOL | BPF_JEQ},
++      {Kind::DISTINCT, BCF_BOOL | BCF_DISTINCT},
++
++      {Kind::BITVECTOR_UGT, BCF_BOOL | BPF_JGT},
++      {Kind::BITVECTOR_UGE, BCF_BOOL | BPF_JGE},
++      {Kind::BITVECTOR_SGT, BCF_BOOL | BPF_JSGT},
++      {Kind::BITVECTOR_SGE, BCF_BOOL | BPF_JSGE},
++      {Kind::BITVECTOR_ULT, BCF_BOOL | BPF_JLT},
++      {Kind::BITVECTOR_ULE, BCF_BOOL | BPF_JLE},
++      {Kind::BITVECTOR_SLT, BCF_BOOL | BPF_JSLT},
++      {Kind::BITVECTOR_SLE, BCF_BOOL | BPF_JSLE},
++
++      {Kind::AND, BCF_BOOL | BCF_CONJ},
++      {Kind::OR, BCF_BOOL | BCF_DISJ},
++      {Kind::NOT, BCF_BOOL | BCF_NOT},
++      {Kind::IMPLIES, BCF_BOOL | BCF_IMPLIES},
++      {Kind::XOR, BCF_BOOL | BCF_XOR},
++      {Kind::BITVECTOR_BIT, BCF_BOOL | BCF_BITOF},
++      {Kind::CONST_BOOLEAN, BCF_BOOL | BCF_VAL},
++
++      /* Decide the type when converting */
++      {Kind::ITE, BCF_ITE},
++      {Kind::VARIABLE, BCF_VAR},
++
++      /* We mostly care about QF_BV, but integer node can occur for various
++       * reasons, e.g., bvsize. We treat every integer node as a bv32; if it
++       * does not fit, we error out.
++       */
++      {Kind::CONST_INTEGER, BCF_BV | BCF_VAL},
++      {Kind::ADD, BCF_BV | BPF_ADD},
++      {Kind::SUB, BCF_BV | BPF_SUB},
++      {Kind::MULT, BCF_BV | BPF_MUL},
++      {Kind::LT, BCF_BOOL | BPF_JSLT},
++      {Kind::LEQ, BCF_BOOL | BPF_JSLE},
++      {Kind::GT, BCF_BOOL | BPF_JSGT},
++      {Kind::GEQ, BCF_BOOL | BPF_JSGE},
++
++      // TODO support these ops
++      {Kind::POW2, __MAX_BCF_TYPE},
++      {Kind::INTS_LOG2, __MAX_BCF_TYPE},
++      {Kind::INTS_ISPOW2, __MAX_BCF_TYPE},
++
++      {Kind::SEXPR, BCF_LIST | BCF_VAL},
++  };
++
++  auto it = code_table.find(k);
++  if (it == code_table.end()) return std::nullopt;
++  return it->second;
++}
++
++bool BCFPrinter::isHandledNode(Node n)
++{
++  return getBCFCode(n.getKind()).has_value();
++}
++
++void setParamHigh(bcf_expr& expr, u8 high) { expr.params |= ((u16)high << 8); }
++
++void setParamLow(bcf_expr& expr, u8 low) { expr.params |= low; }
++
++void setBoolValue(bcf_expr& expr, Node n)
++{
++  setParamLow(expr, n.getConst<bool>() ? BCF_TRUE : BCF_FALSE);
++}
++
++void setBVSize(bcf_expr& expr, Node n)
++{
++  setParamLow(expr, (u8)(n.getType().getBitVectorSize()));
++}
++
++void setBVBitOf(bcf_expr& expr, Node n)
++{
++  setParamLow(expr, (u8)(n.getOperator().getConst<BitVectorBit>().d_bitIndex));
++}
++
++void setBVExtract(bcf_expr& expr, Node n)
++{
++  BitVectorExtract p = n.getOperator().getConst<BitVectorExtract>();
++  setParamHigh(expr, (u8)(p.d_high));
++  setParamLow(expr, (u8)(p.d_low));
++}
++
++void setBVZeroExtend(bcf_expr& expr, Node n)
++{
++  setParamHigh(
++      expr,
++      (u8)(n.getOperator().getConst<BitVectorZeroExtend>().d_zeroExtendAmount));
++  setBVSize(expr, n);
++}
++
++void setBVSignExtend(bcf_expr& expr, Node n)
++{
++  setParamHigh(
++      expr,
++      (u8)(n.getOperator().getConst<BitVectorSignExtend>().d_signExtendAmount));
++  setBVSize(expr, n);
++}
++
++void setBVRepeat(bcf_expr& expr, Node n)
++{
++  setParamHigh(
++      expr, (u8)(n.getOperator().getConst<BitVectorRepeat>().d_repeatAmount));
++  setBVSize(expr, n);
++}
++
++bool getUInt32(TNode n, u32& i)
++{
++  auto r = n.getConst<Rational>().getNumerator();
++  if (r.fitsUnsignedInt())
++  {
++    i = r.toUnsignedInt();
++    return true;
++  }
++  return false;
++}
++
++void bvvalToArgs(const BitVector& bv, vector<u32>* args)
++{
++  // For every 32 bits, we push the value to the args
++  for (u32 low = 0; low < bv.getSize(); low += 32)
++  {
++    u32 high = std::min(low + 31, bv.getSize() - 1);
++    u32 val = bv.extract(high, low).getValue().toUnsignedInt();
++    args->push_back(val);
++  }
++}
++
++optional<struct bcf_expr> BCFPrinter::toBCFExpr(Node n, vector<u32>* args) const
++{
++  bcf_expr expr;
++  memset(&expr, 0, sizeof(expr));
++
++  if (!isHandledNode(n))
++  {
++    d_out << "; Error: unhandled node " << n.getKind() << ": ";
++    n.toStream(d_out);
++    d_out << ", num children: " << n.getNumChildren() << std::endl;
++    return std::nullopt;
++  }
++  expr.code = getBCFCode(n.getKind()).value();
++  expr.vlen = static_cast<u8>(n.getNumChildren());
++
++  if (expr.code == __MAX_BCF_TYPE)
++    d_out << "; WARNING: converting " << n << " as ANY type " << std::endl;
++
++  auto ty = n.getType();
++  if (ty.isBitVector()
++      && ty.getBitVectorSize() > std::numeric_limits<u8>::max())
++  {
++    d_out << "; ERROR: node " << n << " has " << ty.getBitVectorSize()
++          << " bits, greater than U8_MAX allowed in BCF" << std::endl;
++    return std::nullopt;
++  }
++
++  bool skipAppendChildren = false;
++  switch (n.getKind())
++  {
++    case Kind::BITVECTOR_BIT: setBVBitOf(expr, n); break;
++    case Kind::CONST_BOOLEAN: setBoolValue(expr, n); break;
++
++    case Kind::VARIABLE:
++    case Kind::ITE:
++    {
++      if (n.getType().isBoolean())
++        expr.code |= BCF_BOOL;
++      else if (n.getType().isBitVector())
++      {
++        expr.code |= BCF_BV;
++        setBVSize(expr, n);
++      }
++      else
++      {
++        d_out << "; Error: unsupported node kind " << n.getKind() << ": ";
++        n.toStream(d_out);
++        d_out << std::endl;
++        return std::nullopt;
++      }
++      break;
++    }
++
++    case Kind::BITVECTOR_EXTRACT: setBVExtract(expr, n); break;
++    case Kind::BITVECTOR_ZERO_EXTEND: setBVZeroExtend(expr, n); break;
++    case Kind::BITVECTOR_SIGN_EXTEND: setBVSignExtend(expr, n); break;
++    case Kind::BITVECTOR_REPEAT: setBVRepeat(expr, n); break;
++
++    case Kind::CONST_BITVECTOR_SYMBOLIC:
++    {
++      // @bv val size
++      setBVSize(expr, n);
++      if (args)
++      {
++        auto val = n[0];
++        if (val.getKind() != Kind::CONST_INTEGER)
++        {
++          theory::Evaluator e(nullptr);
++          val = e.eval(val, {}, {});
++          if (val.isNull() || val.getKind() != Kind::CONST_INTEGER)
++          {
++            d_out << "; Error: @bv val not a constant: ";
++            val.toStream(d_out);
++            d_out << std::endl;
++            return std::nullopt;
++          }
++        }
++
++        auto bv = BitVector(n.getType().getBitVectorSize(),
++                            val.getConst<Rational>().getNumerator());
++        bvvalToArgs(bv, args);
++        // We encoded the immediate words; do not append child expr IDs for this
++        // node
++        skipAppendChildren = true;
++      }
++      break;
++    }
++    case Kind::CONST_BITVECTOR:
++    {
++      setBVSize(expr, n);
++      if (args)
++      {
++        bvvalToArgs(n.getConst<BitVector>(), args);
++        skipAppendChildren = true;
++      }
++      break;
++    }
++
++    // treat integer and bvsize as a bv32
++    case Kind::CONST_INTEGER:
++    {
++      u32 val;
++      if (!getUInt32(n, val))
++      {
++        d_out << "; Error: constant " << n << " does not fit in u32"
++              << std::endl;
++        return std::nullopt;
++      }
++      if (args)
++      {
++        args->push_back(val);
++        skipAppendChildren = true;
++      }
++      setParamLow(expr, 32);
++      break;
++    }
++
++    case Kind::BITVECTOR_SIZE:
++    case Kind::ADD:
++    case Kind::SUB:
++    case Kind::MULT: setParamLow(expr, 32); break;
++
++    case Kind::SEXPR:
++    {
++      if (n.getNumChildren() != 0)
++      {
++        auto child = n[0];
++        if (child.getType().isBitVector())
++        {
++          setParamLow(expr, BCF_BV);
++          // list elem could be with different bv size.
++          // setParamHigh(expr, child.getType().getBitVectorSize());
++        }
++        else if (child.getType().isBoolean())
++        {
++          setParamLow(expr, BCF_BOOL);
++        }
++        else
++        {
++          d_out << "; Error: unsupported node kind " << n.getKind()
++                << " in SEXPR:";
++          n.toStream(d_out);
++          d_out << std::endl;
++          return std::nullopt;
++        }
++      }
++
++      break;
++    }
++
++    // do not encode the bv size, which is derived from vlen
++    case Kind::BITVECTOR_FROM_BOOLS: break;
++    default:
++      if (n.getType().isBitVector()) setBVSize(expr, n);
++      break;
++  }
++
++  if (args)
++  {
++    if (!skipAppendChildren)
++    {
++      for (const Node& cn : n) args->push_back(exprIdOf(cn));
++    }
++    if (args->size() > std::numeric_limits<u8>::max())
++    {
++      d_out << "; ERROR: node " << n << " has " << args->size()
++            << " children, greater than U8_MAX allowed in BCF" << std::endl;
++      return std::nullopt;
++    }
++    expr.vlen = static_cast<u8>(args->size());
++  }
++
++  return expr;
++}
++
++static bool isBVMax(Node n)
++{
++  return n.getKind() == Kind::SUB && n[0].getKind() == Kind::POW2
++         && n[1].getKind() == Kind::CONST_INTEGER
++         && n[1].getConst<Rational>().getNumerator() == 1;
++}
++
++Node BCFPrinter::processNode(Node n)
++{
++  if (n.getKind() == Kind::APPLY_INDEXED_SYMBOLIC)
++    n = GenericOp::getConcreteApp(n);
++  if (n.getKind() == Kind::SKOLEM) n = SkolemManager::getUnpurifiedForm(n);
++
++  // We convert (- (pow2 x) -1) to its constant integer form
++  if (isBVMax(n))
++  {
++    theory::Evaluator e(nullptr);
++    auto res = e.eval(n, {}, {});
++    if (!res.isNull() && res.getKind() == Kind::CONST_INTEGER) return res;
++  }
++  else if (n.getKind() == Kind::POW2)
++  {
++    // represent this as (bvshl 1 n)
++    theory::Evaluator e(nullptr);
++    auto res = e.eval(n[0], {}, {});
++    if (!res.isNull() && res.getKind() == Kind::CONST_INTEGER)
++    {
++      u32 val;
++      if (getUInt32(res, val) && val < 32)
++      {
++        auto nm = n.getNodeManager();
++        return nm->mkNode(Kind::BITVECTOR_SHL,
++                          nm->mkConst(BitVector(32, 1u)),
++                          nm->mkConst(BitVector(32, val)));
++      }
++    }
++  }
++
++  return n;
++}
++
++optional<u32> BCFPrinter::do_convert(Node n)
++{
++  map<TNode, bool> processingChildren;
++  map<TNode, bool>::iterator pit;
++  map<Node, Node> nodeMap;
++  vector<Node> visit;
++  TNode cur;
++
++  visit.push_back(n);
++  do
++  {
++    cur = visit.back();
++    if (nodeConverted(cur))
++    {
++      visit.pop_back();
++      continue;
++    }
++    pit = processingChildren.find(cur);
++    if (pit == processingChildren.end())
++    {
++      auto node = processNode(cur);
++      for (const TNode& cn : node)
++      {
++        visit.push_back(cn);
++      }
++      processingChildren[cur] = true;
++      nodeMap[cur] = node;
++      continue;
++    }
++    visit.pop_back();
++    if (pit->second)
++    {
++      processingChildren[cur] = false;
++      vector<u32> args;
++      auto node = nodeMap[cur];
++      auto expr = toBCFExpr(node, &args);
++      if (!expr.has_value()) return std::nullopt;
++      addNode(cur, expr.value(), args);
++    }
++  } while (!visit.empty());
++
++  return exprIdOf(n);
++}
++
++bool BCFPrinter::isHandledRule(const ProofNode* pfn)
++{
++  ProofRule rule = pfn->getRule();
++
++  const std::vector<Node> pargs = pfn->getArguments();
++  switch (rule)
++  {
++    case ProofRule::DSL_REWRITE:
++    case ProofRule::THEORY_REWRITE:
++    {
++      ProofRewriteRule id;
++      rewriter::getRewriteRule(pfn->getArguments()[0], id);
++      return isHandledRewriteRule(id);
++    }
++    case ProofRule::BV_BITBLAST_STEP: return isHandledBitblastStep(pargs[0]);
++
++    case ProofRule::EVALUATE: return canEvaluate(pargs[0]);
++
++    case ProofRule::DISTINCT_VALUES:
++      return isHandledDistinctValues(pargs[0])
++             && isHandledDistinctValues(pargs[1]);
++
++    default: return getBCFRule(rule).has_value();
++  }
++}
++
++optional<u16> BCFPrinter::getBCFRule(ProofRule rule)
++{
++  static const map<ProofRule, u16> rule_table = {
++      {ProofRule::ASSUME, BCF_RULE_ASSUME | BCF_RULE_CORE},
++      {ProofRule::DSL_REWRITE, BCF_RULE_REWRITE | BCF_RULE_CORE},
++      {ProofRule::THEORY_REWRITE, BCF_RULE_REWRITE | BCF_RULE_CORE},
++      {ProofRule::EVALUATE, BCF_RULE_EVALUATE | BCF_RULE_CORE},
++      {ProofRule::DISTINCT_VALUES, BCF_RULE_DISTINCT_VALUES | BCF_RULE_CORE},
++      {ProofRule::ACI_NORM, BCF_RULE_ACI_NORM | BCF_RULE_CORE},
++      {ProofRule::ABSORB, BCF_RULE_ABSORB | BCF_RULE_CORE},
++
++      {ProofRule::SKOLEM_INTRO, BCF_RULE_REFL | BCF_RULE_CORE},
++      {ProofRule::REFL, BCF_RULE_REFL | BCF_RULE_CORE},
++      {ProofRule::ENCODE_EQ_INTRO, BCF_RULE_REFL | BCF_RULE_CORE},
++      {ProofRule::SYMM, BCF_RULE_SYMM | BCF_RULE_CORE},
++      {ProofRule::TRANS, BCF_RULE_TRANS | BCF_RULE_CORE},
++      {ProofRule::CONG, BCF_RULE_CONG | BCF_RULE_CORE},
++      {ProofRule::NARY_CONG, BCF_RULE_CONG | BCF_RULE_CORE},
++      {ProofRule::TRUE_INTRO, BCF_RULE_TRUE_INTRO | BCF_RULE_CORE},
++      {ProofRule::TRUE_ELIM, BCF_RULE_TRUE_ELIM | BCF_RULE_CORE},
++      {ProofRule::FALSE_INTRO, BCF_RULE_FALSE_INTRO | BCF_RULE_CORE},
++      {ProofRule::FALSE_ELIM, BCF_RULE_FALSE_ELIM | BCF_RULE_CORE},
++
++      {ProofRule::FACTORING, BCF_RULE_FACTORING | BCF_RULE_BOOL},
++      {ProofRule::REORDERING, BCF_RULE_REORDERING | BCF_RULE_BOOL},
++      {ProofRule::RESOLUTION, BCF_RULE_RESOLUTION | BCF_RULE_BOOL},
++      {ProofRule::CHAIN_RESOLUTION, BCF_RULE_RESOLUTION | BCF_RULE_BOOL},
++      {ProofRule::SPLIT, BCF_RULE_SPLIT | BCF_RULE_BOOL},
++      {ProofRule::EQ_RESOLVE, BCF_RULE_EQ_RESOLVE | BCF_RULE_BOOL},
++      {ProofRule::MODUS_PONENS, BCF_RULE_MODUS_PONENS | BCF_RULE_BOOL},
++      {ProofRule::NOT_NOT_ELIM, BCF_RULE_NOT_NOT_ELIM | BCF_RULE_BOOL},
++      {ProofRule::CONTRA, BCF_RULE_CONTRA | BCF_RULE_BOOL},
++
++      {ProofRule::AND_ELIM, BCF_RULE_AND_ELIM | BCF_RULE_BOOL},
++      {ProofRule::AND_INTRO, BCF_RULE_AND_INTRO | BCF_RULE_BOOL},
++      {ProofRule::NOT_OR_ELIM, BCF_RULE_NOT_OR_ELIM | BCF_RULE_BOOL},
++      {ProofRule::IMPLIES_ELIM, BCF_RULE_IMPLIES_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_IMPLIES_ELIM1, BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_IMPLIES_ELIM2, BCF_RULE_NOT_IMPLIES_ELIM | BCF_RULE_BOOL},
++      {ProofRule::EQUIV_ELIM1, BCF_RULE_EQUIV_ELIM | BCF_RULE_BOOL},
++      {ProofRule::EQUIV_ELIM2, BCF_RULE_EQUIV_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_EQUIV_ELIM1, BCF_RULE_NOT_EQUIV_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_EQUIV_ELIM2, BCF_RULE_NOT_EQUIV_ELIM | BCF_RULE_BOOL},
++      {ProofRule::XOR_ELIM1, BCF_RULE_XOR_ELIM | BCF_RULE_BOOL},
++      {ProofRule::XOR_ELIM2, BCF_RULE_XOR_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_XOR_ELIM1, BCF_RULE_NOT_XOR_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_XOR_ELIM2, BCF_RULE_NOT_XOR_ELIM | BCF_RULE_BOOL},
++      {ProofRule::ITE_ELIM1, BCF_RULE_ITE_ELIM | BCF_RULE_BOOL},
++      {ProofRule::ITE_ELIM2, BCF_RULE_ITE_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_ITE_ELIM1, BCF_RULE_NOT_ITE_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_ITE_ELIM2, BCF_RULE_NOT_ITE_ELIM | BCF_RULE_BOOL},
++      {ProofRule::NOT_AND, BCF_RULE_NOT_AND | BCF_RULE_BOOL},
++
++      {ProofRule::CNF_AND_NEG, BCF_RULE_CNF_AND_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_AND_POS, BCF_RULE_CNF_AND_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_OR_POS, BCF_RULE_CNF_OR_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_OR_NEG, BCF_RULE_CNF_OR_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_IMPLIES_POS, BCF_RULE_CNF_IMPLIES_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_IMPLIES_NEG1, BCF_RULE_CNF_IMPLIES_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_IMPLIES_NEG2, BCF_RULE_CNF_IMPLIES_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_EQUIV_POS1, BCF_RULE_CNF_EQUIV_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_EQUIV_POS2, BCF_RULE_CNF_EQUIV_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_EQUIV_NEG1, BCF_RULE_CNF_EQUIV_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_EQUIV_NEG2, BCF_RULE_CNF_EQUIV_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_XOR_POS1, BCF_RULE_CNF_XOR_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_XOR_POS2, BCF_RULE_CNF_XOR_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_XOR_NEG1, BCF_RULE_CNF_XOR_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_XOR_NEG2, BCF_RULE_CNF_XOR_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_ITE_POS1, BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_ITE_POS2, BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_ITE_POS3, BCF_RULE_CNF_ITE_POS | BCF_RULE_BOOL},
++      {ProofRule::CNF_ITE_NEG1, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_ITE_NEG2, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOL},
++      {ProofRule::CNF_ITE_NEG3, BCF_RULE_CNF_ITE_NEG | BCF_RULE_BOOL},
++      {ProofRule::ITE_EQ, BCF_RULE_ITE_EQ | BCF_RULE_BOOL},
++
++      {ProofRule::BV_BITBLAST_STEP, BCF_RULE_BITBLAST | BCF_RULE_BV},
++      {ProofRule::BV_EAGER_ATOM, BCF_RULE_SYMM | BCF_RULE_CORE},
++      {ProofRule::BV_POLY_NORM, BCF_RULE_POLY_NORM | BCF_RULE_BV},
++      {ProofRule::BV_POLY_NORM_EQ, BCF_RULE_POLY_NORM_EQ | BCF_RULE_BV},
++  };
++
++  auto it = rule_table.find(rule);
++  if (it == rule_table.end())
++  {
++    return std::nullopt;
++  }
++  return it->second;
++}
++
++optional<u32> BCFPrinter::getBCFRewriteRule(ProofRewriteRule rule)
++{
++#define BCF_RULE_MAP(R) {ProofRewriteRule::R, BCF_REWRITE_ENUM_VARIANT(R)},
++  static const map<ProofRewriteRule, u32> rewrite_rule_table = {
++      BCF_REWRITES_TABLE(BCF_RULE_MAP)};
++#undef BCF_RULE_MAP
++
++  auto it = rewrite_rule_table.find(rule);
++  if (it == rewrite_rule_table.end())
++  {
++    return std::nullopt;
++  }
++  return it->second;
++}
++
++bool BCFPrinter::isHandledRewriteRule(ProofRewriteRule rule)
++{
++  return getBCFRewriteRule(rule).has_value();
++}
++
++bool BCFPrinter::isHandledBitblastStep(const Node& eq)
++{
++  Assert(eq.getKind() == Kind::EQUAL);
++  if (theory::Theory::isLeafOf(eq[0], theory::THEORY_BV))
++  {
++    return true;
++  }
++  switch (eq[0].getKind())
++  {
++    case Kind::CONST_BITVECTOR:
++    case Kind::BITVECTOR_EXTRACT:
++    case Kind::BITVECTOR_CONCAT:
++    case Kind::BITVECTOR_AND:
++    case Kind::BITVECTOR_OR:
++    case Kind::BITVECTOR_XOR:
++    case Kind::BITVECTOR_NOT:
++    case Kind::BITVECTOR_ADD:
++    case Kind::BITVECTOR_SUB:
++    case Kind::BITVECTOR_NEG:
++    case Kind::BITVECTOR_MULT:
++    case Kind::BITVECTOR_SIGN_EXTEND:
++    case Kind::BITVECTOR_SHL:
++    case Kind::BITVECTOR_ASHR:
++    case Kind::BITVECTOR_LSHR:
++    case Kind::EQUAL:
++    case Kind::BITVECTOR_SLT:
++    case Kind::BITVECTOR_SLE:
++    case Kind::BITVECTOR_ULT:
++    case Kind::BITVECTOR_ULE:
++    case Kind::BITVECTOR_ITE: return true;
++    default: return false;
++  }
++}
++
++bool BCFPrinter::canEvaluate(Node n)
++{
++  std::unordered_set<TNode> visited;
++  std::vector<TNode> visit;
++  TNode cur;
++  visit.push_back(n);
++  do
++  {
++    cur = visit.back();
++    visit.pop_back();
++    if (visited.find(cur) == visited.end())
++    {
++      visited.insert(cur);
++      Kind k = cur.getKind();
++      if (k == Kind::APPLY_INDEXED_SYMBOLIC)
++      {
++        k = cur.getOperator().getConst<GenericOp>().getKind();
++      }
++      switch (k)
++      {
++        case Kind::CONST_INTEGER:
++        case Kind::ADD:
++        case Kind::SUB:
++        case Kind::NEG:
++        case Kind::LT:
++        case Kind::GT:
++        case Kind::GEQ:
++        case Kind::LEQ:
++        case Kind::MULT:
++        case Kind::INTS_LOG2:
++        case Kind::POW2:
++        case Kind::ITE:
++        case Kind::NOT:
++        case Kind::AND:
++        case Kind::OR:
++        case Kind::IMPLIES:
++        case Kind::XOR:
++        case Kind::CONST_BOOLEAN:
++        case Kind::CONST_BITVECTOR:
++        case Kind::BITVECTOR_EXTRACT:
++        case Kind::BITVECTOR_CONCAT:
++        case Kind::BITVECTOR_ADD:
++        case Kind::BITVECTOR_SUB:
++        case Kind::BITVECTOR_NEG:
++        case Kind::BITVECTOR_NOT:
++        case Kind::BITVECTOR_MULT:
++        case Kind::BITVECTOR_SHL:
++        case Kind::BITVECTOR_LSHR:
++        case Kind::BITVECTOR_ASHR:
++        case Kind::BITVECTOR_AND:
++        case Kind::BITVECTOR_OR:
++        case Kind::BITVECTOR_XOR:
++        case Kind::BITVECTOR_ULT:
++        case Kind::BITVECTOR_ULE:
++        case Kind::BITVECTOR_UGT:
++        case Kind::BITVECTOR_UGE:
++        case Kind::BITVECTOR_SLT:
++        case Kind::BITVECTOR_SLE:
++        case Kind::BITVECTOR_SGT:
++        case Kind::BITVECTOR_SGE:
++        case Kind::BITVECTOR_SIGN_EXTEND:
++        case Kind::BITVECTOR_ZERO_EXTEND:
++        case Kind::CONST_BITVECTOR_SYMBOLIC:
++        case Kind::BITVECTOR_REPEAT:
++        case Kind::EQUAL: break;
++
++        case Kind::BITVECTOR_SIZE: continue;
++
++        default: return false;
++      }
++      for (const Node& cn : cur) visit.push_back(cn);
++    }
++  } while (!visit.empty());
++  return true;
++}
++
++bool BCFPrinter::isHandledDistinctValues(const Node& n)
++{
++  std::unordered_set<TNode> visited;
++  std::vector<TNode> visit;
++  TNode cur;
++  visit.push_back(n);
++  do
++  {
++    cur = visit.back();
++    visit.pop_back();
++    if (visited.find(cur) == visited.end())
++    {
++      visited.insert(cur);
++      switch (cur.getKind())
++      {
++        case Kind::CONST_INTEGER:
++        case Kind::CONST_BOOLEAN:
++        case Kind::CONST_BITVECTOR: break;
++        default: return false;
++      }
++      for (const Node& cn : cur)
++      {
++        visit.push_back(cn);
++      }
++    }
++  } while (!visit.empty());
++  return true;
++}
++
++optional<struct bcf_proof_step> BCFPrinter::toTrustedStep(const ProofNode* pn,
++                                                          vector<u32>& args)
++{
++  bcf_proof_step step;
++  memset(&step, 0, sizeof(step));
++
++  auto rule = pn->getRule();
++  if (rule == ProofRule::THEORY_REWRITE || rule == ProofRule::DSL_REWRITE)
++  {
++    ProofRewriteRule id;
++    rewriter::getRewriteRule(pn->getArguments()[0], id);
++    if (d_warnedRewrites.find(id) == d_warnedRewrites.end())
++    {
++      d_out << "; WARNING: add trust rewrite step for " << id << std::endl;
++      d_warnedRewrites.insert(id);
++    }
++  }
++  else if (rule == ProofRule::EVALUATE)
++  {
++    d_out << "; WARNING: add trust evaluate step for " << pn->getArguments()[0]
++          << std::endl;
++  }
++  else if (d_warnedRules.find(rule) == d_warnedRules.end())
++  {
++    d_out << "; WARNING: add trust step for " << rule << std::endl;
++    d_warnedRules.insert(rule);
++  }
++
++  /* The kernel bcf proof checker does not actually support trusted rules.
++   * This conversion is only for other tools.
++   */
++  step.rule = BCF_RULE_REWRITE | BCF_RULE_CORE;
++
++  auto conclusion = pn->getResult();
++  auto cid = convert(conclusion);
++  if (!cid.has_value()) return std::nullopt;
++  args.push_back(BCF_REWRITE_UNSPEC);
++  args.push_back(cid.value());
++  if (args.size() > std::numeric_limits<u8>::max())
++  {
++    d_out << "; ERROR: trusted step has " << args.size()
++          << " arguments, greater than U8_MAX allowed in BCF" << std::endl;
++    return std::nullopt;
++  }
++  step.param_cnt = static_cast<u8>(args.size());
++
++  return step;
++}
++
++size_t bitmapSize(size_t n) { return (n + 31) / 32; }
++
++void setBit(u32* bits, size_t idx, Node pol)
++{
++  bits[idx / 32] |= (pol.getConst<bool>() ? 1 << (idx % 32) : 0);
++}
++
++/** BCF resolution parameters encoding: pols are encoded first into a u32-based
++ * bitmap, lits are a list of indexes followed.
++ */
++bool BCFPrinter::encodeResolutionParams(Node pol,
++                                        Node lit,
++                                        std::vector<u32>& args)
++{
++  // normal resolution only has one pivot and one polarity
++  args.push_back(0);
++  setBit(args.data(), 0, pol);
++  auto id = convert(lit);
++  if (!id.has_value()) return false;
++  args.push_back(id.value());
++  return true;
++}
++
++bool BCFPrinter::encodeChainResolutionParams(Node pols,
++                                             Node lits,
++                                             std::vector<u32>& args)
++{
++  auto polsSize = bitmapSize(pols.getNumChildren());
++  args.resize(polsSize, 0);
++  for (size_t i = 0; i < pols.getNumChildren(); i++)
++  {
++    setBit(args.data(), i, pols[i]);
++  }
++
++  for (size_t i = 0; i < lits.getNumChildren(); i++)
++  {
++    auto id = convert(lits[i]);
++    if (!id.has_value()) return false;
++    args.push_back(id.value());
++  }
++  return true;
++}
++
++/* Factoring parameters encoding:
++ * The dup_pair_list is a packed byte array encoding duplicate pairs for
++ * factoring. Each entry has the format: (pair_len, uniq_idx, dup_idx0,
++ * dup_idx1, ..., dup_idxN) where:
++ *   - pair_len: the number of indices in this pair (including uniq_idx and all
++ * dup_idx)
++ *   - uniq_idx: the index of the unique literal in the clause
++ *   - dup_idx*: indices of literals that are duplicates of uniq_idx
++ *
++ * The list is a sequence of such entries, e.g.:
++ *   [pair_len, uniq0, dup0, dup1, ..., pair_len, uniq1, dup0, ...]
++ *
++ * Requirements:
++ *   - All unused bytes in the array must be zero.
++ *   - uniq indices must be strictly increasing (uniq0 < uniq1 < ...).
++ *   - For each pair, uniq_idx < dup_idx0 < dup_idx1 < ... (all indices strictly
++ * increasing).
++ *   - For each duplicate, premise->args[uniq_idx] and premise->args[dup_idx*]
++ * must be equivalent (i.e., expr_id_equiv(premise->args[uniq_idx],
++ * premise->args[dup_idx*]) == 1).
++ *   - For each duplicate index, set the corresponding bit in the dups_bitmap.
++ */
++bool BCFPrinter::encodeFactoringParams(Node clause, std::vector<u8>& args)
++{
++  if (clause.getNumChildren() > std::numeric_limits<u8>::max())
++  {
++    d_out << "; ERROR: clause has " << clause.getNumChildren()
++          << " children, greater than U8_MAX allowed in BCF" << std::endl;
++    return false;
++  }
++
++  // remove duplicates while keeping the order of children
++  std::unordered_set<TNode> clauseSet;
++  std::vector<Node> deduped;
++  // deduped.insert(deduped.begin(), conc.begin(), conc.end());
++  unsigned size = clause.getNumChildren();
++  for (unsigned i = 0; i < size; ++i)
++  {
++    if (clauseSet.count(clause[i]))
++    {
++      continue;
++    }
++    deduped.push_back(clause[i]);
++    clauseSet.insert(clause[i]);
++  }
++
++  std::unordered_map<TNode, u8> uniqIdx;
++  std::unordered_map<TNode, vector<u8>> dupIdx;
++  for (auto lit : deduped)
++  {
++    for (u8 i = 0; i < clause.getNumChildren(); i++)
++    {
++      if (lit != clause[i]) continue;
++
++      auto it = uniqIdx.find(lit);
++      if (it != uniqIdx.end())
++        dupIdx[lit].push_back(i);
++      else
++        uniqIdx[lit] = i;
++    }
++  }
++
++  for (auto lit : deduped)
++  {
++    auto dupIdxList = dupIdx[lit];
++    if (dupIdxList.empty()) continue;
++
++    u8 len = 1 + (u8)dupIdxList.size();
++    args.push_back(len);
++    args.push_back(uniqIdx[lit]);
++    for (auto i : dupIdxList) args.push_back(i);
++  }
++
++  return true;
++}
++
++bool BCFPrinter::computeSwaps(Node clause,
++                              Node conclusion,
++                              std::vector<u16>& swaps)
++{
++  /* clause is a disjunction of literals, and conclusion is a disjunction of
++   * literals but reordered. We need to compute the swaps between the literals
++   * in clause and conclusion. The swaps are encoded as a list of pairs of
++   * indices (u8 each), laid out sequentially in the output vector (starting
++   * with the number of swaps contained).
++   */
++  swaps.clear();
++
++  if (clause.getNumChildren() != conclusion.getNumChildren())
++  {
++    d_out << "; ERROR: REORDERING expects same number of children: clause has "
++          << clause.getNumChildren() << ", conclusion has "
++          << conclusion.getNumChildren() << std::endl;
++    return false;
++  }
++
++  size_t len = clause.getNumChildren();
++  if (len > std::numeric_limits<u8>::max())
++  {
++    d_out << "; ERROR: clause has " << len
++          << " children, greater than U8_MAX allowed in BCF" << std::endl;
++    return false;
++  }
++
++  // Work on a mutable copy of the original order
++  std::vector<Node> arr;
++  arr.reserve(len);
++  for (size_t i = 0; i < len; ++i)
++  {
++    arr.push_back(clause[i]);
++  }
++
++  // Greedy swapping: for each position i, if arr[i] != conclusion[i],
++  // find j > i with arr[j] == conclusion[i] and swap (i, j).
++  for (u8 i = 0; i < static_cast<u8>(len); ++i)
++  {
++    if (arr[i] == conclusion[i]) continue;
++
++    bool found = false;
++    u8 j = i;
++    for (u8 k = static_cast<u8>(i + 1); k < static_cast<u8>(len); ++k)
++    {
++      if (arr[k] == conclusion[i])
++      {
++        j = k;
++        found = true;
++        break;
++      }
++    }
++
++    if (!found)
++    {
++      d_out << "; ERROR: REORDERING failed to match target literal at index "
++            << static_cast<unsigned>(i) << std::endl;
++      return false;
++    }
++
++    std::swap(arr[i], arr[j]);
++    u16 swap = ((u16)i << 8) | (u16)j;
++    swaps.push_back(swap);
++  }
++
++  // Sanity check
++  for (size_t i = 0; i < len; ++i)
++  {
++    if (arr[i] != conclusion[i])
++    {
++      d_out << "; ERROR: REORDERING produced inconsistent swaps" << std::endl;
++      return false;
++    }
++  }
++
++  if (swaps.empty())
++  {
++    d_out << "; ERROR: REORDERING produced no swaps" << std::endl;
++    return false;
++  }
++
++  swaps.insert(swaps.begin(), static_cast<u16>(swaps.size()));
++  return true;
++}
++
++optional<struct bcf_proof_step> BCFPrinter::toBCFStep(const ProofNode* pn,
++                                                      vector<u32>& children,
++                                                      vector<u32>& args)
++{
++  bcf_proof_step step;
++  memset(&step, 0, sizeof(step));
++
++  if (!isHandledRule(pn)) return toTrustedStep(pn, args);
++
++  step.rule = getBCFRule(pn->getRule()).value();
++
++  const vector<shared_ptr<ProofNode>>& ch = pn->getChildren();
++  for (const shared_ptr<ProofNode>& c : ch)
++  {
++    children.push_back(stepIdOf(c.get()));
++  }
++  if (children.size() > std::numeric_limits<u8>::max())
++  {
++    d_out << "; ERROR: step " << pn->getRule() << " has " << children.size()
++          << " children, greater than U8_MAX allowed in BCF" << std::endl;
++    return std::nullopt;
++  }
++  step.premise_cnt = static_cast<u8>(children.size());
++
++  const vector<Node>& pargs = pn->getArguments();
++  // Handle special arguments or special encodings for some rules
++  switch (pn->getRule())
++  {
++    case ProofRule::NARY_CONG:
++    case ProofRule::CONG:
++    {
++      TNode op = pargs[0];
++      auto expr = toBCFExpr(op, nullptr);
++      if (!expr.has_value()) return std::nullopt;
++      u32 op_encoded = 0;
++      static_assert(sizeof(op_encoded) == sizeof(bcf_expr),
++                    "bcf_expr size mismatch with u32");
++      memcpy(&op_encoded, &expr.value(), sizeof(op_encoded));
++      args.push_back(op_encoded);
++      break;
++    }
++
++    case ProofRule::RESOLUTION:
++    {
++      if (!encodeResolutionParams(pargs[0], pargs[1], args))
++        return std::nullopt;
++      break;
++    }
++
++    case ProofRule::CHAIN_RESOLUTION:
++    {
++      if (!encodeChainResolutionParams(pargs[0], pargs[1], args))
++        return std::nullopt;
++      break;
++    }
++
++    case ProofRule::FACTORING:
++    {
++      vector<u8> dup_pairs;
++      auto clause = pn->getChildren()[0]->getResult();
++
++      if (!encodeFactoringParams(clause, dup_pairs)) return std::nullopt;
++      u16 param_cnt = (dup_pairs.size() + 3) / 4;
++      args.resize(param_cnt, 0);
++      memcpy(args.data(), dup_pairs.data(), dup_pairs.size());
++      break;
++    }
++
++    case ProofRule::AND_ELIM:
++    case ProofRule::NOT_OR_ELIM:
++    {
++      u32 i;
++      if (!getUInt32(pargs[0], i)) return std::nullopt;
++      args.push_back(i);
++      break;
++    }
++
++    case ProofRule::NOT_IMPLIES_ELIM1:
++    case ProofRule::EQUIV_ELIM1:
++    case ProofRule::NOT_EQUIV_ELIM1:
++    case ProofRule::XOR_ELIM1:
++    case ProofRule::NOT_XOR_ELIM1:
++    case ProofRule::ITE_ELIM1:
++    case ProofRule::NOT_ITE_ELIM1: args.push_back(0); break;
++
++    case ProofRule::NOT_IMPLIES_ELIM2:
++    case ProofRule::EQUIV_ELIM2:
++    case ProofRule::NOT_EQUIV_ELIM2:
++    case ProofRule::XOR_ELIM2:
++    case ProofRule::NOT_XOR_ELIM2:
++    case ProofRule::ITE_ELIM2:
++    case ProofRule::NOT_ITE_ELIM2: args.push_back(1); break;
++
++    case ProofRule::CNF_IMPLIES_NEG1:
++    case ProofRule::CNF_EQUIV_POS1:
++    case ProofRule::CNF_EQUIV_NEG1:
++    case ProofRule::CNF_XOR_POS1:
++    case ProofRule::CNF_XOR_NEG1:
++    case ProofRule::CNF_ITE_POS1:
++    case ProofRule::CNF_ITE_NEG1:
++    {
++      auto id = convert(pargs[0]);
++      if (!id.has_value()) return std::nullopt;
++      args.push_back(id.value());
++      args.push_back(0);
++      break;
++    }
++
++    case ProofRule::CNF_IMPLIES_NEG2:
++    case ProofRule::CNF_EQUIV_POS2:
++    case ProofRule::CNF_EQUIV_NEG2:
++    case ProofRule::CNF_XOR_POS2:
++    case ProofRule::CNF_XOR_NEG2:
++    case ProofRule::CNF_ITE_POS2:
++    case ProofRule::CNF_ITE_NEG2:
++    {
++      auto id = convert(pargs[0]);
++      if (!id.has_value()) return std::nullopt;
++      args.push_back(id.value());
++      args.push_back(1);
++      break;
++    }
++
++    case ProofRule::CNF_ITE_POS3:
++    case ProofRule::CNF_ITE_NEG3:
++    {
++      auto id = convert(pargs[0]);
++      if (!id.has_value()) return std::nullopt;
++      args.push_back(id.value());
++      args.push_back(2);
++      break;
++    }
++
++    case ProofRule::CNF_AND_POS:
++    case ProofRule::CNF_OR_NEG:
++    {
++      auto id = convert(pargs[0]);
++      if (!id.has_value()) return std::nullopt;
++      args.push_back(id.value());
++      u32 i;
++      if (!getUInt32(pargs[1], i)) return std::nullopt;
++      args.push_back(i);
++      break;
++    }
++
++    // Encode the conclusion as argument
++    case ProofRule::REORDERING:
++    {
++      Node clause = pn->getChildren()[0]->getResult();
++      Node conclusion = pn->getResult();
++      vector<u16> swaps;
++
++      computeSwaps(clause, conclusion, swaps);
++      u32 arg_cnt = ((swaps.size() * 2) + 3) / 4;
++      args.resize(arg_cnt, 0);
++      memcpy(args.data(), swaps.data(), swaps.size() * 2);
++      break;
++    }
++
++    case ProofRule::THEORY_REWRITE:
++    case ProofRule::DSL_REWRITE:
++    {
++      ProofRewriteRule id;
++      rewriter::getRewriteRule(pargs[0], id);
++      auto bcf_rewrite_id = getBCFRewriteRule(id);
++      args.push_back(bcf_rewrite_id.value());
++
++      for (size_t i = 1; i < pargs.size(); i++)
++      {
++        auto arg_id = convert(pargs[i]);
++        if (!arg_id.has_value()) return std::nullopt;
++        args.push_back(arg_id.value());
++      }
++      break;
++    }
++      /* Arguments are not required, the conclusion is derived. */
++    case ProofRule::BV_POLY_NORM_EQ: break;
++
++    default:
++      for (const Node& arg : pargs)
++      {
++        auto id = convert(arg);
++        if (!id.has_value()) return std::nullopt;
++        args.push_back(id.value());
++      }
++      break;
++  }
++  if (args.size() > std::numeric_limits<u8>::max())
++  {
++    d_out << "; ERROR: step " << pn->getRule() << " has " << args.size()
++          << " arguments, greater than U8_MAX allowed in BCF" << std::endl;
++    return std::nullopt;
++  }
++  step.param_cnt = static_cast<u8>(args.size());
++
++  return step;
++}
++
++optional<u32> BCFPrinter::do_convert(const ProofNode* pn)
++{
++  std::vector<const ProofNode*> visit;
++  map<const ProofNode*, bool> processingChildren;
++  map<const ProofNode*, bool>::iterator pit;
++  const ProofNode* cur;
++
++  visit.push_back(pn);
++  do
++  {
++    cur = visit.back();
++    if (stepConverted(cur))
++    {
++      visit.pop_back();
++      continue;
++    }
++    pit = processingChildren.find(cur);
++    if (pit == processingChildren.end())
++    {
++      const vector<shared_ptr<ProofNode>>& children = cur->getChildren();
++      for (const shared_ptr<ProofNode>& child : children)
++      {
++        visit.push_back(child.get());
++      }
++      processingChildren[cur] = true;
++      continue;
++    }
++    visit.pop_back();
++    if (pit->second)
++    {
++      vector<u32> children;
++      vector<u32> args;
++      auto step = toBCFStep(cur, children, args);
++      if (!step.has_value())
++      {
++        d_out << "; ERROR: failed to convert step " << cur->getRule()
++              << std::endl;
++        if (options().proof.proofAllowTrust && isHandledRule(cur))
++        {
++          args.clear();
++          step = toTrustedStep(cur, args);
++        }
++        if (!step.has_value()) return std::nullopt;
++      }
++      // std::cout << cur->getRule() << ", " << children.size() << ", "
++      //           << args.size() << std::endl;
++      addStep(cur, step.value(), children, args);
++      processingChildren[cur] = false;
++    }
++  } while (!visit.empty());
++
++  return stepIdOf(pn);
++}
++
++void BCFPrinter::print(std::ostream& out,
++                       std::shared_ptr<ProofNode> pfn,
++                       ProofScopeMode psm)
++{
++  const ProofNode* pnBody = nullptr;
++  if (psm == ProofScopeMode::NONE)
++  {
++    pnBody = pfn.get();
++  }
++  else if (psm == ProofScopeMode::UNIFIED)
++  {
++    const ProofNode* ascope = pfn.get();
++    Assert(ascope->getRule() == ProofRule::SCOPE);
++    pnBody = pfn->getChildren()[0].get();
++  }
++  else if (psm == ProofScopeMode::DEFINITIONS_AND_ASSERTIONS)
++  {
++    auto dscope = pfn.get();
++    const ProofNode* ascope;
++    Assert(dscope->getRule() == ProofRule::SCOPE);
++    ascope = pfn->getChildren()[0].get();
++    Assert(ascope->getRule() == ProofRule::SCOPE);
++    pnBody = pfn->getChildren()[0]->getChildren()[0].get();
++  }
++
++  auto stepId = convert(pnBody);
++  if (!stepId.has_value()) return;
++
++  auto exprs = getExprs();
++  auto steps = getSteps();
++  Assert(!exprs.empty() && !steps.empty());
++
++  struct bcf_proof_header header = {
++      .magic = BCF_MAGIC,
++      .expr_cnt = static_cast<__u32>(exprs.size()),
++      .step_cnt = static_cast<__u32>(steps.size()),
++  };
++  size_t sizebytes = sizeof(header) + exprs.size() * sizeof(exprs[0])
++                     + steps.size() * sizeof(steps[0]);
++
++  auto proofOut = options().proof.bcfProofOut;
++  proofOut->write((const char*)&header, sizeof(header));
++  proofOut->write((const char*)exprs.data(), exprs.size() * sizeof(exprs[0]));
++  proofOut->write((const char*)steps.data(), steps.size() * sizeof(steps[0]));
++  proofOut->flush();
++
++  out << "; Proof produced: " << d_stepId << " steps, " << sizebytes << " bytes"
++      << std::endl;
++  out.flush();
++}
++}  // namespace proof
++}  // namespace cvc5::internal
+diff --git a/src/proof/bcf/bcf_printer.h b/src/proof/bcf/bcf_printer.h
+new file mode 100644
+index 000000000..6ed10be29
+--- /dev/null
++++ b/src/proof/bcf/bcf_printer.h
+@@ -0,0 +1,209 @@
++/******************************************************************************
++ * Top contributors (to current version):
++ *   Hao Sun <hao.sun@inf.ethz.ch>
++ *
++ * This file is part of the cvc5 project.
++ *
++ * Copyright (c) 2009-2025 by the authors listed in the file AUTHORS
++ * in the top-level source directory and their institutional affiliations.
++ * All rights reserved.  See the file COPYING in the top-level source
++ * directory for licensing information.
++ * ****************************************************************************
++ *
++ * The printer for the BCF format.
++ */
++#ifndef CVC5__PROOF__BCF__BCF_PRINTER_H
++#define CVC5__PROOF__BCF__BCF_PRINTER_H
++
++#include <cstdint>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <optional>
++#include <unordered_set>
++
++#include "proof/bcf/bcf_defs.h"
++#include "proof/proof_node.h"
++#include "rewriter/rewrite_proof_rule.h"
++#include "smt/env_obj.h"
++#include "smt/proof_manager.h"
++
++namespace cvc5::internal {
++namespace proof {
++
++/**
++ * Print a proof in the BCF format.
++ */
++class BCFPrinter : protected EnvObj
++{
++ public:
++  BCFPrinter(Env& env, std::ostream& out) : EnvObj(env), d_out(out), d_env(env)
++  {
++  }
++  ~BCFPrinter() {}
++
++  /**
++   * Print the full proof pfn.
++   * @param out The output stream.
++   * @param pfn The proof node.
++   * @param psm The scope mode, which determines whether there are outermost
++   * scope to process in pfn.
++   */
++  void print(std::ostream& out,
++             std::shared_ptr<ProofNode> pfn,
++             ProofScopeMode psm = ProofScopeMode::DEFINITIONS_AND_ASSERTIONS);
++
++  using u8 = std::uint8_t;
++  using u16 = std::uint16_t;
++  using u32 = std::uint32_t;
++  using u64 = std::uint64_t;
++
++  std::optional<u32> convert(Node n)
++  {
++    auto it = d_nodeIdMap.find(n);
++    if (it != d_nodeIdMap.end())
++    {
++      return it->second;
++    }
++    return do_convert(n);
++  }
++
++  std::optional<u32> convert(const ProofNode* n)
++  {
++    auto it = d_stepIdMap.find(n);
++    if (it != d_stepIdMap.end())
++    {
++      return it->second;
++    }
++    return do_convert(n);
++  }
++
++  std::vector<struct bcf_expr> getExprs() const { return d_exprs; }
++  std::vector<struct bcf_proof_step> getSteps() const { return d_steps; }
++
++  static bool isHandledNode(Node n);
++  static bool isHandledRule(const ProofNode* pfn);
++  static bool isHandledRewriteRule(ProofRewriteRule rule);
++  static bool isHandledBitblastStep(const Node& eq);
++  static bool isHandledDistinctValues(const Node& n);
++  static bool canEvaluate(Node n);
++
++ private:
++  std::optional<u32> do_convert(Node n);
++  std::optional<u32> do_convert(const ProofNode* n);
++
++  u32 getExprId() const { return static_cast<u32>(d_exprs.size()); }
++
++  u32 exprIdOf(Node n) const
++  {
++    auto it = d_nodeIdMap.find(n);
++    Assert(it != d_nodeIdMap.end());
++    return it->second;
++  }
++
++  bool nodeConverted(Node n) const
++  {
++    return d_nodeIdMap.find(n) != d_nodeIdMap.end();
++  }
++
++  void addNode(Node n, struct bcf_expr expr)
++  {
++    d_nodeIdMap[n] = getExprId();
++    d_exprs.push_back(expr);
++  }
++
++  void addNode(Node n, struct bcf_expr expr, const std::vector<u32>& args)
++  {
++    addNode(n, expr);
++    static_assert(sizeof(struct bcf_expr) == sizeof(u32));
++    for (u32 arg : args)
++    {
++      struct bcf_expr _arg;
++      std::memcpy(&_arg, &arg, sizeof(u32));
++      d_exprs.push_back(_arg);
++    }
++  }
++
++  static std::optional<u8> getBCFCode(Kind k);
++  std::optional<struct bcf_expr> toBCFExpr(Node n,
++                                           std::vector<u32>* args) const;
++
++  u32 getStepId() { return d_stepId++; }
++
++  bool stepConverted(const ProofNode* n) const
++  {
++    return d_stepIdMap.find(n) != d_stepIdMap.end();
++  }
++
++  u32 stepIdOf(const ProofNode* n) const
++  {
++    auto it = d_stepIdMap.find(n);
++    Assert(it != d_stepIdMap.end());
++    return it->second;
++  }
++
++  void addStep(const ProofNode* n, struct bcf_proof_step step)
++  {
++    d_stepIdMap[n] = getStepId();
++    d_steps.push_back(step);
++  }
++
++  void addStep(const ProofNode* n,
++               struct bcf_proof_step step,
++               const std::vector<u32>& children)
++  {
++    addStep(n, step);
++    static_assert(sizeof(struct bcf_proof_step) == sizeof(u32));
++    for (u32 child : children)
++    {
++      struct bcf_proof_step _child;
++      std::memcpy(&_child, &child, sizeof(u32));
++      d_steps.push_back(_child);
++    }
++  }
++
++  void addStep(const ProofNode* n,
++               struct bcf_proof_step step,
++               const std::vector<u32>& children,
++               const std::vector<u32>& args)
++  {
++    addStep(n, step, children);
++    for (u32 arg : args)
++    {
++      struct bcf_proof_step convertedArg;
++      std::memcpy(&convertedArg, &arg, sizeof(u32));
++      d_steps.push_back(convertedArg);
++    }
++  }
++
++  std::optional<struct bcf_proof_step> toBCFStep(const ProofNode* n,
++                                                 std::vector<u32>& children,
++                                                 std::vector<u32>& args);
++  std::optional<struct bcf_proof_step> toTrustedStep(const ProofNode* n,
++                                                     std::vector<u32>& args);
++  static std::optional<u16> getBCFRule(ProofRule rule);
++  static std::optional<u32> getBCFRewriteRule(ProofRewriteRule rule);
++  Node processNode(Node n);
++  bool encodeResolutionParams(Node pol, Node lit, std::vector<u32>& args);
++  bool encodeChainResolutionParams(Node pols,
++                                   Node lits,
++                                   std::vector<u32>& args);
++  bool encodeFactoringParams(Node clause, std::vector<u8>& args);
++  bool computeSwaps(Node clause, Node conclusion, std::vector<u16>& swaps);
++
++  std::unordered_map<TNode, u32> d_nodeIdMap;
++  std::vector<struct bcf_expr> d_exprs;
++  u32 d_stepId = 0;
++  std::map<const ProofNode*, u32> d_stepIdMap;
++  std::vector<struct bcf_proof_step> d_steps;
++
++  std::unordered_set<ProofRule> d_warnedRules;
++  std::unordered_set<ProofRewriteRule> d_warnedRewrites;
++  std::ostream& d_out;
++  Env& d_env;
++};
++
++}  // namespace proof
++}  // namespace cvc5::internal
++
++#endif
+diff --git a/src/smt/proof_manager.cpp b/src/smt/proof_manager.cpp
+index 60b42206c..0d36663dd 100644
+--- a/src/smt/proof_manager.cpp
++++ b/src/smt/proof_manager.cpp
+@@ -22,6 +22,7 @@
+ #include "proof/alethe/alethe_post_processor.h"
+ #include "proof/alethe/alethe_printer.h"
+ #include "proof/alf/alf_printer.h"
++#include "proof/bcf/bcf_printer.h"
+ #include "proof/dot/dot_printer.h"
+ #include "proof/lfsc/lfsc_post_processor.h"
+ #include "proof/lfsc/lfsc_printer.h"
+@@ -363,6 +364,11 @@ void PfManager::printProof(std::ostream& out,
+     proof::LfscPrinter lp(d_env, ltp, d_rewriteDb.get());
+     lp.print(out, fp.get());
+   }
++  else if (mode == options::ProofFormatMode::BCF)
++  {
++    proof::BCFPrinter bcf_printer(d_env, out);
++    bcf_printer.print(out, fp, scopeMode);
++  }
+   else
+   {
+     // otherwise, print using default printer
+diff --git a/src/smt/solver_engine.cpp b/src/smt/solver_engine.cpp
+index 8546e597d..514e225dc 100644
+--- a/src/smt/solver_engine.cpp
++++ b/src/smt/solver_engine.cpp
+@@ -1513,6 +1513,7 @@ void SolverEngine::printProof(std::ostream& out,
+       break;
+     case modes::ProofFormat::CPC: mode = options::ProofFormatMode::CPC; break;
+     case modes::ProofFormat::LFSC: mode = options::ProofFormatMode::LFSC; break;
++    case modes::ProofFormat::BCF: mode = options::ProofFormatMode::BCF; break;
+   }
+ 
+   d_pfManager->printProof(out,
+-- 
+2.34.1
+
