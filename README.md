@@ -9,18 +9,14 @@
 - **Delegation**: Delegating refinement reasoning to user space (low kernel complexity)
 - **Proof**: Requiring formal proofs that are validated by an in-kernel proof checker
 
-**Note**: For the initial full implementation of BCF (as well as the SOSP AE process), please refer to the [artifact-evaluation](https://github.com/SunHao-0/BCF/tree/artifact-evaluation) branch.
-
-The `main` branch currently contains the updated proof checker. As we continue to improve the checker, updates are needed for each patch set (e.g., kernel patches). We will release the updated patches soon.
-
 ## Project Structure
 
 ```
 ├── patches-kernel/     # Kernel patches for BCF integration
-├── patches-loader/     # User-space loader (bpftool) patches
 ├── patches-solver/     # SMT solver (cvc5) patches for proof generation
 ├── bcf-checker/        # Standalone proof checker (user-space port)
 ├── bpf-progs/          # eBPF programs for evaluation
+├── examples/           # example programs for playing with BCF
 ├── scripts/            # Build and evaluation scripts
 ├── build/              # Build artifacts (generated)
 └── output/             # Results and binaries (generated)
@@ -40,16 +36,14 @@ The `main` branch currently contains the updated proof checker. As we continue t
 
 ### 1. Kernel Integration (`patches-kernel/`)
 
-See [the patch cover letter](patches-kernel/0000-cover-letter.patch) for more details.
+See [the patch cover letter](patches-kernel/set1:verifier_and_initial_checker_support/0000-cover-letter.patch) for more details.
 
 - Adds BCF expression and formula definitions to the kernel
 - Implements state tracking and path constraint collection
 - Integrates the BCF proof checker for soundness validation
 - Enables on-demand abstraction refinement
 
-### 2. User-Space Loader (`patches-loader/`)
-
-See [the patch cover letter](patches-loader/0000-cover-letter.patch) for more details.
+### 2. User-Space Loader (`patches-kernel/set5:bpftool_libbpf_support/`)
 
 - Modifies bpftool to detect refinement conditions
 - Converts conditions to SMT-LIB format
@@ -82,68 +76,6 @@ The following script will install most of the dependencies for the project autom
 ```bash
 ./scripts/install-deps.sh
 ```
-
-## Quick Start
-
-(The following instructions are currently for the artifact-evaluation branch, and they will be updated for the main branch soon.)
-
-Please refer to the [scripts/README.md](scripts/README.md) for more details.
-
-### Build the System
-```bash
-./scripts/build.sh all
-```
-
-This will:
-- Download, patch, and build the Linux kernel
-- Download, patch, and build the cvc5 solver with BCF proof support
-- Compile the modified bpftool loader
-- Install the kernel image, tools, libs to the output directory (default: `output/`)
-
-### Run Evaluation
-The following script will run the evaluation automatically. It will:
-- Boot the modified kernel using QEMU, and share the current directory to the guest VM
-- Run the loading script to load the programs with BCF enhanced verifier (`--run-load`)
-- Run the benchmarks, e.g., benchmark load time (`--run-bench`)
-- Collect the results in the output directory (default: `output/`)
-- Analyze the results and generate plots (`--analyze`)
-
-```bash
-# Run load experiments
-./scripts/run_exp.sh --run-load
-
-# Run benchmarks, e.g., benchmark load time
-./scripts/run_exp.sh --run-bench
-
-# Analyze results
-./scripts/run_exp.sh --analyze
-```
-
-The evaluation script (`scripts/load_prog.py`) performs the following steps:
-
-1. **Program Loading**: Attempts to load eBPF programs using the modified bpftool
-2. **BCF Integration**: When verification fails, BCF automatically engages
-3. **Proof Generation**: cvc5 generates proofs for refinement conditions
-4. **Result Collection**: Records success/failure rates and performance metrics
-
-The evaluation uses structured program indices:
-- `prog_index.json`: Program metadata and grouping
-- `obj_prog_type.json`: Program type information
-- `accepted_prog_index.json`: Successfully loaded programs
-
-
-Results are stored in `output/` with the following structure:
-- `load.log`: Detailed loading process log
-- `vm.log`: Virtual machine operation log
-- `calico/`, `cilium/`: Project-specific results
-- Performance metrics and success rates
-
-Use `scripts/process_bcf_result.py` to analyze results:
-```bash
-./scripts/process_bcf_result.py --output_dir output/ -p bpf-progs/
-```
-
-After executing everything, the analysis automatically produces: (1) the acceptance details, matching the results in Section 6.2, (2) a detailed table shown the component-wise evaluation results, matching Table 2 in Section 6.3, and (3) various plots (`*.pdf`) matching Figure 8 and other results in the paper.
 
 ## License
 

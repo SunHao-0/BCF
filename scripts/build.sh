@@ -37,7 +37,7 @@ patch_loader_paths() {
 build_kernel() {
     local kernel_dir="$BUILD_DIR/$KERNEL_NAME"
     local kernel_tar="$BUILD_DIR/$KERNEL_TAR"
-    local kernel_url="https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.13.4.tar.xz"
+    local kernel_url="url/to/bpf-next"
     local loader_skips=("0000-cover-letter.patch" "0001-bpf-Add-bcf-uapi-arguments.patch" "0002-bpf-Add-bcf-expression-and-formula-definitions.patch")
     local kernel_skips=("0000-cover-letter.patch")
 

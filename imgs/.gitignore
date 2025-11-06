@@ -1,0 +1,4 @@
+# ignore all img files
+*.img
+*.id_rsa
+*.id_rsa.pub
