@@ -25,46 +25,43 @@ apply_patches() {
     done
 }
 
-patch_loader_paths() {
-    local dir="$1"
-    for patch in "$dir"/0004-bpftool-Check-cvc5-prover-feature.patch "$dir"/0006-bpftool-Add-cvc5-prover-support.patch; do
-        [[ -f "$patch" ]] || continue
-        sed -i "s|{REPLACE_INC}|$SOLVER_PATH/include|g" "$patch" >>"$LOGFILE" 2>&1
-        sed -i "s|{REPLACE_LIB}|$SOLVER_PATH/lib|g" "$patch" >>"$LOGFILE" 2>&1
-    done
-}
-
 build_kernel() {
-    local kernel_dir="$BUILD_DIR/$KERNEL_NAME"
-    local kernel_tar="$BUILD_DIR/$KERNEL_TAR"
-    local kernel_url="url/to/bpf-next"
-    local loader_skips=("0000-cover-letter.patch" "0001-bpf-Add-bcf-uapi-arguments.patch" "0002-bpf-Add-bcf-expression-and-formula-definitions.patch")
-    local kernel_skips=("0000-cover-letter.patch")
+    local kernel_dir="$KERNEL_SRC_DIR"
+    local set_skips=("0000-cover-letter.patch")
 
-    if [[ -d "$kernel_dir" || -f "$KERNEL_PATH" ]]; then
-        do_log "Kernel already built, skipping"
+    if [[ -f "$KERNEL_PATH" ]]; then
+        info "Kernel already built, skipping"
         return
     fi
 
-    [[ -f "$SOLVER_PATH/bin/cvc5" ]] || fatal "Solver must be built and installed first"
+    if [[ -d "$kernel_dir" ]]; then
+        ack "Removing existing kernel source at $kernel_dir"
+        rm -rf "$kernel_dir" >>"$LOGFILE" 2>&1 || fatal "Failed to remove $kernel_dir (see $LOGFILE)"
+    fi
 
-    download_if_missing "$kernel_url" "$kernel_tar"
-    ack "Extracting kernel tarball"
-    tar -xf "$kernel_tar" -C "$BUILD_DIR" >>"$LOGFILE" 2>&1 || fatal "Failed to extract $kernel_tar (see $LOGFILE)"
+    if [[ -n "$BPF_NEXT_COMMIT" ]]; then
+        ack "Cloning bpf-next and checking out $BPF_NEXT_COMMIT"
+        git clone "$BPF_NEXT_REPO_URL" "$kernel_dir" >>"$LOGFILE" 2>&1 || fatal "Failed to clone $BPF_NEXT_REPO_URL (see $LOGFILE)"
+        pushd "$kernel_dir" > /dev/null
+        git checkout -q "$BPF_NEXT_COMMIT" >>"$LOGFILE" 2>&1 || fatal "Failed to checkout commit $BPF_NEXT_COMMIT (see $LOGFILE)"
+    else
+        ack "Cloning bpf-next"
+        git clone "$BPF_NEXT_REPO_URL" "$kernel_dir" >>"$LOGFILE" 2>&1 || fatal "Failed to clone $BPF_NEXT_REPO_URL (see $LOGFILE)"
+        pushd "$kernel_dir" > /dev/null
+    fi
 
     pushd "$kernel_dir" > /dev/null
 
-    ack "Applying kernel patches"
-    apply_patches "$KERNEL_PATCH_DIR" kernel_skips[@]
-
-    ack "Applying loader patches"
-
-    local loader_patches_dir="$BUILD_DIR/patches-loader"
-    mkdir -p "$loader_patches_dir"
-    cp "$LAODER_PATCH_DIR"/*.patch "$loader_patches_dir"
-    patch_loader_paths "$loader_patches_dir"
-
-    apply_patches "$loader_patches_dir" loader_skips[@]
+    ack "Applying kernel patches (set1..set5)"
+    for setdir in \
+        "$KERNEL_PATCH_DIR/set1:verifier_and_initial_checker_support" \
+        "$KERNEL_PATCH_DIR/set2:add_core_proof_rules" \
+        "$KERNEL_PATCH_DIR/set3:add_boolean_proof_rules" \
+        "$KERNEL_PATCH_DIR/set4:add_bv_proof_rules" \
+        "$KERNEL_PATCH_DIR/set5:bpftool_libbpf_support"; do
+        [[ -d "$setdir" ]] || fatal "Patch set directory $setdir not found"
+        apply_patches "$setdir" set_skips[@]
+    done
 
     ack "Configuring kernel..."
     cp "$KERNEL_CONFIG" .config >>"$LOGFILE" 2>&1 || fatal "Failed to copy kernel config (see $LOGFILE)"
@@ -91,11 +88,11 @@ build_kernel() {
 build_solver() {
     local solver_tar="$BUILD_DIR/$SOLVER_TAR"
     local solver_dir="$BUILD_DIR/$SOLVER_NAME"
-    local solver_url="https://github.com/cvc5/cvc5/archive/8514715cbc48f898f620955f8c718495f926777d.zip"
+    local solver_url="https://github.com/cvc5/cvc5/archive/${SOLVER_COMMIT}.zip"
     local solver_skips=("cvc5.patch")
 
     if [[ -d "$solver_dir" || -f "$SOLVER_PATH" ]]; then
-        do_log "Solver already built, skipping"
+        info "Solver already built, skipping"
         return
     fi
 
@@ -108,7 +105,7 @@ build_solver() {
     apply_patches "$SOLVER_PATCH_DIR" solver_skips[@]
 
     ack "Building solver..."
-    ./configure.sh --best --gpl --auto-download --prefix="$SOLVER_PATH" >>"$LOGFILE" 2>&1 || fatal "Solver configure failed (see $LOGFILE)"
+    ./configure.sh --best --static --gpl --auto-download --prefix="$SOLVER_PATH" >>"$LOGFILE" 2>&1 || fatal "Solver configure failed (see $LOGFILE)"
     make -C build -j"$(nproc)" >>"$LOGFILE" 2>&1 || fatal "Solver build failed (see $LOGFILE)"
     make -C build install >>"$LOGFILE" 2>&1 || fatal "Solver install failed (see $LOGFILE)"
     [[ -f "$SOLVER_PATH/bin/cvc5" ]] || fatal "Solver not found"

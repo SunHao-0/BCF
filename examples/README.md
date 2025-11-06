@@ -4,7 +4,15 @@ A set of safe programs incorrectly rejected by the current verifier. One may bui
 
 #### Build and Boot
 
-Download `bpf-next` and optionally checkout to `4cb4897bb49a4` (the base test commit); other HEAD should also work as the patches are mostly adding code.
+Note that we have already provided a build script `scripts/build.sh` to automatically download the source, patch, and build the kernel, bpftool, cvc5.
+
+Just:
+```
+> ./scripts/build.sh all
+```
+will build everything under a `build` directory and copy the artifacts to the `output` directory.
+
+Alternatively, you may download `bpf-next` and checkout to `4cb4897bb49a4` (the base test commit); other HEAD should also work as the patches are mostly adding code.
 
 Apply the patches from each set:
 ```

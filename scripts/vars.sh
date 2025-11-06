@@ -28,10 +28,9 @@ export SCRIPT_DIR="$WORK_DIR/scripts"
 export IMG_DIR="$WORK_DIR/imgs"
 export PROG_DIR="$WORK_DIR/bpf-progs"
 export KERNEL_PATCH_DIR="$WORK_DIR/patches-kernel"
-export LAODER_PATCH_DIR="$WORK_DIR/patches-loader"
 export SOLVER_PATCH_DIR="$WORK_DIR/patches-solver"
 
-for dir in "$KERNEL_PATCH_DIR" "$LAODER_PATCH_DIR" "$SOLVER_PATCH_DIR" "$SCRIPT_DIR" "$PROG_DIR"; do
+for dir in "$KERNEL_PATCH_DIR" "$SOLVER_PATCH_DIR" "$SCRIPT_DIR" "$PROG_DIR"; do
     [[ -d "$dir" ]] || fatal "Directory $dir not found"
 done
 
@@ -41,10 +40,14 @@ for dir in "$BUILD_DIR" "$RESULT_DIR"; do
     mkdir -p "$dir"
 done
 
-export KERNEL_NAME=linux-6.13.4
-export KERNEL_TAR=linux-6.13.4.tar.gz
-export SOLVER_NAME=cvc5-8514715cbc48f898f620955f8c718495f926777d
-export SOLVER_TAR=cvc5-8514715cbc48f898f620955f8c718495f926777d.zip
+export BPF_NEXT_REPO_URL="https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+export BPF_NEXT_COMMIT="4cb4897bb49a4"
+export KERNEL_SRC_DIR="$BUILD_DIR/bpf-next"
+
+# cvc5 solver commit to build against (matches patches under patches-solver)
+export SOLVER_COMMIT=f7db8faac6639980ed61a1920042ded79cd15e21
+export SOLVER_NAME="cvc5-${SOLVER_COMMIT}"
+export SOLVER_TAR="${SOLVER_NAME}.zip"
 export KERNEL_CONFIG=$SCRIPT_DIR/kernel-config
 export KERNEL_PATH=$RESULT_DIR/bzImage
 export BPFTOOL_PATH=$RESULT_DIR/bpftool
@@ -62,7 +65,6 @@ export VM_BUILD_DIR="$VM_BCF_DIR/build"
 export VM_SCRIPT_DIR="$VM_BCF_DIR/scripts"
 export VM_RESULT_DIR="$VM_BCF_DIR/output"
 export VM_KERNEL_PATCH_DIR="$VM_BCF_DIR/patches-kernel"
-export VM_LAODER_PATCH_DIR="$VM_BCF_DIR/patches-loader"
 export VM_SOLVER_PATCH_DIR="$VM_BCF_DIR/patches-solver"
 export VM_PROG_DIR="$VM_BCF_DIR/bpf-progs"
 export VM_BPF_TOOL_PATH="$VM_RESULT_DIR/bpftool"
@@ -90,5 +92,5 @@ vmcmd() {
 vmstop() {
     _vmcmd "shutdown -h now"
     wait "$(cat ${VM_PIDFILE})"
-    do_log "Stopped VM."
+    ack "Stopped VM."
 }
