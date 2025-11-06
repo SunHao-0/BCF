@@ -1,4 +1,4 @@
-From 2d1317fe4c71a953f3803011f157e44d61dfa32e Mon Sep 17 00:00:00 2001
+From 66af31c4095c3b222d12d426d45c990afd708380 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 13 Oct 2025 09:47:05 +0200
 Subject: [PATCH] proof: Add bcf proof format support
@@ -11,11 +11,11 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  src/CMakeLists.txt             |    3 +
  src/options/proof_options.toml |   12 +
  src/proof/bcf/bcf_defs.h       |  508 +++++++++++++
- src/proof/bcf/bcf_printer.cpp  | 1298 ++++++++++++++++++++++++++++++++
- src/proof/bcf/bcf_printer.h    |  209 +++++
+ src/proof/bcf/bcf_printer.cpp  | 1291 ++++++++++++++++++++++++++++++++
+ src/proof/bcf/bcf_printer.h    |  209 ++++++
  src/smt/proof_manager.cpp      |    6 +
  src/smt/solver_engine.cpp      |    1 +
- 8 files changed, 2039 insertions(+)
+ 8 files changed, 2032 insertions(+)
  create mode 100644 src/proof/bcf/bcf_defs.h
  create mode 100644 src/proof/bcf/bcf_printer.cpp
  create mode 100644 src/proof/bcf/bcf_printer.h
@@ -591,10 +591,10 @@ index 000000000..040951893
 +#endif /* CVC5__PROOF__BCF__BCF_DEFS_H */
 diff --git a/src/proof/bcf/bcf_printer.cpp b/src/proof/bcf/bcf_printer.cpp
 new file mode 100644
-index 000000000..1c87b1868
+index 000000000..e1cb36b80
 --- /dev/null
 +++ b/src/proof/bcf/bcf_printer.cpp
-@@ -0,0 +1,1298 @@
+@@ -0,0 +1,1291 @@
 +/******************************************************************************
 + * Top contributors (to current version):
 + *   Hao Sun <hao.sun@inf.ethz.ch>
@@ -1852,17 +1852,10 @@ index 000000000..1c87b1868
 +  }
 +  else if (psm == ProofScopeMode::UNIFIED)
 +  {
-+    const ProofNode* ascope = pfn.get();
-+    Assert(ascope->getRule() == ProofRule::SCOPE);
 +    pnBody = pfn->getChildren()[0].get();
 +  }
 +  else if (psm == ProofScopeMode::DEFINITIONS_AND_ASSERTIONS)
 +  {
-+    auto dscope = pfn.get();
-+    const ProofNode* ascope;
-+    Assert(dscope->getRule() == ProofRule::SCOPE);
-+    ascope = pfn->getChildren()[0].get();
-+    Assert(ascope->getRule() == ProofRule::SCOPE);
 +    pnBody = pfn->getChildren()[0]->getChildren()[0].get();
 +  }
 +
