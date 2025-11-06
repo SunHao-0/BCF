@@ -1,0 +1,494 @@
+From 747cdc4df9344e4df989bc264589cf43fa663eb6 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 17:20:50 +0200
+Subject: [PATCH RFC 06/11] bpf: Add core rule: evaluate
+
+Add constant-eval rule EVALUATE: for a constant BOOL/BV expression e,
+produce e = v where v is the literal result. Implement a bounded, non-recursive
+evaluator over well-typed nodes:
+- BOOL: true/false, not, and/or/xor, implies, ite, bitof, comparisons
+- BV (<= 64-bit): val, add/sub/mul (with overflow check), div/mod, shifts,
+  extract/concat, sign/zero-extend, bvsize, from_bool, ite
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 428 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 425 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 3403166e9670..58c91726db12 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -75,6 +75,20 @@ struct bcf_cmp_stack_elem {
+ 	u32 cur_arg;
+ };
+ 
++#define __MAX_BCF_STACK (sizeof(struct bcf_cmp_stack_elem) * BCF_MAX_CMP_STACK)
++
++/* For constant expr evaluation, see eval_const_expr(). */
++#define BCF_MAX_EVAL_STACK \
++	(__MAX_BCF_STACK / sizeof(struct bcf_eval_stack_elem))
++struct bcf_eval_stack_elem {
++	struct bcf_expr *expr;
++	union {
++		u32 cur_arg;
++		u64 bv_res;
++		bool bool_res;
++	};
++};
++
+ struct bcf_expr_buf {
+ 	u8 code;
+ 	u8 vlen;
+@@ -131,7 +145,14 @@ struct bcf_checker_state {
+ 	/* Pre-allocated expr bufs used by different routines. */
+ 	struct bcf_expr_buf expr_buf;
+ 
+-	struct bcf_cmp_stack_elem cmp[BCF_MAX_CMP_STACK];
++	/*
++	 * Shared stack space: used either by equivalence comparison or by
++	 * constant evaluation, *exclusively*.
++	 */
++	union {
++		struct bcf_cmp_stack_elem cmp[BCF_MAX_CMP_STACK];
++		struct bcf_eval_stack_elem eval[BCF_MAX_EVAL_STACK];
++	} stack;
+ };
+ 
+ static void free_checker_state(struct bcf_checker_state *st)
+@@ -562,6 +583,16 @@ static bool is_false(const struct bcf_expr *expr)
+ 	       BCF_BOOL_LITERAL(expr->params) == BCF_FALSE;
+ }
+ 
++static struct bcf_expr_ref *build_bv_val(struct bcf_checker_state *st, u8 bv_sz,
++					 u64 val)
++{
++	if (bv_sz <= 32)
++		return build_expr_move(st, BCF_BV | BCF_VAL, bv_sz, (u32)val);
++	else
++		return build_expr_move(st, BCF_BV | BCF_VAL, bv_sz, (u32)val,
++				       (u32)(val >> 32));
++}
++
+ static const struct bcf_expr bcf_bool_false = {
+ 	.code = BCF_BOOL | BCF_VAL,
+ 	.vlen = 0,
+@@ -1002,7 +1033,7 @@ static void make_arg_sharing(struct bcf_checker_state *st, struct bcf_expr *e0,
+ static int __expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
+ 			struct bcf_expr *e1, bool from_checker, bool own_args)
+ {
+-	struct bcf_cmp_stack_elem *stack = st->cmp;
++	struct bcf_cmp_stack_elem *stack = st->stack.cmp;
+ 	struct bcf_var_map map = { 0 };
+ 	u32 sp = 0;
+ 	int ret;
+@@ -1276,6 +1307,372 @@ static struct bcf_expr *get_expr_buf(struct bcf_checker_state *st)
+ 	return (struct bcf_expr *)&st->expr_buf;
+ }
+ 
++/* Sign extend val (of `bw` bitwidth) to s64 form. */
++static s64 sign_extend_val(u64 val, u8 bw)
++{
++	u64 m;
++
++	val &= bv_max(bw);
++	m = 1ULL << (bw - 1);
++	return (s64)((val ^ m) - m);
++}
++
++static int eval_bool_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
++			  bool *res, struct bcf_eval_stack_elem *sub_vals)
++{
++	s64 s = 0, d = 0;
++	u32 i;
++	u8 op;
++
++	op = BCF_OP(expr->code);
++	if (op == BPF_JSGT || op == BPF_JSGE || op == BPF_JSLT ||
++	    op == BPF_JSLE) {
++		u8 bw;
++
++		bw = bv_size(id_to_expr(st, expr->args[0]));
++		s = sign_extend_val(sub_vals[0].bv_res, bw);
++		d = sign_extend_val(sub_vals[1].bv_res, bw);
++	}
++
++	switch (op) {
++	case BCF_VAL:
++		*res = BCF_BOOL_LITERAL(expr->params);
++		break;
++	case BCF_NOT:
++		*res = !sub_vals[0].bool_res;
++		break;
++	case BCF_CONJ:
++		*res = sub_vals[0].bool_res;
++		for (i = 1; i < expr->vlen; i++)
++			*res &= sub_vals[i].bool_res;
++		break;
++	case BCF_DISJ:
++		*res = sub_vals[0].bool_res;
++		for (i = 1; i < expr->vlen; i++)
++			*res |= sub_vals[i].bool_res;
++		break;
++	case BCF_XOR:
++		*res = sub_vals[0].bool_res;
++		for (i = 1; i < expr->vlen; i++)
++			*res ^= sub_vals[i].bool_res;
++		break;
++	case BCF_IMPLIES:
++		*res = !sub_vals[0].bool_res || sub_vals[1].bool_res;
++		break;
++	case BCF_ITE:
++		*res = sub_vals[0].bool_res ? sub_vals[1].bool_res :
++					      sub_vals[2].bool_res;
++		break;
++	case BCF_BITOF:
++		*res = (sub_vals[0].bv_res >> BCF_BITOF_BIT(expr->params)) & 1;
++		break;
++	case BPF_JEQ: {
++		struct bcf_expr *a0 = id_to_expr(st, expr->args[0]);
++
++		if (is_bool(a0->code))
++			*res = (sub_vals[0].bool_res == sub_vals[1].bool_res);
++		else
++			*res = (sub_vals[0].bv_res == sub_vals[1].bv_res);
++		break;
++	}
++	case BPF_JNE: {
++		struct bcf_expr *a0 = id_to_expr(st, expr->args[0]);
++
++		if (is_bool(a0->code))
++			*res = (sub_vals[0].bool_res != sub_vals[1].bool_res);
++		else
++			*res = (sub_vals[0].bv_res != sub_vals[1].bv_res);
++		break;
++	}
++	case BPF_JGT:
++		*res = sub_vals[0].bv_res > sub_vals[1].bv_res;
++		break;
++	case BPF_JGE:
++		*res = sub_vals[0].bv_res >= sub_vals[1].bv_res;
++		break;
++	case BPF_JLT:
++		*res = sub_vals[0].bv_res < sub_vals[1].bv_res;
++		break;
++	case BPF_JLE:
++		*res = sub_vals[0].bv_res <= sub_vals[1].bv_res;
++		break;
++	case BPF_JSGT:
++		*res = s > d;
++		break;
++	case BPF_JSGE:
++		*res = s >= d;
++		break;
++	case BPF_JSLT:
++		*res = s < d;
++		break;
++	case BPF_JSLE:
++		*res = s <= d;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
++			u64 *res, struct bcf_eval_stack_elem *sub_vals,
++			bool *check_overflow)
++{
++	bool overflow = false;
++	u64 mask;
++	u32 i;
++	u8 op;
++
++	op = BCF_OP(expr->code);
++	if (bv_size(expr) > 64)
++		return -E2BIG;
++	mask = bv_max(bv_size(expr));
++
++	switch (op) {
++	case BCF_VAL:
++		*res = bv_val(expr);
++		break;
++	case BCF_ITE: {
++		struct bcf_expr *cond = id_to_expr(st, expr->args[0]);
++		bool cond_res = is_bv(cond->code) ? sub_vals[0].bv_res :
++						    sub_vals[0].bool_res;
++
++		*res = cond_res ? sub_vals[1].bv_res : sub_vals[2].bv_res;
++		break;
++	}
++	case BPF_ADD:
++		*res = 0;
++		for (i = 0; i < expr->vlen; i++)
++			overflow |= check_add_overflow(*res, sub_vals[i].bv_res,
++						       res);
++		break;
++	case BPF_SUB:
++		overflow |= check_sub_overflow(sub_vals[0].bv_res,
++					       sub_vals[1].bv_res, res);
++		break;
++	case BPF_MUL:
++		*res = 1;
++		for (i = 0; i < expr->vlen; i++)
++			overflow |= check_mul_overflow(*res, sub_vals[i].bv_res,
++						       res);
++		break;
++	case BPF_DIV:
++		ENSURE(sub_vals[1].bv_res != 0);
++		*res = div64_u64(sub_vals[0].bv_res, sub_vals[1].bv_res);
++		break;
++	case BPF_MOD:
++		ENSURE(sub_vals[1].bv_res != 0);
++		div64_u64_rem(sub_vals[0].bv_res, sub_vals[1].bv_res, res);
++		break;
++	case BPF_OR:
++		*res = 0;
++		for (i = 0; i < expr->vlen; i++)
++			*res |= sub_vals[i].bv_res;
++		break;
++	case BPF_AND:
++		*res = sub_vals[0].bv_res;
++		for (i = 1; i < expr->vlen; i++)
++			*res &= sub_vals[i].bv_res;
++		break;
++	case BPF_XOR:
++		*res = 0;
++		for (i = 0; i < expr->vlen; i++)
++			*res ^= sub_vals[i].bv_res;
++		break;
++	case BPF_NEG: {
++		u64 sub = sub_vals[0].bv_res;
++
++		ENSURE((sub & mask) != (1u << (bv_size(expr) - 1)));
++		*res = -sign_extend_val(sub, bv_size(expr));
++		*res &= mask;
++		break;
++	}
++	case BPF_LSH:
++		overflow |= check_shl_overflow(sub_vals[0].bv_res,
++					       sub_vals[1].bv_res, res);
++		break;
++	case BPF_RSH:
++		*res = sub_vals[0].bv_res >> sub_vals[1].bv_res;
++		break;
++	case BPF_ARSH: {
++		s64 s = sign_extend_val(sub_vals[0].bv_res, bv_size(expr));
++		*res = s >> sub_vals[1].bv_res;
++		break;
++	}
++	case BCF_EXTRACT: {
++		u32 start = BCF_EXTRACT_START(expr->params);
++		u32 end = BCF_EXTRACT_END(expr->params);
++
++		*res = (sub_vals[0].bv_res >> end) & bv_max(start - end + 1);
++		break;
++	}
++	case BCF_CONCAT: {
++		struct bcf_expr *arg;
++
++		*res = 0;
++		for (i = 0; i < expr->vlen; i++) {
++			arg = id_to_expr(st, expr->args[i]);
++			*res <<= bv_size(arg);
++			*res |= sub_vals[i].bv_res;
++		}
++		break;
++	}
++	case BCF_SIGN_EXTEND: {
++		struct bcf_expr *arg;
++
++		arg = id_to_expr(st, expr->args[0]);
++		*res = sign_extend_val(sub_vals[0].bv_res, bv_size(arg));
++		break;
++	}
++	case BCF_ZERO_EXTEND:
++		*res = sub_vals[0].bv_res;
++		break;
++	case BCF_BVSIZE:
++		*res = bv_size(id_to_expr(st, expr->args[0]));
++		break;
++	case BCF_FROM_BOOL: {
++		*res = 0;
++		for (i = 0; i < expr->vlen; i++)
++			*res |= ((u64)sub_vals[i].bool_res) << i;
++		break;
++	}
++	case BCF_SDIV:
++	case BCF_SMOD:
++		return -EOPNOTSUPP;
++	default:
++		return -EINVAL;
++	}
++
++	if (*res > mask)
++		overflow = true;
++	if (check_overflow)
++		*check_overflow |= overflow;
++	*res &= mask;
++	return 0;
++}
++
++static bool is_constant(struct bcf_expr *e)
++{
++	return is_val(e->code) || is_bv_bvsize(e->code);
++}
++
++static int do_eval_const(struct bcf_checker_state *st, struct bcf_expr *expr,
++			 struct bcf_eval_stack_elem *frame,
++			 struct bcf_eval_stack_elem *sub_vals, bool *overflow)
++{
++	int err;
++
++	if (is_bv(expr->code))
++		err = eval_bv_expr(st, expr, &frame->bv_res, sub_vals,
++				   overflow);
++	else if (is_bool(expr->code))
++		err = eval_bool_expr(st, expr, &frame->bool_res, sub_vals);
++	else
++		return -EFAULT;
++
++	/* Evaluated, set to NULL. */
++	if (!err)
++		frame->expr = NULL;
++	return err;
++}
++
++struct bcf_eval_result {
++	u64 bv_res;
++	bool bool_res;
++	bool overflow;
++};
++
++/*
++ * Evaluate a constant expression rooted at `expr_id`.
++ * On success returns 0 and sets *res to a boolean/bv literal.
++ */
++static int eval_const_expr(struct bcf_checker_state *st, u32 expr_id,
++			   struct bcf_eval_result *res)
++{
++	struct bcf_eval_stack_elem *stack = st->stack.eval;
++	bool *overflow = &res->overflow;
++	struct bcf_expr *root;
++	u32 sp = 0;
++	int err;
++
++	root = id_to_expr(st, expr_id);
++	ENSURE((is_bv(root->code) && bv_size(root) <= 64) ||
++	       is_bool(root->code));
++	ENSURE(!is_var(root->code));
++
++	stack[sp++] = (struct bcf_eval_stack_elem){
++		.expr = root,
++		.cur_arg = 0,
++	};
++
++	while (sp) {
++		struct bcf_eval_stack_elem *top;
++		int top_idx;
++		u32 vlen;
++
++		/* Terminate when the only frame left is a value frame */
++		if (sp == 1 && stack[0].expr == NULL)
++			break;
++
++		/* Find the nearest frame that still has an expr */
++		top_idx = sp - 1;
++		while (top_idx >= 0 && stack[top_idx].expr == NULL)
++			top_idx--;
++		if (top_idx < 0) /* unreachable */
++			return -EFAULT;
++
++		top = &stack[top_idx];
++		if (is_constant(top->expr)) {
++			err = do_eval_const(st, top->expr, top, NULL, overflow);
++			if (err)
++				return err;
++			continue;
++		}
++
++		/* Non-constant must have sub-exprs. */
++		vlen = top->expr->vlen;
++		if (!vlen)
++			return -EFAULT;
++
++		if (top->cur_arg < vlen) {
++			u32 child_id = top->expr->args[top->cur_arg++];
++			struct bcf_expr *child = id_to_expr(st, child_id);
++
++			if (sp >= BCF_MAX_EVAL_STACK)
++				return -E2BIG;
++			ENSURE(!is_var(child->code));
++
++			stack[sp++] = (struct bcf_eval_stack_elem){
++				.expr = child,
++				.cur_arg = 0,
++			};
++			continue;
++		}
++
++		/*
++		 * All children processed – evaluate this node.
++		 * Child values are the next vlen frames.
++		 */
++		if (top_idx + vlen + 1 != sp)
++			return -EFAULT;
++
++		/* Replace children + node with single value frame */
++		err = do_eval_const(st, top->expr, top, top + 1, overflow);
++		if (err)
++			return err;
++		sp -= vlen;
++	}
++
++	/* Root value frame is stack[0] */
++	if (is_bool(root->code))
++		res->bool_res = stack[0].bool_res;
++	else
++		res->bv_res = stack[0].bv_res;
++
++	return 0;
++}
++
+ #define RULE_TBL(rule) [BCF_RULE_NAME(rule)] = &&rule,
+ #define DEFINE_JUMP_TABLE(rule_set)                                         \
+ 	static const void                                                   \
+@@ -1313,7 +1710,32 @@ static int apply_core_rule(struct bcf_checker_state *st,
+ 	return set_step_fact_id(st, step->args[0]);
+ 
+ EVALUATE: { /* Evaluate constant boolean/bitvector expression */
+-	return -EOPNOTSUPP;
++	struct bcf_eval_result res = { 0 };
++	struct bcf_expr *const_expr;
++	u32 res_id;
++
++	ENSURE(!pm_cnt && param_cnt == 1);
++	const_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(const_expr))
++		return PTR_ERR(const_expr);
++
++	err = eval_const_expr(st, step->args[0], &res);
++	if (err)
++		return err;
++
++	if (is_bool(const_expr->code)) {
++		res_id = res.bool_res ? st->true_expr : st->false_expr;
++	} else {
++		struct bcf_expr_ref *eref;
++
++		eref = build_bv_val(st, bv_size(const_expr), res.bv_res);
++		if (IS_ERR(eref))
++			return PTR_ERR(eref);
++		res_id = eref->id;
++	}
++
++	fact = build_bool_eq_move(st, step->args[0], res_id);
++	return set_step_fact(st, fact);
+ }
+ 
+ DISTINCT_VALUES: { /* Inequality of distinct values */
+-- 
+2.34.1
+

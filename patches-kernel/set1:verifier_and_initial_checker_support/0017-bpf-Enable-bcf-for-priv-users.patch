@@ -1,0 +1,27 @@
+From d8f7abdd2dd701d2b886c3b738389887e772eb9c Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 3 Nov 2025 16:45:53 +0100
+Subject: [PATCH RFC 17/17] bpf: Enable bcf for priv users
+
+Enable bcf when bcf_buf is provided and is_priv.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index fb672c9cc7cd..d48357bac9f3 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -25961,6 +25961,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	env->bypass_spec_v1 = bpf_bypass_spec_v1(env->prog->aux->token);
+ 	env->bypass_spec_v4 = bpf_bypass_spec_v4(env->prog->aux->token);
+ 	env->bpf_capable = is_priv = bpf_token_capable(env->prog->aux->token, CAP_BPF);
++	env->bcf.available = is_priv && attr->bcf_buf_size;
+ 
+ 	bpf_get_btf_vmlinux();
+ 
+-- 
+2.34.1
+

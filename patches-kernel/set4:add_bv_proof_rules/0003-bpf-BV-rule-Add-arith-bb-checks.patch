@@ -1,0 +1,228 @@
+From 5bc2172823dbc2c77f07e5f1c96442a18dbf0ef7 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 19:29:11 +0200
+Subject: [PATCH RFC 3/7] bpf: BV rule: Add arith bb checks
+
+Validate bit-blast encodings for arithmetic:
+- neg: two’s complement via add(~a, 0, carry_in=1)
+- add: k-ary ripple-carry addition by peeling sums stage-wise
+- sub: a - b via add(a, ~b, 1)
+Extract per-bit pre-sum and pre-adder from the output XOR trees and
+check carry relations and initial carry per stage.
+
+Ripple-carry and two’s-complement encodings are standard.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 168 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 164 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 7ed97c6252aa..0f041fb6082b 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -703,6 +703,14 @@ static bool is_ite_bool_cond(struct bcf_checker_state *st, struct bcf_expr *e)
+ 	return !is_bv_ite(e->code) || is_bool(id_to_expr(st, e->args[0])->code);
+ }
+ 
++static bool is_bool_xor_of(struct bcf_checker_state *st, u32 id, u32 a, u32 b)
++{
++	struct bcf_expr *e = id_to_expr(st, id);
++
++	return is_bool_xor(e->code) && e->vlen == 2 && e->args[0] == a &&
++	       e->args[1] == b;
++}
++
+ static bool is_bool_disj_of(struct bcf_checker_state *st, u32 id, u32 a, u32 b)
+ {
+ 	struct bcf_expr *e = id_to_expr(st, id);
+@@ -4077,6 +4085,75 @@ static int bb_bitwise_op(struct bcf_checker_state *st, struct bcf_expr *term,
+ 	return 0;
+ }
+ 
++/* Check if `res` faithfully represents `a + b` */
++static int check_ripple_carry_adder(struct bcf_checker_state *st, u32 vlen,
++				    u32 *a, u32 *b, u32 *res, bool init_carry)
++{
++	struct bcf_expr *sum, *carry, *sub;
++	u32 pre_carry, i;
++
++	for (i = 0; i < vlen; i++) {
++		sum = id_to_expr(st, res[i]);
++		ENSURE(is_bool_xor(sum->code) && sum->vlen == 2);
++
++		ENSURE(is_bool_xor_of(st, sum->args[0], a[i], b[i]));
++
++		carry = id_to_expr(st, sum->args[1]);
++		if (i == 0) {
++			ENSURE(init_carry ? is_true(carry) : is_false(carry));
++			continue;
++		}
++
++		/* check carry */
++		ENSURE(is_bool_disj(carry->code) && carry->vlen == 2);
++
++		sub = id_to_expr(st, carry->args[0]);
++		ENSURE(is_bool_conj(sub->code) && sub->vlen == 2);
++		ENSURE(sub->args[0] == a[i - 1] && sub->args[1] == b[i - 1]);
++
++		sub = id_to_expr(st, carry->args[1]);
++		ENSURE(is_bool_conj(sub->code) && sub->vlen == 2);
++		ENSURE(is_bool_xor_of(st, sub->args[0], a[i - 1], b[i - 1]));
++
++		pre_carry = id_to_expr(st, res[i - 1])->args[1];
++		ENSURE(sub->args[1] == pre_carry);
++	}
++
++	return 0;
++}
++
++static int extract_pre_sum(struct bcf_checker_state *st, u32 vlen, u32 *sum,
++			   u32 *pre_sum)
++{
++	struct bcf_expr *sub;
++	u32 i;
++
++	for (i = 0; i < vlen; i++) {
++		sub = id_to_expr(st, sum[i]);
++		ENSURE(sub->vlen);
++		sub = id_to_expr(st, sub->args[0]);
++		ENSURE(sub->vlen);
++		pre_sum[i] = sub->args[0];
++	}
++	return 0;
++}
++
++static int extract_pre_adder(struct bcf_checker_state *st, u32 vlen, u32 *sum,
++			     u32 *pre_adder)
++{
++	struct bcf_expr *sub;
++	u32 i;
++
++	for (i = 0; i < vlen; i++) {
++		sub = id_to_expr(st, sum[i]);
++		ENSURE(sub->vlen);
++		sub = id_to_expr(st, sub->args[0]);
++		ENSURE(sub->vlen > 1);
++		pre_adder[i] = sub->args[1];
++	}
++	return 0;
++}
++
+ static int check_bb_term(struct bcf_checker_state *st, u32 term_id, u32 bbt_id)
+ {
+ #define BB_TERM_CHECKER(_bv, ty_name, op, op_name, _arity) \
+@@ -4088,7 +4165,8 @@ static int check_bb_term(struct bcf_checker_state *st, u32 term_id, u32 bbt_id)
+ 	struct bcf_expr *term = id_to_expr(st, term_id);
+ 	struct bcf_expr *bbt = id_to_expr(st, bbt_id);
+ 	struct bcf_expr *sub, *bit;
+-	u32 i, j;
++	u32 arg_buf[U8_MAX], i, j;
++	int err;
+ 
+ 	ENSURE(is_bv_from_bool(bbt->code));
+ 	if (expr_arg_is_id(term->code)) {
+@@ -4126,15 +4204,97 @@ bb_bv_not: {
+ 
+ /* Arith ops */
+ bb_bv_neg: {
+-	return -EOPNOTSUPP;
++	/*
++	 * Validate negation as two's-complement addition: add(~a, 0, carry_in=true).
++	 * From the output sum bits (bbt->args):
++	 *   - pre_sum := first XOR-input vector extracted per bit (extract_pre_sum),
++	 *               must equal bitwise-NOT of a’s bits.
++	 *   - adder   := second XOR-input vector, must be all-false (zero).
++	 *   - Then check sum is a ripple-carry add of (pre_sum, adder)
++	 *     with initial carry true (check_ripple_carry_adder).
++	 */
++	u32 vlen = bbt->vlen;
++	u32 *pre_sum, *adder;
++
++	sub = id_to_expr(st, term->args[0]);
++	pre_sum = get_expr_buf(st)->args;
++	err = extract_pre_sum(st, vlen, bbt->args, pre_sum);
++	adder = arg_buf;
++	err = err ?: extract_pre_adder(st, vlen, bbt->args, adder);
++	if (err)
++		return err;
++	for (i = 0; i < vlen; i++) {
++		ENSURE(is_bool_not_of(st, pre_sum[i], sub->args[i]));
++		ENSURE(is_false(id_to_expr(st, adder[i])));
++	}
++
++	err = check_ripple_carry_adder(st, vlen, pre_sum, adder, bbt->args,
++				       true);
++	return err;
+ }
+ 
+ bb_bv_add: {
+-	return -EOPNOTSUPP;
++	/*
++	 * Validate multi-operand addition via staged ripple-carry “peeling”.
++	 * Let result R = a0 + a1 + ... + an. Start with sum := R’s bits.
++	 * For k = n..1:
++	 *   - pre_sum := first XOR-input vector extracted from sum[i]
++	 *               (extract_pre_sum).
++	 *   - adder   := ak’s bit-vector.
++	 *   - Check sum is a ripple-carry add of (pre_sum, adder)
++	 *     with initial carry false (check_ripple_carry_adder).
++	 *   - Set sum := pre_sum and continue.
++	 * Finally, require sum == a0’s bit-vector (exact bitwise identity).
++	 */
++	u32 vlen = bbt->vlen;
++	u32 *pre_sum = arg_buf, *sum;
++	struct bcf_expr *adder;
++
++	sum = st->expr_buf.args;
++	memcpy(sum, bbt->args, sizeof(u32) * bbt->vlen);
++
++	for (i = term->vlen - 1; i > 0; i--) {
++		adder = id_to_expr(st, term->args[i]);
++		err = extract_pre_sum(st, vlen, sum, pre_sum);
++		if (err)
++			return err;
++		err = check_ripple_carry_adder(st, vlen, pre_sum, adder->args,
++					       sum, false);
++		if (err)
++			return err;
++
++		swap(sum, pre_sum);
++	}
++	adder = id_to_expr(st, term->args[0]);
++	ENSURE(memcmp(adder->args, sum, sizeof(u32) * vlen) == 0);
++	return 0;
+ }
+ 
+ bb_bv_sub: {
+-	return -EOPNOTSUPP;
++	/*
++	 * Validate subtraction as two's-complement transform: a - b == add(a, ~b, 1).
++	 * From the output sum bits:
++	 *   - pre_adder := second XOR-input vector per bit (extract_pre_adder),
++	 *                 must equal bitwise-NOT of b’s bits.
++	 *   - Then check sum is a ripple-carry add of (a, pre_adder)
++	 *     with initial carry true (check_ripple_carry_adder).
++	 */
++	u32 *pre_adder, vlen = bbt->vlen;
++	u32 *sum;
++
++	sum = bbt->args;
++	pre_adder = get_expr_buf(st)->args;
++	err = extract_pre_adder(st, vlen, sum, pre_adder);
++	if (err)
++		return err;
++	sub = id_to_expr(st, term->args[1]);
++	for (i = 0; i < vlen; i++)
++		ENSURE(is_bool_not_of(st, pre_adder[i], sub->args[i]));
++
++	sub = id_to_expr(st, term->args[0]);
++	err = check_ripple_carry_adder(st, vlen, sub->args, pre_adder, sum,
++				       true);
++	return err;
+ }
+ 
+ /* Bitwise ops */
+-- 
+2.34.1
+

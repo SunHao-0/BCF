@@ -1,0 +1,31 @@
+From 3870dfc132eae338fdfca7fb00db579b6997d251 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 5 Nov 2025 16:42:40 +0100
+Subject: [PATCH RFC 0/4] bpf: Boolean proof rules for the BCF checker
+
+This set implements the boolean rule suite used by the BCF checker.
+It covers resolution, clause factoring/reordering, a set of streamlined
+propositional rules, and CNF equivalences.
+
+- Resolution: chained resolution over multiple clauses via pivot list and
+  polarity bitmap; produces a resolvent (or contradiction).
+- Factoring/reordering: remove duplicate literals from a clause and apply a
+  sequence of swaps; validates literal equivalence and indices.
+- Streamlined rules: SPLIT, EQ_RESOLVE, MODUS_PONENS, NOT_NOT_ELIM, CONTRA,
+  AND intro/elim, NOT_OR_ELIM, IMPLIES variants, EQUIV/XOR expansions, ITE
+  elimination on boolean conditionals, NOT_AND.
+- CNF rules: CNF_* family to normalize boolean ops into disjunctions.
+
+Hao Sun (4):
+  bpf: Boolean rule: add resolution
+  bpf: Boolean rule: add factoring and reordering
+  bpf: Boolean rule: Add streamlined rules
+  bpf: Boolean rule: CNF rules
+
+ .clang-format            |    1 +
+ kernel/bpf/bcf_checker.c | 1022 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 990 insertions(+), 33 deletions(-)
+
+-- 
+2.34.1
+

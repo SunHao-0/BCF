@@ -1,0 +1,391 @@
+From 6bca694d400fdf0a430d3f24e03d6fd7a6203f60 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 12:35:05 +0200
+Subject: [PATCH RFC 04/11] bpf: Add top-level workflow of rule application
+
+Add the rule engine: dispatch by class (core/boolean/bv), fetch premises,
+validate parameters, compute a conclusion (fact), and record last-use of
+premises to release their facts early.
+
+- jump tables per rule class; helpers to set the current step’s fact from an
+  expr-id or a newly built node; release premises marked as last_ref
+- add stubs for core/boolean/bv rules to be filled by follow-up patches
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 342 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 342 insertions(+)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 9525e726c39a..ff4709be1fca 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -1153,23 +1153,365 @@ static int check_steps(struct bcf_checker_state *st, bpfptr_t bcf_buf,
+ 	return 0;
+ }
+ 
++/*
++ * Set the conclusion/fact for the current proof step.
++ *
++ * If expr_ref 'fact' is provided, takes ownership of the expr_ref and
++ * stores its ID and expression pointer in the current step state.
++ * If 'fact' is NULL, uses the provided 'fact_id', increments its ref
++ * count, resolves it to an expression pointer, and stores both.
++ *
++ * For each premise step, if the current step is marked as the last
++ * reference to that premise (via last_ref), the premise's conclusion
++ * is released.
++ */
++static void __set_step_fact(struct bcf_checker_state *st,
++			    struct bcf_expr_ref *fact, u32 fact_id)
++{
++	struct bcf_step_state *step_st = &st->step_state[st->cur_step];
++	struct bcf_proof_step *step = &st->steps[st->cur_step_idx];
++	u32 step_id;
++
++	if (fact) {
++		/* Take ownership */
++		step_st->fact_id = fact->id;
++		step_st->fact = &fact->expr;
++	} else {
++		expr_id_get(st, fact_id);
++		step_st->fact = id_to_expr(st, fact_id);
++		step_st->fact_id = fact_id;
++	}
++
++	bcf_for_each_pm_step(step_id, step) {
++		struct bcf_step_state *pm_st = &st->step_state[step_id];
++
++		/*
++		 * NULL check is necessary because the current step may refer
++		 * the same premise multiple times, the check ensures its fact
++		 * is only put once.
++		 */
++		if (pm_st->last_ref == st->cur_step && pm_st->fact) {
++			expr_put(st, pm_st->fact);
++			pm_st->fact = NULL;
++		}
++	}
++}
++
++__used static int set_step_fact(struct bcf_checker_state *st,
++				struct bcf_expr_ref *fact)
++{
++	if (IS_ERR(fact))
++		return PTR_ERR(fact);
++	__set_step_fact(st, fact, 0);
++	return 0;
++}
++
++static int set_step_fact_id(struct bcf_checker_state *st, u32 fact_id)
++{
++	__set_step_fact(st, NULL, fact_id);
++	return 0;
++}
++
++#define RULE_TBL(rule) [BCF_RULE_NAME(rule)] = &&rule,
++#define DEFINE_JUMP_TABLE(rule_set)                                         \
++	static const void                                                   \
++		*const checkers[__MAX_##rule_set] __annotate_jump_table = { \
++			[0 ... __MAX_##rule_set - 1] = &&bad_rule,          \
++			rule_set(RULE_TBL)                                  \
++		};
++
+ static int apply_core_rule(struct bcf_checker_state *st,
+ 			   struct bcf_proof_step *step)
++{
++	DEFINE_JUMP_TABLE(BCF_CORE_RULES);
++	u16 rule = BCF_STEP_RULE(step->rule);
++	u8 param_cnt = step->param_cnt;
++	u8 pm_cnt = step->premise_cnt;
++	struct bcf_expr *param;
++	u32 arg_i;
++
++	/* Must refer to valid exprs in the proof. */
++	for (arg_i = 0; arg_i < param_cnt; arg_i++) {
++		u32 arg_id = step->args[pm_cnt + arg_i];
++
++		if (rule == BCF_RULE_REWRITE || rule == BCF_RULE_CONG)
++			break;
++		param = get_arg_expr(st, arg_id);
++		if (IS_ERR(param))
++			return PTR_ERR(param);
++	}
++	goto *checkers[rule];
++
++ASSUME:
++	/* Assume only appears once and is already check in `check_steps()`. */
++	return set_step_fact_id(st, step->args[0]);
++
++EVALUATE: { /* Evaluate constant boolean/bitvector expression */
++	return -EOPNOTSUPP;
++}
++
++DISTINCT_VALUES: { /* Inequality of distinct values */
++	return -EOPNOTSUPP;
++}
++
++ACI_NORM: { /* Equality of ACI normal form */
++	return -EOPNOTSUPP;
++}
++
++ABSORB: { /* Absorption of conjunctions */
++	return -EOPNOTSUPP;
++}
++
++REWRITE: { /* Rewrite equality to equivalent expression */
++	return -EOPNOTSUPP;
++}
++
++REFL: /* A ⊢ A = A */
++{
++	return -EOPNOTSUPP;
++}
++
++SYMM: /* A = B ⊢ B = A */
++{
++	return -EOPNOTSUPP;
++}
++
++TRANS: /* A = B, B = C ⊢ A = C */
++{
++	return -EOPNOTSUPP;
++}
++
++CONG: /* A = B ⊢ f(A) = f(B) */
++{
++	return -EOPNOTSUPP;
++}
++
++TRUE_INTRO: /* A ⊢ A = True */
++{
++	return -EOPNOTSUPP;
++}
++
++TRUE_ELIM: /* A = True ⊢ A */
++{
++	return -EOPNOTSUPP;
++}
++
++FALSE_INTRO: /* ¬A ⊢ A = False */
+ {
+ 	return -EOPNOTSUPP;
+ }
+ 
++FALSE_ELIM: /* A = False ⊢ ¬A */
++{
++	return -EOPNOTSUPP;
++}
++
++bad_rule:
++	WARN_ONCE(1, "Unknown core rule: %u", BCF_STEP_RULE(step->rule));
++	return -EFAULT;
++}
++
+ static int apply_bool_rule(struct bcf_checker_state *st,
+ 			   struct bcf_proof_step *step)
++{
++	DEFINE_JUMP_TABLE(BCF_BOOL_RULES);
++	u16 rule = BCF_STEP_RULE(step->rule);
++
++	goto *checkers[rule];
++
++RESOLUTION: /* (A ∨ l), (¬l ∨ B) ⊢ (A ∨ B) */
++{
++	return -EOPNOTSUPP;
++}
++
++FACTORING: /* (A ∨ l ∨ l) ⊢ (A ∨ l) */
+ {
+ 	return -EOPNOTSUPP;
+ }
+ 
++REORDERING: /* (l₁ ∨ ... ∨ lₙ) ⊢ (l_{π(1)} ∨ ... ∨ l_{π(n)}) */
++{
++	return -EOPNOTSUPP;
++}
++
++SPLIT: /* ⊢ A ∨ ¬A */
++{
++	return -EOPNOTSUPP;
++}
++
++EQ_RESOLVE: /* (A, A = B) ⊢ B */
++{
++	return -EOPNOTSUPP;
++}
++
++MODUS_PONENS: /* A, (A ⇒ B) ⊢ B */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_NOT_ELIM: /* ¬¬A ⊢ A */
++{
++	return -EOPNOTSUPP;
++}
++
++CONTRA: /* A, ¬A ⊢ ⊥ */
++{
++	return -EOPNOTSUPP;
++}
++
++AND_ELIM: /* (A ∧ B) ⊢ A */
++{
++	return -EOPNOTSUPP;
++}
++
++AND_INTRO: /* A, B ⊢ (A ∧ B) */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_OR_ELIM: /* ¬(A ∨ B) ⊢ ¬A */
++{
++	return -EOPNOTSUPP;
++}
++
++IMPLIES_ELIM: /* (A ⇒ B) ⊢ ¬A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_IMPLIES_ELIM: /* ¬(A ⇒ B) ⊢ A ∧ ¬B */
++{
++	return -EOPNOTSUPP;
++}
++
++EQUIV_ELIM: /* (A ⇔ B) ⊢ (¬A ∨ B) ∧ (A ∨ ¬B) */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_EQUIV_ELIM: /* ¬(A ⇔ B) ⊢ (A ∨ B) ∧ (¬A ∨ ¬B) */
++{
++	return -EOPNOTSUPP;
++}
++
++XOR_ELIM: /* (A ⊕ B) ⊢ (A ∨ B) ∧ (¬A ∨ ¬B) */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_XOR_ELIM: /* ¬(A ⊕ B) ⊢ (A ∨ ¬B) ∧ (¬A ∨ B) */
++{
++	return -EOPNOTSUPP;
++}
++
++ITE_ELIM: /* (C ? A : B) ⊢ (¬C ∨ A) ∧ (C ∨ B) */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_ITE_ELIM: /* ¬(C ? A : B) ⊢ (¬C ∨ ¬A) ∧ (C ∨ ¬B) */
++{
++	return -EOPNOTSUPP;
++}
++
++NOT_AND: /* ¬(A ∧ B) ⊢ (¬A ∨ ¬B) */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_AND_POS: /* ¬(A ∧ B) ∨ A */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_AND_NEG: /* (A ∧ B) ∨ ¬A ∨ ¬B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_OR_POS: /* ¬(A ∨ B) ∨ A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_OR_NEG: /* (A ∨ B) ∨ ¬A */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_IMPLIES_POS: /* (A ⇒ B) ∨ ¬A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_IMPLIES_NEG: /* (A ⇒ B) ∨ (A ∧ ¬B) */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_EQUIV_POS: /* ¬(A ⇔ B) ∨ ¬A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_EQUIV_NEG: /* (A ⇔ B) ∨ A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_XOR_POS: /* ¬(A ⊕ B) ∨ ¬A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_XOR_NEG: /* (A ⊕ B) ∨ A ∨ B */
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_ITE_POS: /* ¬(C ? A : B) ∨ ¬C ∨ A*/
++{
++	return -EOPNOTSUPP;
++}
++
++CNF_ITE_NEG: /* (C ? A : B) ∨ ¬C ∨ ¬A */
++{
++	return -EOPNOTSUPP;
++}
++
++ITE_EQ: /* (C ? (C ? A : B) = A : (C ? A : B) = B) */
++{
++	return -EOPNOTSUPP;
++}
++
++bad_rule:
++	WARN_ONCE(1, "Unknown boolean rule: %u", BCF_STEP_RULE(step->rule));
++	return -EFAULT;
++}
++
+ static int apply_bv_rule(struct bcf_checker_state *st,
+ 			 struct bcf_proof_step *step)
+ {
++	DEFINE_JUMP_TABLE(BCF_BV_RULES);
++
++	goto *checkers[BCF_STEP_RULE(step->rule)];
++
++BITBLAST: { /* Lowering bv term to bitblasted term (boolean circuit) */
+ 	return -EOPNOTSUPP;
+ }
++POLY_NORM: { /* Equality of polynomial normal form */
++	return -EOPNOTSUPP;
++}
++POLY_NORM_EQ: { /* Polynomial normalization for relations */
++	return -EOPNOTSUPP;
++}
++
++bad_rule:
++	WARN_ONCE(1, "Unknown bv rule: %u", BCF_STEP_RULE(step->rule));
++	return -EFAULT;
++}
++#undef DEFINE_JUMP_TABLE
++#undef RULE_TBL
+ 
+ static int apply_rules(struct bcf_checker_state *st)
+ {
+-- 
+2.34.1
+

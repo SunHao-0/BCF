@@ -1,0 +1,194 @@
+From d9947482f61a615d2d96e1dfcccc2d32fc81c721 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 17:46:22 +0200
+Subject: [PATCH RFC 08/11] bpf: Add core rule: rewrites 
+
+Extend UAPI with a catalog of rewrite identifiers (BCF_REWRITE_*). Each
+rewrite denotes a proven equivalence schema from the solver (match = target),
+parametric over types and optionally guarded by conditions.
+
+- Rewrites are referenced by id in proof steps; parameters are expression-ids
+- Conditional rewrites require supplying premises that prove their condition(s)
+- The checker substitutes parameters into the (match,target) templates and
+  asserts the resulting equality as the step’s fact
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/uapi/linux/bcf.h | 163 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 163 insertions(+)
+
+diff --git a/include/uapi/linux/bcf.h b/include/uapi/linux/bcf.h
+index 459ad3ed5c6f..8e93a46898aa 100644
+--- a/include/uapi/linux/bcf.h
++++ b/include/uapi/linux/bcf.h
+@@ -194,4 +194,167 @@ enum bcf_bv_rule {
+ };
+ #undef BCF_RULE_ENUM_VARIANT
+ 
++/* Rewrite rules */
++#define BCF_REWRITE_NAME(x)	BCF_REWRITE_##x
++#define BCF_REWRITES_TABLE(FN)		\
++	FN(EQ_REFL)			\
++	FN(EQ_SYMM)			\
++	FN(EQ_COND_DEQ)			\
++	FN(EQ_ITE_LIFT)			\
++	FN(DISTINCT_BINARY_ELIM)	\
++	FN(ITE_TRUE_COND)		\
++	FN(ITE_FALSE_COND)		\
++	FN(ITE_NOT_COND)		\
++	FN(ITE_EQ_BRANCH)		\
++	FN(ITE_THEN_LOOKAHEAD)		\
++	FN(ITE_ELSE_LOOKAHEAD)		\
++	FN(ITE_THEN_NEG_LOOKAHEAD)	\
++	FN(ITE_ELSE_NEG_LOOKAHEAD)	\
++	FN(BOOL_DOUBLE_NOT_ELIM)	\
++	FN(BOOL_NOT_TRUE)		\
++	FN(BOOL_NOT_FALSE)		\
++	FN(BOOL_EQ_TRUE)		\
++	FN(BOOL_EQ_FALSE)		\
++	FN(BOOL_EQ_NREFL)		\
++	FN(BOOL_IMPL_FALSE1)		\
++	FN(BOOL_IMPL_FALSE2)		\
++	FN(BOOL_IMPL_TRUE1)		\
++	FN(BOOL_IMPL_TRUE2)		\
++	FN(BOOL_IMPL_ELIM)		\
++	FN(BOOL_DUAL_IMPL_EQ)		\
++	FN(BOOL_AND_CONF)		\
++	FN(BOOL_AND_CONF2)		\
++	FN(BOOL_OR_TAUT)		\
++	FN(BOOL_OR_TAUT2)		\
++	FN(BOOL_IMPLIES_DE_MORGAN)	\
++	FN(BOOL_XOR_REFL)		\
++	FN(BOOL_XOR_NREFL)		\
++	FN(BOOL_XOR_FALSE)		\
++	FN(BOOL_XOR_TRUE)		\
++	FN(BOOL_XOR_COMM)		\
++	FN(BOOL_XOR_ELIM)		\
++	FN(BOOL_NOT_XOR_ELIM)		\
++	FN(BOOL_NOT_EQ_ELIM1)		\
++	FN(BOOL_NOT_EQ_ELIM2)		\
++	FN(ITE_NEG_BRANCH)		\
++	FN(ITE_THEN_TRUE)		\
++	FN(ITE_ELSE_FALSE)		\
++	FN(ITE_THEN_FALSE)		\
++	FN(ITE_ELSE_TRUE)		\
++	FN(ITE_THEN_LOOKAHEAD_SELF)	\
++	FN(ITE_ELSE_LOOKAHEAD_SELF)	\
++	FN(ITE_THEN_LOOKAHEAD_NOT_SELF)	\
++	FN(ITE_ELSE_LOOKAHEAD_NOT_SELF)	\
++	FN(ITE_EXPAND)			\
++	FN(BOOL_NOT_ITE_ELIM)		\
++	FN(BV_CONCAT_EXTRACT_MERGE)	\
++	FN(BV_EXTRACT_EXTRACT)		\
++	FN(BV_EXTRACT_WHOLE)		\
++	FN(BV_EXTRACT_CONCAT_1)		\
++	FN(BV_EXTRACT_CONCAT_2)		\
++	FN(BV_EXTRACT_CONCAT_3)		\
++	FN(BV_EXTRACT_CONCAT_4)		\
++	FN(BV_EQ_EXTRACT_ELIM1)		\
++	FN(BV_EQ_EXTRACT_ELIM2)		\
++	FN(BV_EQ_EXTRACT_ELIM3)		\
++	FN(BV_EXTRACT_NOT)		\
++	FN(BV_EXTRACT_SIGN_EXTEND_1)	\
++	FN(BV_EXTRACT_SIGN_EXTEND_2)	\
++	FN(BV_EXTRACT_SIGN_EXTEND_3)	\
++	FN(BV_NOT_XOR)			\
++	FN(BV_AND_SIMPLIFY_1)		\
++	FN(BV_AND_SIMPLIFY_2)		\
++	FN(BV_OR_SIMPLIFY_1)		\
++	FN(BV_OR_SIMPLIFY_2)		\
++	FN(BV_XOR_SIMPLIFY_2)		\
++	FN(BV_XOR_SIMPLIFY_3)		\
++	FN(BV_ULT_ADD_ONE)		\
++	FN(BV_MULT_SLT_MULT_1)		\
++	FN(BV_MULT_SLT_MULT_2)		\
++	FN(BV_COMMUTATIVE_XOR)		\
++	FN(BV_ZERO_EXTEND_ELIMINATE_0)	\
++	FN(BV_SIGN_EXTEND_ELIMINATE_0)	\
++	FN(BV_NOT_NEQ)			\
++	FN(BV_ULT_ONES)			\
++	FN(BV_CONCAT_MERGE_CONST)	\
++	FN(BV_COMMUTATIVE_ADD)		\
++	FN(BV_SUB_ELIMINATE)		\
++	FN(BV_ITE_WIDTH_ONE)		\
++	FN(BV_ITE_WIDTH_ONE_NOT)	\
++	FN(BV_EQ_XOR_SOLVE)		\
++	FN(BV_EQ_NOT_SOLVE)		\
++	FN(BV_UGT_ELIMINATE)		\
++	FN(BV_UGE_ELIMINATE)		\
++	FN(BV_SGT_ELIMINATE)		\
++	FN(BV_SGE_ELIMINATE)		\
++	FN(BV_SLE_ELIMINATE)		\
++	FN(BV_ULE_ELIMINATE)		\
++	FN(BV_ZERO_EXTEND_ELIMINATE)	\
++	FN(BV_ITE_EQUAL_CHILDREN)	\
++	FN(BV_ITE_CONST_CHILDREN_1)	\
++	FN(BV_ITE_CONST_CHILDREN_2)	\
++	FN(BV_ITE_EQUAL_COND_1)		\
++	FN(BV_ITE_EQUAL_COND_2)		\
++	FN(BV_ITE_EQUAL_COND_3)		\
++	FN(BV_ITE_MERGE_THEN_IF)	\
++	FN(BV_ITE_MERGE_ELSE_IF)	\
++	FN(BV_ITE_MERGE_THEN_ELSE)	\
++	FN(BV_ITE_MERGE_ELSE_ELSE)	\
++	FN(BV_SHL_BY_CONST_0)		\
++	FN(BV_SHL_BY_CONST_1)		\
++	FN(BV_SHL_BY_CONST_2)		\
++	FN(BV_LSHR_BY_CONST_0)		\
++	FN(BV_LSHR_BY_CONST_1)		\
++	FN(BV_LSHR_BY_CONST_2)		\
++	FN(BV_ASHR_BY_CONST_0)		\
++	FN(BV_ASHR_BY_CONST_1)		\
++	FN(BV_ASHR_BY_CONST_2)		\
++	FN(BV_AND_CONCAT_PULLUP)	\
++	FN(BV_OR_CONCAT_PULLUP)		\
++	FN(BV_XOR_CONCAT_PULLUP)	\
++	FN(BV_AND_CONCAT_PULLUP2)	\
++	FN(BV_OR_CONCAT_PULLUP2)	\
++	FN(BV_XOR_CONCAT_PULLUP2)	\
++	FN(BV_AND_CONCAT_PULLUP3)	\
++	FN(BV_OR_CONCAT_PULLUP3)	\
++	FN(BV_XOR_CONCAT_PULLUP3)	\
++	FN(BV_XOR_DUPLICATE)		\
++	FN(BV_XOR_ONES)			\
++	FN(BV_ULE_MAX)			\
++	FN(BV_XOR_NOT)			\
++	FN(BV_NOT_IDEMP)		\
++	FN(BV_ULT_ZERO_1)		\
++	FN(BV_ULT_ZERO_2)		\
++	FN(BV_ULT_SELF)			\
++	FN(BV_LT_SELF)			\
++	FN(BV_ULE_SELF)			\
++	FN(BV_ULE_ZERO)			\
++	FN(BV_ZERO_ULE)			\
++	FN(BV_SLE_SELF)			\
++	FN(BV_NOT_ULT)			\
++	FN(BV_SHL_ZERO)			\
++	FN(BV_LSHR_ZERO)		\
++	FN(BV_ASHR_ZERO)		\
++	FN(BV_ULT_ONE)			\
++	FN(BV_MERGE_SIGN_EXTEND_1)	\
++	FN(BV_MERGE_SIGN_EXTEND_2)	\
++	FN(BV_SIGN_EXTEND_EQ_CONST_1)	\
++	FN(BV_SIGN_EXTEND_EQ_CONST_2)	\
++	FN(BV_ZERO_EXTEND_EQ_CONST_1)	\
++	FN(BV_ZERO_EXTEND_EQ_CONST_2)	\
++	FN(BV_ZERO_EXTEND_ULT_CONST_1)	\
++	FN(BV_ZERO_EXTEND_ULT_CONST_2)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_1)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_2)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_3)	\
++	FN(BV_SIGN_EXTEND_ULT_CONST_4)
++
++#define BCF_REWRITE_ENUM_VARIANT(x) BCF_REWRITE_NAME(x),
++enum bcf_rewrite_id {
++	BCF_REWRITE_UNSPEC = 0,
++	BCF_REWRITES_TABLE(BCF_REWRITE_ENUM_VARIANT)
++	__MAX_BCF_REWRITES,
++};
++#undef BCF_REWRITE_ENUM_VARIANT
++
+ #endif /* _UAPI__LINUX_BCF_H__ */
+-- 
+2.34.1
+

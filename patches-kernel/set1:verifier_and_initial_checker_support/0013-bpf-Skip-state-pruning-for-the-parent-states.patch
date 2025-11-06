@@ -1,0 +1,81 @@
+From 47734ac101fc7ebd474213a558f58692f5089369 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Thu, 30 Oct 2025 14:50:36 +0100
+Subject: [PATCH RFC 13/17] bpf: Skip state pruning for the parent states
+
+Different incoming paths to the same instruction may yield different path
+conditions; pruning by containment would drop paths with different constraints.
+
+- Add `children_unsafe` flag to `struct bpf_verifier_state`.
+- In `is_state_visited()`, if a visited candidate has `children_unsafe`, treat
+  it as a miss.
+- Propagate `children_unsafe` to the next state on split and clear it in the
+  current state when pushing a new parent.
+- After a refinement request, clear all `bcf_expr` in registers and mark all
+  collected parents (except the base) as `children_unsafe` to avoid pruning
+  alternative suffixes that may build different path conditions.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  1 +
+ kernel/bpf/verifier.c        | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index b430702784e2..9b91353a86d7 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -422,6 +422,7 @@ struct bpf_verifier_state {
+ 	bool speculative;
+ 	bool in_sleepable;
+ 	bool cleaned;
++	bool children_unsafe;
+ 
+ 	/* first and last insn idx of this verifier state */
+ 	u32 first_insn_idx;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index f1e8e70f9f61..ec0e736f39c5 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19904,6 +19904,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 		states_cnt++;
+ 		if (sl->state.insn_idx != insn_idx)
+ 			continue;
++		if (sl->state.children_unsafe)
++			goto miss;
+ 
+ 		if (sl->state.branches) {
+ 			struct bpf_func_state *frame = sl->state.frame[sl->state.curframe];
+@@ -20216,6 +20218,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 		return err;
+ 	}
+ 
++	new->children_unsafe = cur->children_unsafe;
++	cur->children_unsafe = false;
+ 	cur->parent = new;
+ 	cur->first_insn_idx = insn_idx;
+ 	cur->dfs_depth = new->dfs_depth + 1;
+@@ -24272,6 +24276,20 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+ 	if (!err && (env->bcf.refine_cond >= 0 || env->bcf.path_cond >= 0))
+ 		mark_bcf_requested(env);
+ 
++	for (i = 0; i < MAX_BPF_REG; i++)
++		regs[i].bcf_expr = -1;
++
++	/*
++	 * Mark the parents as children_unsafe, i.e., they are not safe for
++	 * state pruning anymore. Say s0 is contained in s1 (marked), then
++	 * exploring s0 will reach the same error state that triggers the
++	 * refinement. However, since the path they reach the pruning point
++	 * can be different, the path condition collected for s0 can be
++	 * different from s1's. Hence, pruning is not safe.
++	 */
++	for (i = 0; i < bcf->vstate_cnt - 1; i++)
++		bcf->parents[i]->children_unsafe = true;
++
+ 	kfree(env->bcf.parents);
+ 	return err ?: 1;
+ }
+-- 
+2.34.1
+

@@ -1,0 +1,763 @@
+From 189343919fc90b039d65e212f578fba52507fe67 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 3 Nov 2025 19:52:11 +0100
+Subject: [PATCH RFC 3/3] bpftool: Add bcf support
+
+Allow the user to specify the prover path, and check the BCF support
+automatically. If supported, register bpftool callback to libbpf,
+the callback will be invoked when proof is requested. It then
+translates the condition into SMTlib format, invokes the solver,
+waits and transmits the proof produced by the prover.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ tools/bpf/bpftool/bcf_prover.c | 654 +++++++++++++++++++++++++++++++++
+ tools/bpf/bpftool/main.c       |   6 +-
+ tools/bpf/bpftool/main.h       |   3 +
+ tools/bpf/bpftool/prog.c       |   5 +-
+ 4 files changed, 666 insertions(+), 2 deletions(-)
+ create mode 100644 tools/bpf/bpftool/bcf_prover.c
+
+diff --git a/tools/bpf/bpftool/bcf_prover.c b/tools/bpf/bpftool/bcf_prover.c
+new file mode 100644
+index 000000000000..ce910279fee9
+--- /dev/null
++++ b/tools/bpf/bpftool/bcf_prover.c
+@@ -0,0 +1,654 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <errno.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++
++#include <linux/bcf.h>
++#include <linux/bpf.h>
++
++#include <bpf/libbpf.h>
++
++#include "main.h"
++
++static const struct bcf_expr *id_to_expr(const struct bcf_expr *exprs, __u32 id)
++{
++	return exprs + id;
++}
++
++static bool expr_arg_is_id(__u8 code)
++{
++	/* Only BV_VAL carries non-id immediates */
++	return code != (BCF_BV | BCF_VAL);
++}
++
++static __u8 bv_size(const struct bcf_expr *e)
++{
++	__u8 op = BCF_OP(e->code);
++
++	if (op == BCF_EXTRACT)
++		return (__u8)(BCF_EXTRACT_START(e->params) -
++			      BCF_EXTRACT_END(e->params) + 1);
++	if (op == BCF_FROM_BOOL)
++		return e->vlen;
++	return BCF_BV_WIDTH(e->params);
++}
++
++static __u64 bv_val(const struct bcf_expr *e)
++{
++	if (e->vlen == 1)
++		return e->args[0];
++	return ((__u64)e->args[1] << 32) | (__u64)e->args[0];
++}
++
++struct bcf_smt_emit_ctx {
++	const struct bcf_expr *exprs;
++	__u32 expr_cnt;
++	__u32 root_id;
++
++	__u8 *is_bound;
++	__u32 *refcnt; /* per id */
++	__u32 *postorder; /* ids in postorder */
++	__u32 post_sz;
++
++	FILE *out;
++};
++
++static int dag_refcount_postorder(struct bcf_smt_emit_ctx *ctx, __u32 id)
++{
++#define BCF_MAX_DAG_STACK 128
++	struct frame {
++		__u32 id;
++		__u32 next_child;
++		const struct bcf_expr *e;
++	} stack[BCF_MAX_DAG_STACK];
++	__u32 sp = 0;
++
++	ctx->refcnt[id]++;
++	stack[sp++] = (struct frame){ .id = id,
++				      .next_child = 0,
++				      .e = id_to_expr(ctx->exprs, id) };
++
++	while (sp) {
++		struct frame *top = &stack[sp - 1];
++		const struct bcf_expr *e = top->e;
++
++		if (e->vlen && expr_arg_is_id(e->code) &&
++		    top->next_child < e->vlen) {
++			__u32 child = e->args[top->next_child++];
++
++			if (ctx->refcnt[child] > 0) {
++				ctx->refcnt[child]++;
++				continue;
++			}
++
++			if (sp >= BCF_MAX_DAG_STACK)
++				return -E2BIG;
++
++			ctx->refcnt[child]++;
++			stack[sp++] = (struct frame){
++				.id = child,
++				.next_child = 0,
++				.e = id_to_expr(ctx->exprs, child)
++			};
++			continue;
++		}
++
++		/* All children processed */
++		ctx->postorder[ctx->post_sz++] = top->id;
++		sp--;
++	}
++
++	return 0;
++}
++
++static void print_symbol(FILE *out, const char *prefix, __u32 id)
++{
++	fprintf(out, "%s%u", prefix, id);
++}
++
++static void emit_bv_const(FILE *out, __u64 val, __u32 width)
++{
++	fprintf(out, "(_ bv%llu %u)", val, width);
++}
++
++static bool expr_is_shared_node(const struct bcf_expr *e, __u32 refcnt)
++{
++	__u8 ty = BCF_TYPE(e->code), op = BCF_OP(e->code);
++
++	if (refcnt <= 1)
++		return false;
++	if ((ty == BCF_BV && (op == BCF_VAR || op == BCF_VAL)) ||
++	    (ty == BCF_BOOL && (op == BCF_VAR || op == BCF_VAL)))
++		return false;
++
++	return true;
++}
++
++static const char *op_bv_token(__u8 op)
++{
++	switch (op) {
++	case BPF_ADD:
++		return "bvadd";
++	case BPF_SUB:
++		return "bvsub";
++	case BPF_MUL:
++		return "bvmul";
++	case BPF_OR:
++		return "bvor";
++	case BPF_AND:
++		return "bvand";
++	case BPF_XOR:
++		return "bvxor";
++	case BPF_NEG:
++		return "bvneg";
++	case BCF_BVNOT:
++		return "bvnot";
++	case BPF_LSH:
++		return "bvshl";
++	case BPF_RSH:
++		return "bvlshr";
++	case BPF_ARSH:
++		return "bvashr";
++	case BPF_DIV:
++		return "bvudiv";
++	case BPF_MOD:
++		return "bvurem";
++	case BCF_SDIV:
++		return "bvsdiv";
++	case BCF_SMOD:
++		return "bvsmod";
++	default:
++		return NULL;
++	}
++}
++
++static const char *op_bool_token(__u8 op)
++{
++	switch (op) {
++	case BCF_CONJ:
++		return "and";
++	case BCF_DISJ:
++		return "or";
++	case BCF_NOT:
++		return "not";
++	case BCF_XOR:
++		return "xor";
++	case BCF_IMPLIES:
++		return "=>";
++	default:
++		return NULL;
++	}
++}
++
++static void emit_expr(const struct bcf_smt_emit_ctx *ctx, __u32 id);
++
++static void emit_compare(const struct bcf_smt_emit_ctx *ctx,
++			 const struct bcf_expr *e)
++{
++	__u8 op = BCF_OP(e->code);
++	const char *tok = NULL;
++
++	switch (op) {
++	case BPF_JEQ:
++		tok = "=";
++		break;
++	case BPF_JNE:
++		tok = "distinct";
++		break;
++	case BPF_JLT:
++		tok = "bvult";
++		break;
++	case BPF_JLE:
++		tok = "bvule";
++		break;
++	case BPF_JGT:
++		tok = "bvugt";
++		break;
++	case BPF_JGE:
++		tok = "bvuge";
++		break;
++	case BPF_JSLT:
++		tok = "bvslt";
++		break;
++	case BPF_JSLE:
++		tok = "bvsle";
++		break;
++	case BPF_JSGT:
++		tok = "bvsgt";
++		break;
++	case BPF_JSGE:
++		tok = "bvsge";
++		break;
++	default:
++		tok = "unknown";
++		break;
++	}
++
++	fprintf(ctx->out, "(%s ", tok);
++	emit_expr(ctx, e->args[0]);
++	fprintf(ctx->out, " ");
++	emit_expr(ctx, e->args[1]);
++	fprintf(ctx->out, ")");
++}
++
++static void emit_indexed_bv(const struct bcf_smt_emit_ctx *ctx,
++			    const struct bcf_expr *e)
++{
++	__u8 op = BCF_OP(e->code);
++
++	switch (op) {
++	case BCF_EXTRACT:
++		fprintf(ctx->out, "((_ extract %d %d) ",
++			BCF_EXTRACT_START(e->params),
++			BCF_EXTRACT_END(e->params));
++		emit_expr(ctx, e->args[0]);
++		fprintf(ctx->out, ")");
++		break;
++	case BCF_SIGN_EXTEND:
++		fprintf(ctx->out, "((_ sign_extend %d) ",
++			BCF_EXT_LEN(e->params));
++		emit_expr(ctx, e->args[0]);
++		fprintf(ctx->out, ")");
++		break;
++	case BCF_ZERO_EXTEND:
++		fprintf(ctx->out, "((_ zero_extend %d) ",
++			BCF_EXT_LEN(e->params));
++		emit_expr(ctx, e->args[0]);
++		fprintf(ctx->out, ")");
++		break;
++	case BCF_REPEAT: {
++		__u32 n = BCF_REPEAT_N(e->params);
++		fprintf(ctx->out, "((_ repeat %u) ", n);
++		emit_expr(ctx, e->args[0]);
++		fprintf(ctx->out, ")");
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++static void emit_expr(const struct bcf_smt_emit_ctx *ctx, __u32 id)
++{
++	const struct bcf_expr *e = id_to_expr(ctx->exprs, id);
++	__u8 ty = BCF_TYPE(e->code);
++	__u8 op = BCF_OP(e->code);
++
++	if (expr_is_shared_node(e, ctx->refcnt[id])) {
++		/* If already bound, just refer to symbol */
++		if (ctx->is_bound[id]) {
++			print_symbol(ctx->out, "t", id);
++			return;
++		}
++	}
++
++	if (ty == BCF_BOOL && op == BCF_VAL) {
++		fprintf(ctx->out, "%s",
++			BCF_BOOL_LITERAL(e->params) ? "true" : "false");
++		return;
++	}
++	if (ty == BCF_BV && op == BCF_VAL) {
++		emit_bv_const(ctx->out, bv_val(e), bv_size(e));
++		return;
++	}
++	if (ty == BCF_BV && op == BCF_VAR) {
++		print_symbol(ctx->out, "v", id);
++		return;
++	}
++	if (ty == BCF_BOOL && op == BCF_VAR) {
++		print_symbol(ctx->out, "b", id);
++		return;
++	}
++
++	if (op == BCF_EXTRACT || op == BCF_SIGN_EXTEND ||
++	    op == BCF_ZERO_EXTEND || op == BCF_REPEAT) {
++		emit_indexed_bv(ctx, e);
++		return;
++	}
++
++	if (op == BCF_ITE) {
++		const struct bcf_expr *cond =
++			id_to_expr(ctx->exprs, e->args[0]);
++
++		fprintf(ctx->out, "(ite ");
++
++		if (BCF_TYPE(cond->code) == BCF_BOOL) {
++			emit_expr(ctx, e->args[0]);
++		} else {
++			/* 1-bit BV treated as Bool: (= cond 1) */
++			fprintf(ctx->out, "(= ");
++			emit_expr(ctx, e->args[0]);
++			fprintf(ctx->out, " (_ bv1 1))");
++		}
++
++		fprintf(ctx->out, " ");
++		emit_expr(ctx, e->args[1]);
++		fprintf(ctx->out, " ");
++		emit_expr(ctx, e->args[2]);
++		fprintf(ctx->out, ")");
++		return;
++	}
++
++	if (ty == BCF_BOOL) {
++		const char *tok = op_bool_token(op);
++
++		if (op == BPF_JEQ || op == BPF_JNE || op == BPF_JLT ||
++		    op == BPF_JLE || op == BPF_JGT || op == BPF_JGE ||
++		    op == BPF_JSLT || op == BPF_JSLE || op == BPF_JSGT ||
++		    op == BPF_JSGE) {
++			emit_compare(ctx, e);
++			return;
++		}
++
++		if (tok) {
++			fprintf(ctx->out, "(%s", tok);
++			for (__u32 i = 0; i < e->vlen; i++) {
++				fprintf(ctx->out, " ");
++				emit_expr(ctx, e->args[i]);
++			}
++			fprintf(ctx->out, ")");
++			return;
++		}
++	}
++
++	if (ty == BCF_BV) {
++		const char *tok = op_bv_token(op);
++
++		if (op == BCF_CONCAT) {
++			fprintf(ctx->out, "(concat");
++			for (__u32 i = 0; i < e->vlen; i++) {
++				fprintf(ctx->out, " ");
++				emit_expr(ctx, e->args[i]);
++			}
++			fprintf(ctx->out, ")");
++			return;
++		}
++
++		if (tok) {
++			fprintf(ctx->out, "(%s", tok);
++			for (__u32 i = 0; i < e->vlen; i++) {
++				fprintf(ctx->out, " ");
++				emit_expr(ctx, e->args[i]);
++			}
++			fprintf(ctx->out, ")");
++			return;
++		}
++	}
++
++	/* Fallback to a printable marker if unknown */
++	fprintf(ctx->out, "(unsupported node %u)", id);
++}
++
++static void emit_declarations(const struct bcf_smt_emit_ctx *ctx)
++{
++	for (__u32 id = 0; id < ctx->expr_cnt; id++) {
++		const struct bcf_expr *e = id_to_expr(ctx->exprs, id);
++		__u8 ty, op;
++
++		if (!ctx->refcnt[id])
++			continue;
++
++		ty = BCF_TYPE(e->code);
++		op = BCF_OP(e->code);
++		if (ty == BCF_BV && op == BCF_VAR) {
++			fprintf(ctx->out, "(declare-fun ");
++			print_symbol(ctx->out, "v", id);
++			fprintf(ctx->out, " () (_ BitVec %u))\n", bv_size(e));
++		} else if (ty == BCF_BOOL && op == BCF_VAR) {
++			fprintf(ctx->out, "(declare-fun ");
++			print_symbol(ctx->out, "b", id);
++			fprintf(ctx->out, " () Bool)\n");
++		}
++	}
++}
++
++/*
++ * SMT-LIB QF_BV formatter for BCF DAGs
++ *
++ * A general formatter that consumes a contiguous array of `struct bcf_expr`
++ * nodes (as exported by the kernel) and a chosen root id.
++ * It emits a QF_BV formula with:
++ *   - variable declarations for reachable VARs
++ *   - let-bindings for shared subterms (refcount > 1)
++ *   - a single (assert ...) for the root (Bool type)
++ */
++static int format_smt_from_dag(const struct bcf_expr *exprs, __u32 expr_cnt,
++			       __u32 root_id, FILE *out)
++{
++	struct bcf_smt_emit_ctx ctx = {
++		.exprs = exprs,
++		.expr_cnt = expr_cnt,
++		.root_id = root_id,
++		.out = out,
++	};
++	const struct bcf_expr *root;
++	__u32 shared_cnt = 0;
++	int err;
++
++	root = id_to_expr(exprs, root_id);
++	if (BCF_TYPE(root->code) != BCF_BOOL)
++		return -EINVAL;
++
++	ctx.refcnt = calloc(expr_cnt, sizeof(__u32));
++	ctx.postorder = calloc(expr_cnt, sizeof(__u32));
++	ctx.is_bound = calloc(expr_cnt, sizeof(__u8));
++	if (!ctx.refcnt || !ctx.postorder || !ctx.is_bound) {
++		err = -ENOMEM;
++		goto err_free;
++	}
++
++	/* Build refcounts and postorder from root */
++	err = dag_refcount_postorder(&ctx, root_id);
++	if (err)
++		goto err_free;
++
++	/* Emit prologue */
++	fprintf(out, "(set-logic QF_BV)\n");
++	emit_declarations(&ctx);
++
++	fprintf(out, "(assert ");
++	/* Build nested let for shared nodes in postorder (deps first) */
++	for (__u32 i = 0; i < ctx.post_sz; i++) {
++		__u32 id = ctx.postorder[i];
++		const struct bcf_expr *e = id_to_expr(ctx.exprs, id);
++
++		if (!expr_is_shared_node(e, ctx.refcnt[id]))
++			continue;
++
++		fprintf(out, "(let ((");
++		print_symbol(out, "t", id);
++		fprintf(out, " ");
++		ctx.is_bound[id] = 0;
++		emit_expr(&ctx, id);
++		fprintf(out, ")) ");
++		ctx.is_bound[id] = 1; /* Now bound */
++		shared_cnt++;
++	}
++
++	/* Emit body (root) */
++	emit_expr(&ctx, root_id);
++
++	/* Close nested lets */
++	for (__u32 i = 0; i < shared_cnt; i++)
++		fprintf(out, ")");
++
++	fprintf(out, ")\n");
++	fprintf(out, "(check-sat)\n(exit)\n");
++
++err_free:
++	free(ctx.refcnt);
++	free(ctx.postorder);
++	free(ctx.is_bound);
++	return err;
++}
++
++static const char *__prover_path;
++
++static int do_prove(__u32 *bcf_buf, __u32 expr_cnt, __u32 root_id,
++		    __u32 bcf_buf_size, __u32 *proof_size)
++{
++	struct bcf_expr *exprs = (struct bcf_expr *)bcf_buf;
++	char proof_path[] = "/tmp/bcf_proof.XXXXXX";
++	int proof_out, status;
++	struct stat proof_st;
++	char cmd[1024];
++	FILE *p;
++	int err = 0;
++
++	proof_out = mkstemp(proof_path);
++	if (proof_out < 0)
++		return -errno;
++
++	snprintf(cmd, sizeof(cmd),
++		 "%s --lang smt2 --proof-format=bcf "
++		 "--proof-granularity=dsl-rewrite "
++		 "--bcf-proof-out=%s --dump-proofs",
++		 __prover_path, proof_path);
++
++	p = popen(cmd, "w");
++	if (!p) {
++		err = -errno;
++		goto err_close;
++	}
++
++	if (format_smt_from_dag(exprs, expr_cnt, root_id, p) != 0) {
++		pclose(p);
++		err = -EFAULT;
++		goto err_close;
++	}
++
++	status = pclose(p);
++	if (status == -1) {
++		err = -errno;
++		goto err_close;
++	}
++	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++		err = -EFAULT;
++		goto err_close;
++	}
++
++	/* Read proof and hand to libbpf. */
++	if (fstat(proof_out, &proof_st) < 0) {
++		err = -errno;
++		goto err_close;
++	}
++	if (!proof_st.st_size || proof_st.st_size > bcf_buf_size) {
++		err = -EINVAL;
++		goto err_close;
++	}
++
++	if (read(proof_out, bcf_buf, proof_st.st_size) != proof_st.st_size)
++		err = -EFAULT;
++	else
++		*proof_size = proof_st.st_size;
++
++err_close:
++	close(proof_out);
++	unlink(proof_path);
++	return err;
++}
++
++/*
++ * Command: prover --proof-format=help
++ * Expected output: ... + bcf ...
++ */
++static bool prover_has_bcf_support(const char *prover)
++{
++	char buf[1024];
++	FILE *p;
++	size_t off = 0, n;
++
++	snprintf(buf, sizeof(buf), "%s --proof-format=help 2>&1", prover);
++	p = popen(buf, "r");
++	if (!p)
++		return false;
++
++	while (off < sizeof(buf) - 1 &&
++	       (n = fread(buf + off, 1, sizeof(buf) - 1 - off, p)) > 0)
++		off += n;
++	buf[off] = '\0';
++
++	pclose(p);
++	return strstr(buf, "+ bcf") != NULL;
++}
++
++static int bcf_prove(__u32 *bcf_buf, __u32 bcf_buf_size,
++		     __u32 *bcf_buf_true_size, __u32 *bcf_flags)
++{
++	__u32 expr_cnt;
++	int path_cond, refine_cond, err;
++	__u32 cond_sz = *bcf_buf_true_size;
++
++	if (!__prover_path)
++		return -EOPNOTSUPP;
++
++	if (cond_sz < sizeof(__u32) * 2 || cond_sz > bcf_buf_size ||
++	    cond_sz % sizeof(__u32))
++		return -EFAULT;
++
++	expr_cnt = cond_sz / sizeof(__u32);
++	path_cond = bcf_buf[expr_cnt - 2];
++	refine_cond = bcf_buf[expr_cnt - 1];
++	expr_cnt -= 2;
++
++	if (path_cond < 0 && refine_cond < 0)
++		return -EFAULT;
++
++	*bcf_flags = 0;
++	*bcf_buf_true_size = 0;
++
++	if (path_cond >= 0) {
++		p_info("Proving the path condition...");
++		if (verifier_logs)
++			format_smt_from_dag((struct bcf_expr *)bcf_buf,
++					    expr_cnt, path_cond, stdout);
++		err = do_prove(bcf_buf, expr_cnt, path_cond, bcf_buf_size,
++			       bcf_buf_true_size);
++		if (!err) {
++			*bcf_flags = BCF_F_PROOF_PATH_UNREACHABLE;
++			return 0;
++		}
++	}
++
++	if (refine_cond < 0)
++		return -EINVAL;
++
++	p_info("Proving the refine condition...");
++	if (verifier_logs)
++		format_smt_from_dag((struct bcf_expr *)bcf_buf, expr_cnt,
++				    refine_cond, stdout);
++	return do_prove(bcf_buf, expr_cnt, refine_cond, bcf_buf_size,
++			bcf_buf_true_size);
++}
++
++int bcf_set_prover(const char *arg)
++{
++	const char *provers[4] = {
++		arg,
++		"cvc5",
++		"/usr/bin/cvc5",
++		"/usr/local/bin/cvc5",
++	};
++
++	for (size_t i = 0; i < ARRAY_SIZE(provers); i++) {
++		if (!provers[i])
++			continue;
++
++		if (access(provers[i], X_OK) == 0 &&
++		    prover_has_bcf_support(provers[i])) {
++			__prover_path = provers[i];
++			p_info("Using prover: %s", __prover_path);
++			libbpf_set_prover(bcf_prove);
++			return 0;
++		}
++	}
++
++	return -EOPNOTSUPP;
++}
+diff --git a/tools/bpf/bpftool/main.c b/tools/bpf/bpftool/main.c
+index a829a6a49037..c9fd55da3f86 100644
+--- a/tools/bpf/bpftool/main.c
++++ b/tools/bpf/bpftool/main.c
+@@ -36,6 +36,7 @@ struct hashmap *refs_table;
+ bool sign_progs;
+ const char *private_key_path;
+ const char *cert_path;
++const char *prover_path;
+ 
+ static void __noreturn clean_and_exit(int i)
+ {
+@@ -478,7 +479,7 @@ int main(int argc, char **argv)
+ 	bin_name = "bpftool";
+ 
+ 	opterr = 0;
+-	while ((opt = getopt_long(argc, argv, "VhpjfLmndSi:k:B:l",
++	while ((opt = getopt_long(argc, argv, "VhpjfLmndSi:k:B:lP:",
+ 				  options, NULL)) >= 0) {
+ 		switch (opt) {
+ 		case 'V':
+@@ -534,6 +535,9 @@ int main(int argc, char **argv)
+ 		case 'i':
+ 			cert_path = optarg;
+ 			break;
++		case 'P':
++			prover_path = optarg;
++			break;
+ 		default:
+ 			p_err("unrecognized option '%s'", argv[optind - 1]);
+ 			if (json_output)
+diff --git a/tools/bpf/bpftool/main.h b/tools/bpf/bpftool/main.h
+index 1130299cede0..c793cba8b6ea 100644
+--- a/tools/bpf/bpftool/main.h
++++ b/tools/bpf/bpftool/main.h
+@@ -94,6 +94,7 @@ extern struct hashmap *refs_table;
+ extern bool sign_progs;
+ extern const char *private_key_path;
+ extern const char *cert_path;
++extern const char *prover_path;
+ 
+ void __printf(1, 2) p_err(const char *fmt, ...);
+ void __printf(1, 2) p_info(const char *fmt, ...);
+@@ -295,4 +296,6 @@ int read_kernel_config(const struct kernel_config_option *requested_options,
+ 		       const char *define_prefix);
+ int bpftool_prog_sign(struct bpf_load_and_run_opts *opts);
+ __u32 register_session_key(const char *key_der_path);
++
++int bcf_set_prover(const char *arg);
+ #endif
+diff --git a/tools/bpf/bpftool/prog.c b/tools/bpf/bpftool/prog.c
+index 6daf19809ca4..38ec7396837c 100644
+--- a/tools/bpf/bpftool/prog.c
++++ b/tools/bpf/bpftool/prog.c
+@@ -2040,6 +2040,7 @@ static int do_loader(int argc, char **argv)
+ 
+ static int do_load(int argc, char **argv)
+ {
++	bcf_set_prover(prover_path);
+ 	if (use_loader)
+ 		return do_loader(argc, argv);
+ 	return load_with_options(argc, argv, true);
+@@ -2047,6 +2048,7 @@ static int do_load(int argc, char **argv)
+ 
+ static int do_loadall(int argc, char **argv)
+ {
++	bcf_set_prover(prover_path);
+ 	return load_with_options(argc, argv, false);
+ }
+ 
+@@ -2589,7 +2591,8 @@ static int do_help(int argc, char **argv)
+ 		"       METRIC := { cycles | instructions | l1d_loads | llc_misses | itlb_misses | dtlb_misses }\n"
+ 		"       " HELP_SPEC_OPTIONS " |\n"
+ 		"                    {-f|--bpffs} | {-m|--mapcompat} | {-n|--nomount} |\n"
+-		"                    {-L|--use-loader} | [ {-S|--sign } {-k} <private_key.pem> {-i} <certificate.x509> ] \n"
++		"                    {-L|--use-loader} | [ {-S|--sign } {-k} <private_key.pem> {-i} <certificate.x509> ] |\n"
++		"                    {-P} <prover_path> ] \n"
+ 		"",
+ 		bin_name, argv[-2]);
+ 
+-- 
+2.34.1
+

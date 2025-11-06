@@ -1,0 +1,289 @@
+From 152b0091df5ba98aa2bf3a02e51f27c2a9c14836 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 12:11:33 +0200
+Subject: [PATCH RFC 03/11] bpf: Add expr_equiv() for proof goal check
+
+Add structural expression equivalence with variable renaming and argument
+sharing for faster repeated checks. Also use it to verify the ASSUME goal
+(step 0) matches the checker’s requested goal when present.
+
+- non-recursive DFS over node pairs with a bounded stack; nodes must match on
+  opcode/params/arity; arguments are compared pairwise
+- variables originating from the checker must be identical; variables from the
+  proof are matched via a small map (alpha-equivalence)
+- when both nodes own their arguments, unify equal sub-ids by replacing the
+  larger with the smaller and releasing the other, shrinking exprs
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 216 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 214 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 83288129b6b4..9525e726c39a 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -61,6 +61,13 @@ static_assert(struct_size_t(struct bcf_proof_step, args, 1) ==
+ 			   (step_id = (step)->args[___i], true); \
+ 	     ___i++)
+ 
++/* For expr equivalence comparison, see __expr_equiv(). */
++#define BCF_MAX_CMP_STACK 128
++struct bcf_cmp_stack_elem {
++	struct bcf_expr *e0, *e1;
++	u32 cur_arg;
++};
++
+ struct bcf_checker_state {
+ 	/*
+ 	 * Exprs from the proof, referred to as `static expr`. They exist
+@@ -104,6 +111,8 @@ struct bcf_checker_state {
+ 	/* Builtin expr id. */
+ 	u32 true_expr;
+ 	u32 false_expr;
++
++	struct bcf_cmp_stack_elem cmp[BCF_MAX_CMP_STACK];
+ };
+ 
+ static void free_checker_state(struct bcf_checker_state *st)
+@@ -252,7 +261,7 @@ static struct bcf_expr *id_to_expr(struct bcf_checker_state *st, u32 id)
+ 	return &eref->expr;
+ }
+ 
+-__used static void expr_id_put(struct bcf_checker_state *st, u32 id)
++static void expr_id_put(struct bcf_checker_state *st, u32 id)
+ {
+ 	expr_put(st, id_to_expr(st, id));
+ }
+@@ -492,6 +501,11 @@ static bool is_list(u8 code)
+ 	return BCF_TYPE(code) == BCF_LIST;
+ }
+ 
++static bool is_var(u8 code)
++{
++	return BCF_OP(code) == BCF_VAR;
++}
++
+ static bool is_true(const struct bcf_expr *expr)
+ {
+ 	return is_bool_val(expr->code) &&
+@@ -525,6 +539,20 @@ static bool valid_arg_id(struct bcf_checker_state *st, u32 id)
+ 	return is_static_expr_id(st, id) && test_bit(id, st->valid_idx);
+ }
+ 
++static struct bcf_expr *get_arg_expr(struct bcf_checker_state *st, u32 id)
++{
++	return valid_arg_id(st, id) ? st->exprs + id : ERR_PTR(-EINVAL);
++}
++
++static struct bcf_expr *get_bool_arg(struct bcf_checker_state *st, u32 id)
++{
++	struct bcf_expr *e = get_arg_expr(st, id);
++
++	if (IS_ERR(e))
++		return e;
++	return is_bool(e->code) ? e : ERR_PTR(-EINVAL);
++}
++
+ static u8 bv_size(struct bcf_expr *expr)
+ {
+ 	if (BCF_OP(expr->code) == BCF_EXTRACT)
+@@ -839,10 +867,194 @@ static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
+ 	return alloc_builtins(st);
+ }
+ 
++static bool is_leaf_node(struct bcf_expr *e)
++{
++	return !e->vlen || !expr_arg_is_id(e->code);
++}
++
++#define BCF_MAX_VAR_MAP 128
++struct bcf_var_map {
++	struct {
++		u32 idx0;
++		u32 idx1;
++	} pair[BCF_MAX_VAR_MAP];
++	u32 cnt;
++};
++
++static int var_equiv(struct bcf_var_map *map, u32 v0, u32 v1, bool from_checker)
++{
++	u32 i;
++
++	/* Variables from the checker must have the same id. */
++	if (from_checker)
++		return v0 == v1 ? 1 : 0;
++
++	for (i = 0; i < map->cnt; i++) {
++		if (map->pair[i].idx0 == v0)
++			return map->pair[i].idx1 == v1 ? 1 : 0;
++		if (map->pair[i].idx1 == v1)
++			return 0;
++	}
++
++	if (map->cnt < BCF_MAX_VAR_MAP) {
++		map->pair[map->cnt].idx0 = v0;
++		map->pair[map->cnt].idx1 = v1;
++		map->cnt++;
++		return 1;
++	}
++
++	return -E2BIG;
++}
++
++static bool expr_node_equiv(struct bcf_expr *e0, struct bcf_expr *e1)
++{
++	u32 i;
++
++	if (e0->code != e1->code || e0->vlen != e1->vlen ||
++	    e0->params != e1->params)
++		return false;
++
++	if (is_leaf_node(e0))
++		for (i = 0; i < e1->vlen; i++)
++			if (e0->args[i] != e1->args[i])
++				return false;
++
++	return true;
++}
++
++/*
++ * Once the equivalence of e0 and e1 are established, we can merge their args.
++ * For each arg a0 arg a1 of them, we know the arg must also be equiv; hence,
++ * use min(a0, a1) for both e0 and e1, release the other arg.
++ *
++ * This makes future comparison fast, since we don't need to dfs into the arg
++ * again, and this also allows releasing the equivalent exprs early.
++ */
++static void make_arg_sharing(struct bcf_checker_state *st, struct bcf_expr *e0,
++			     struct bcf_expr *e1)
++{
++	u32 i;
++
++	if (WARN_ON_ONCE(e1->vlen != e0->vlen))
++		return;
++
++	for (i = 0; i < e0->vlen; i++) {
++		if (e0->args[i] == e1->args[i])
++			continue;
++		/* Share the smaller id so that we converge to the static exprs. */
++		if (e0->args[i] < e1->args[i]) {
++			expr_id_put(st, e1->args[i]);
++			expr_id_get(st, e0->args[i]);
++			e1->args[i] = e0->args[i];
++		} else {
++			expr_id_put(st, e0->args[i]);
++			expr_id_get(st, e1->args[i]);
++			e0->args[i] = e1->args[i];
++		}
++	}
++}
++
++/* Compare the equivalence of e0 and e1, merge the args if they own the args. */
++static int __expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
++			struct bcf_expr *e1, bool from_checker, bool own_args)
++{
++	struct bcf_cmp_stack_elem *stack = st->cmp;
++	struct bcf_var_map map = { 0 };
++	u32 sp = 0;
++	int ret;
++
++	if (!expr_node_equiv(e0, e1))
++		return 0;
++	/*
++	 * Vars from the checker must be the same node;
++	 * For other cases, use the var_map.
++	 */
++	if (is_var(e0->code) && from_checker && e0 != e1)
++		return 0;
++	if (is_leaf_node(e0) || e0 == e1)
++		return 1;
++
++	stack[sp++] = (struct bcf_cmp_stack_elem){ e0, e1, 0 };
++
++	while (sp) {
++		struct bcf_cmp_stack_elem *cmp = &stack[sp - 1];
++		bool pop = true;
++
++		while (cmp->cur_arg < cmp->e0->vlen) {
++			u32 arg0 = cmp->e0->args[cmp->cur_arg];
++			u32 arg1 = cmp->e1->args[cmp->cur_arg];
++			struct bcf_expr *a0, *a1;
++
++			cmp->cur_arg++;
++
++			if (from_checker && arg0 == arg1)
++				continue;
++
++			a0 = id_to_expr(st, arg0);
++			a1 = from_checker ? id_to_expr(st, arg1) :
++					    st->goal_exprs + arg1;
++
++			if (!expr_node_equiv(a0, a1))
++				return 0;
++
++			if (is_var(a0->code)) {
++				ret = var_equiv(&map, arg0, arg1, from_checker);
++				if (ret != 1)
++					return ret;
++				continue;
++			}
++
++			if (is_leaf_node(a0))
++				continue;
++
++			if (sp >= BCF_MAX_CMP_STACK)
++				return -E2BIG;
++
++			stack[sp++] = (struct bcf_cmp_stack_elem){ a0, a1, 0 };
++			pop = false;
++			break;
++		}
++
++		if (pop) {
++			sp--;
++			if (own_args)
++				make_arg_sharing(st, cmp->e0, cmp->e1);
++		}
++	}
++
++	return 1;
++}
++
++__used static int expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
++			     struct bcf_expr *e1)
++{
++	/* own_args is false since the e0/e1 may be tmp exprs. */
++	return __expr_equiv(st, e0, e1, /* from_checker */ true,
++			    /* own_args */ false);
++}
++
++__used static int expr_id_equiv(struct bcf_checker_state *st, u32 i0, u32 i1)
++{
++	/* Each id increases the expr ref, hence owns the expr and its args. */
++	return __expr_equiv(st, id_to_expr(st, i0), id_to_expr(st, i1), true,
++			    true);
++}
++
+ static int check_assume(struct bcf_checker_state *st,
+ 			struct bcf_proof_step *step)
+ {
+-	return -EOPNOTSUPP;
++	struct bcf_expr *proof_goal, *goal;
++
++	ENSURE(!step->premise_cnt && step->param_cnt == 1);
++	proof_goal = get_bool_arg(st, step->args[0]);
++	if (IS_ERR(proof_goal))
++		return PTR_ERR(proof_goal);
++
++	if (!st->goal_exprs)
++		return 0; /* Proof check only without goal. */
++	goal = st->goal_exprs + st->goal;
++	ENSURE(__expr_equiv(st, proof_goal, goal, false, false) == 1);
++	return 0;
+ }
+ 
+ static bool is_assume(u16 rule)
+-- 
+2.34.1
+

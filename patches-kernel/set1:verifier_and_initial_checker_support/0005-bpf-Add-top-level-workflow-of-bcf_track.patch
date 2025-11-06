@@ -1,0 +1,359 @@
+From a9065dec5447405885ffb520ca4d34fb51b602d3 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 27 Oct 2025 18:15:03 +0100
+Subject: [PATCH RFC 05/17] bpf: Add top-level workflow of bcf_track()
+
+Add the top-level `bcf_track()` that symbolically tracks the path suffix
+identified by `backtrack_states()` and records per-register expressions and
+path conditions.
+
+- Extend `struct bpf_reg_state` with `bcf_expr` index. Extend
+  `env->bcf` with tracking state: expression arena (exprs/expr_cnt/expr_size),
+  branch condition list (br_conds/br_cond_cnt), and final `path_cond` and
+  `refine_cond` index.
+
+- Disable liveness/precision/pruning side effects during tracking to ensure
+  single-state, suffix-only analysis (short-circuit early in liveness helpers,
+  jump history/push, speculative sanitization, visited-state pruning).
+
+- Implement an env save/restore (`env_backup` + `swap_env_states`) so the
+  tracker can reuse verifier execution without polluting global state. 
+
+- After tracking, copy collected `bcf_expr` bindings from the tracked state
+  into the original state’s regs. The path condition is built later,
+
+Follow-ups add instruction-specific tracking, path matching and condition
+construction into this framework.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |   9 +++
+ kernel/bpf/liveness.c        |  15 ++++
+ kernel/bpf/verifier.c        | 135 +++++++++++++++++++++++++++++++++--
+ 3 files changed, 154 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 090430168523..b430702784e2 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -204,6 +204,7 @@ struct bpf_reg_state {
+ 	s32 subreg_def;
+ 	/* if (!precise && SCALAR_VALUE) min/max/tnum don't affect safety */
+ 	bool precise;
++	int bcf_expr;
+ };
+ 
+ enum bpf_stack_slot_type {
+@@ -742,6 +743,14 @@ struct bcf_refine_state {
+ 	u32 cur_jmp_entry;
+ 
+ 	bool available; /* if bcf_buf is provided. */
++	bool tracking; /* In bcf_track(). */
++	struct bcf_expr *exprs;
++	u32 expr_size;
++	u32 expr_cnt;
++	u32 *br_conds; /* each branch condition */
++	u32 br_cond_cnt;
++	int path_cond; /* conjunction of br_conds */
++	int refine_cond; /* refinement condition */
+ };
+ 
+ /* single container for all structs
+diff --git a/kernel/bpf/liveness.c b/kernel/bpf/liveness.c
+index bffb495bc933..4e44c3f0404c 100644
+--- a/kernel/bpf/liveness.c
++++ b/kernel/bpf/liveness.c
+@@ -276,6 +276,8 @@ static struct per_frame_masks *alloc_frame_masks(struct bpf_verifier_env *env,
+ 
+ void bpf_reset_live_stack_callchain(struct bpf_verifier_env *env)
+ {
++	if (env->bcf.tracking)
++		return;
+ 	env->liveness->cur_instance = NULL;
+ }
+ 
+@@ -318,6 +320,9 @@ int bpf_mark_stack_read(struct bpf_verifier_env *env, u32 frame, u32 insn_idx, u
+ {
+ 	int err;
+ 
++	if (env->bcf.tracking)
++		return 0;
++
+ 	err = ensure_cur_instance(env);
+ 	err = err ?: mark_stack_read(env, env->liveness->cur_instance, frame, insn_idx, mask);
+ 	return err;
+@@ -339,6 +344,9 @@ int bpf_reset_stack_write_marks(struct bpf_verifier_env *env, u32 insn_idx)
+ 	struct bpf_liveness *liveness = env->liveness;
+ 	int err;
+ 
++	if (env->bcf.tracking)
++		return 0;
++
+ 	err = ensure_cur_instance(env);
+ 	if (err)
+ 		return err;
+@@ -349,6 +357,8 @@ int bpf_reset_stack_write_marks(struct bpf_verifier_env *env, u32 insn_idx)
+ 
+ void bpf_mark_stack_write(struct bpf_verifier_env *env, u32 frame, u64 mask)
+ {
++	if (env->bcf.tracking)
++		return;
+ 	env->liveness->write_masks_acc[frame] |= mask;
+ }
+ 
+@@ -398,6 +408,8 @@ static int commit_stack_write_marks(struct bpf_verifier_env *env,
+  */
+ int bpf_commit_stack_write_marks(struct bpf_verifier_env *env)
+ {
++	if (env->bcf.tracking)
++		return 0;
+ 	return commit_stack_write_marks(env, env->liveness->cur_instance);
+ }
+ 
+@@ -675,6 +687,9 @@ int bpf_update_live_stack(struct bpf_verifier_env *env)
+ 	struct func_instance *instance;
+ 	int err, frame;
+ 
++	if (env->bcf.tracking)
++		return 0;
++
+ 	bpf_reset_live_stack_callchain(env);
+ 	for (frame = env->cur_state->curframe; frame >= 0; --frame) {
+ 		instance = lookup_instance(env, env->cur_state, frame);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 7125f7434e6f..725ea503c1c7 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3924,6 +3924,9 @@ static int push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_st
+ 	struct bpf_jmp_history_entry *p;
+ 	size_t alloc_size;
+ 
++	if (env->bcf.tracking)
++		return 0;
++
+ 	/* combine instruction flags if we already recorded this instruction */
+ 	if (env->cur_hist_ent) {
+ 		/* atomic instructions push insn_flags twice, for READ and
+@@ -4735,7 +4738,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env,
+ 	struct bpf_reg_state *reg;
+ 	int i, fr, err;
+ 
+-	if (!env->bpf_capable)
++	if (!env->bpf_capable || env->bcf.tracking)
+ 		return 0;
+ 
+ 	changed = changed ?: &tmp;
+@@ -8878,6 +8881,9 @@ static struct bpf_verifier_state *find_prev_entry(struct bpf_verifier_env *env,
+ 	struct bpf_verifier_state *st;
+ 	struct list_head *pos, *head;
+ 
++	if (env->bcf.tracking)
++		return NULL;
++
+ 	/* Explored states are pushed in stack order, most recent states come first */
+ 	head = explored_state(env, insn_idx);
+ 	list_for_each(pos, head) {
+@@ -14302,7 +14308,8 @@ static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
+ {
+ 	return env->bypass_spec_v1 ||
+ 		BPF_SRC(insn->code) == BPF_K ||
+-		cur_aux(env)->nospec;
++		cur_aux(env)->nospec ||
++		env->bcf.tracking;
+ }
+ 
+ static int update_alu_sanitation_state(struct bpf_insn_aux_data *aux,
+@@ -14350,6 +14357,9 @@ static int sanitize_speculative_path(struct bpf_verifier_env *env,
+ 	struct bpf_verifier_state *branch;
+ 	struct bpf_reg_state *regs;
+ 
++	if (env->bcf.tracking)
++		return 0;
++
+ 	branch = push_stack(env, next_idx, curr_idx, true);
+ 	if (!IS_ERR(branch) && insn) {
+ 		regs = branch->frame[branch->curframe]->regs;
+@@ -19415,6 +19425,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+ 	int n, err, states_cnt = 0;
+ 	struct list_head *pos, *tmp, *head;
+ 
++	if (env->bcf.tracking)
++		return 0;
++
+ 	force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx) ||
+ 			  /* Avoid accumulating infinitely long jmp history */
+ 			  cur->jmp_history_cnt > 40;
+@@ -20076,7 +20089,7 @@ static int do_check(struct bpf_verifier_env *env)
+ 	struct bpf_insn *insns = env->prog->insnsi;
+ 	int insn_cnt = env->prog->len;
+ 	bool do_print_state = false;
+-	int prev_insn_idx = -1;
++	int prev_insn_idx = env->prev_insn_idx;
+ 
+ 	for (;;) {
+ 		struct bpf_insn *insn;
+@@ -20178,6 +20191,14 @@ static int do_check(struct bpf_verifier_env *env)
+ 		if (err)
+ 			return err;
+ 		err = do_check_insn(env, &do_print_state);
++		/*
++		 * bcf_track() only follows checked insns, errors during it
++		 * indicate a previously refined location; The refinement
++		 * is applied directly (see bcf_refine()), so analyzes the
++		 * insn again with the refined state.
++		 */
++		if (err && env->bcf.tracking)
++			err = do_check_insn(env, &do_print_state);
+ 		if (err >= 0 || error_recoverable_with_nospec(err)) {
+ 			marks_err = bpf_commit_stack_write_marks(env);
+ 			if (marks_err)
+@@ -23275,6 +23296,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	struct bpf_reg_state *regs;
+ 	int ret, i;
+ 
++	env->prev_insn_idx = -1;
+ 	env->prev_linfo = NULL;
+ 	env->pass_cnt++;
+ 
+@@ -23388,6 +23410,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	}
+ 
+ 	ret = do_check(env);
++
++	/* Invoked by bcf_track(), just return. */
++	if (env->bcf.tracking)
++		return ret;
+ out:
+ 	if (!ret && pop_log)
+ 		bpf_vlog_reset(&env->log, 0);
+@@ -23395,11 +23421,104 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	return ret;
+ }
+ 
++struct env_backup {
++	u32 insn_idx;
++	u32 prev_insn_idx;
++	struct bpf_verifier_stack_elem *head;
++	int stack_size;
++	u32 id_gen;
++	struct bpf_verifier_state *cur_state;
++	const struct bpf_line_info *prev_linfo;
++	struct list_head *explored_states;
++	struct list_head free_list;
++	u32 log_level;
++	u32 prev_insn_processed, insn_processed;
++	u32 prev_jmps_processed, jmps_processed;
++};
++
++static void swap_env_states(struct env_backup *env_old,
++			    struct bpf_verifier_env *env)
++{
++	swap(env_old->insn_idx, env->insn_idx);
++	swap(env_old->prev_insn_idx, env->prev_insn_idx);
++	swap(env_old->head, env->head);
++	swap(env_old->stack_size, env->stack_size);
++	swap(env_old->id_gen, env->id_gen);
++	swap(env_old->cur_state, env->cur_state);
++	swap(env_old->prev_linfo, env->prev_linfo);
++	swap(env_old->explored_states, env->explored_states);
++	swap(env_old->free_list, env->free_list);
++	/* Disable log during bcf tracking */
++	swap(env_old->log_level, env->log.level);
++	swap(env_old->prev_insn_processed, env->prev_insn_processed);
++	swap(env_old->insn_processed, env->insn_processed);
++	swap(env_old->prev_jmps_processed, env->prev_jmps_processed);
++	swap(env_old->jmps_processed, env->jmps_processed);
++}
++
+ static int bcf_track(struct bpf_verifier_env *env,
+ 		     struct bpf_verifier_state *st,
+ 		     struct bpf_verifier_state *base)
+ {
+-	return -EOPNOTSUPP;
++	struct bpf_reg_state *regs = st->frame[st->curframe]->regs;
++	struct bpf_reg_state *tracked_regs;
++	struct bpf_verifier_state *vstate = NULL;
++	struct env_backup env_old = { 0 };
++	struct bcf_refine_state *bcf = &env->bcf;
++	int err, i;
++
++	bcf->expr_cnt = 0;
++	bcf->path_cond = -1;
++	bcf->refine_cond = -1;
++
++	if (base) {
++		vstate = kzalloc(sizeof(struct bpf_verifier_state),
++				 GFP_KERNEL_ACCOUNT);
++		if (!vstate)
++			return -ENOMEM;
++		err = copy_verifier_state(vstate, base);
++		if (err) {
++			free_verifier_state(vstate, true);
++			return err;
++		}
++		vstate->parent = vstate->equal_state = NULL;
++		vstate->first_insn_idx = base->insn_idx;
++		clear_jmp_history(vstate);
++	}
++
++	/* Continue with the current id. */
++	env_old.id_gen = env->id_gen;
++	swap_env_states(&env_old, env);
++
++	env->bcf.tracking = true;
++	if (vstate) {
++		env->insn_idx = vstate->first_insn_idx;
++		env->prev_insn_idx = vstate->last_insn_idx;
++		env->cur_state = vstate;
++		err = do_check(env);
++	} else {
++		u32 subprog = st->frame[0]->subprogno;
++
++		env->insn_idx = env->subprog_info[subprog].start;
++		err = do_check_common(env, subprog);
++	}
++	env->bcf.tracking = false;
++
++	if (!err && !same_callsites(env->cur_state, st))
++		err = -EFAULT;
++
++	if (!err) {
++		tracked_regs = cur_regs(env);
++		for (i = 0; i < BPF_REG_FP; i++)
++			regs[i].bcf_expr = tracked_regs[i].bcf_expr;
++	}
++
++	free_verifier_state(env->cur_state, true);
++	env->cur_state = NULL;
++	while (!pop_stack(env, NULL, NULL, false))
++		;
++	swap_env_states(&env_old, env);
++	return err;
+ }
+ 
+ /*
+@@ -23507,6 +23626,12 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+ 	/* BCF requested multiple times in an error path. */
+ 	if (bcf_requested(env))
+ 		return -EFAULT;
++	/* BCF requested during bcf_track(), known safe just refine. */
++	if (env->bcf.tracking) {
++		if (refine_cb)
++			return refine_cb(env, st, ctx);
++		return 0;
++	}
+ 
+ 	if (!reg_masks) {
+ 		for (i = 0; i < BPF_REG_FP; i++) {
+@@ -23527,7 +23652,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+ 	if (!err && refine_cb)
+ 		err = refine_cb(env, st, ctx);
+ 
+-	if (!err)
++	if (!err && (env->bcf.refine_cond >= 0 || env->bcf.path_cond >= 0))
+ 		mark_bcf_requested(env);
+ 
+ 	kfree(env->bcf.parents);
+-- 
+2.34.1
+

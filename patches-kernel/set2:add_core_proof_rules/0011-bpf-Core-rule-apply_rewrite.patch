@@ -1,0 +1,542 @@
+From 5be1d986dc48b6d60ea88d53ca8afe6035351d44 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 18:22:44 +0200
+Subject: [PATCH RFC 11/11] bpf: Core rule: apply_rewrite()
+
+Implement REWRITE rule execution:
+- lookup rewrite descriptor by id; check parameter count and types
+- if the rewrite has conditions, require matching premise facts
+- parse match/target templates with parameter substitution, pack indexed
+  operator params, flatten list-typed arguments into variadics, infer widths,
+  and type-check the resulting nodes
+- emit match = target as the current step fact
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 496 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 495 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 89f157b9096e..579d032a8dbb 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -387,6 +387,54 @@ static struct bcf_expr_ref *clone_expr(struct bcf_checker_state *st,
+ 	return eref;
+ }
+ 
++static struct bcf_expr *realloc_expr(struct bcf_checker_state *st, u32 expr_id,
++				     u32 new_vlen)
++{
++	struct bcf_expr_ref *eref;
++
++	eref = xa_load(&st->expr_id_map, expr_id);
++	if (eref->vlen > new_vlen)
++		return ERR_PTR(-EFAULT);
++
++	eref = krealloc(eref, struct_size(eref, args, new_vlen), GFP_KERNEL);
++	if (!eref)
++		/* old eref freed during free_checker_state() */
++		return ERR_PTR(-ENOMEM);
++
++	BUG_ON(xa_is_err(
++		xa_store(&st->expr_id_map, expr_id, eref, GFP_KERNEL)));
++	return &eref->expr;
++}
++
++static int __copy_expr_args(struct bcf_expr *dst, struct bcf_expr *src,
++			    bool append)
++{
++	u32 *args = dst->args;
++
++	if (append) {
++		args += dst->vlen;
++		if ((u32)dst->vlen + src->vlen > U8_MAX)
++			return -E2BIG;
++		dst->vlen += src->vlen;
++	} else {
++		dst->vlen = src->vlen;
++	}
++	memcpy(args, src->args, sizeof(u32) * src->vlen);
++	return 0;
++}
++
++/* Append args from src to dst, and update vlen */
++static int append_expr_args(struct bcf_expr *dst, struct bcf_expr *src)
++{
++	return __copy_expr_args(dst, src, true);
++}
++
++/* Copy args from src to dst, and set vlen */
++static int copy_expr_args(struct bcf_expr *dst, struct bcf_expr *src)
++{
++	return __copy_expr_args(dst, src, false);
++}
++
+ /* type/operation/arity table */
+ #define Nullary { 0, 0 }
+ #define Unary { 1, 1 }
+@@ -2003,6 +2051,438 @@ static int check_absorb(struct bcf_checker_state *st, struct bcf_expr *eq)
+ 	return -EINVAL;
+ }
+ 
++#define BCF_REWRITE_STRUCT_NAME(_name) __bcf_rw_##_name
++#include "bcf_rewrite_dsl.h"
++#include "bcf_rewrites.h"
++
++#define __MAKE_REWRITE_TB(_name) \
++	[BCF_REWRITE_##_name] = &BCF_REWRITE_STRUCT_NAME(_name),
++static const struct bcf_rewrite *const bcf_rewrites[__MAX_BCF_REWRITES] = {
++	[0 ... __MAX_BCF_REWRITES - 1] = NULL,
++	BCF_REWRITES_TABLE(__MAKE_REWRITE_TB)
++};
++#undef __MAKE_REWRITE_TB
++
++#include "bcf_rewrite_dsl_cleanup.h"
++#undef BCF_REWRITE_STRUCT_NAME
++
++static int rw_type_check(struct bcf_checker_state *st,
++			 const struct bcf_expr_nullary *ty,
++			 struct bcf_expr *expr)
++{
++	bool ty_match;
++
++	if (rw_type_any(ty))
++		return 0;
++
++	if (rw_type_bvany(ty))
++		ty_match = is_bv(expr->code);
++	else if (rw_type_list_bvany(ty))
++		ty_match = is_list(expr->code) &&
++			   BCF_LIST_TYPE(expr->params) == BCF_BV;
++	else
++		ty_match = same_type((void *)ty, expr);
++
++	return ty_match ? 0 : -EINVAL;
++}
++
++static int pack_bv_params(struct bcf_checker_state *st, struct bcf_expr *expr,
++			  u32 val_id, bool low)
++{
++	struct bcf_expr *val = id_to_expr(st, val_id);
++	struct bcf_eval_result res = { 0 };
++	int err;
++
++	BUG_ON(!is_bv(val->code));
++	err = eval_const_expr(st, val_id, &res);
++	if (err)
++		return err;
++	ENSURE(!res.overflow && res.bv_res <= U8_MAX);
++
++	if (low)
++		expr->params |= (u8)res.bv_res;
++	else
++		expr->params |= (u16)res.bv_res << 8;
++
++	expr_id_put(st, val_id);
++	return 0;
++}
++
++struct bcf_rw_parse_state {
++	const struct bcf_expr_nullary *rw_expr;
++	u32 expr_id;
++	u32 cur_arg;
++	u32 size;
++};
++
++static int convert_rw_expr(struct bcf_checker_state *st,
++			   struct bcf_rw_parse_state *cur)
++{
++	struct bcf_expr *expr = id_to_expr(st, cur->expr_id);
++	struct bcf_eval_result eval_res = { 0 };
++	struct bcf_expr *arg, *expr_buf;
++	bool encode_low = false;
++	int err;
++
++	/* Pack indexed op into its params. */
++	switch (expr->code) {
++	case (BCF_BOOL | BCF_BITOF):
++		encode_low = true;
++		fallthrough;
++	case (BCF_BV | BCF_REPEAT):
++	case (BCF_BV | BCF_ZERO_EXTEND):
++	case (BCF_BV | BCF_SIGN_EXTEND): {
++		if (WARN_ON_ONCE(expr->vlen != 2))
++			return -EFAULT;
++		err = pack_bv_params(st, expr, expr->args[0], encode_low);
++		if (err)
++			return err;
++		expr->vlen = 1;
++		expr->args[0] = expr->args[1];
++		break;
++	}
++	case (BCF_BV | BCF_EXTRACT): {
++		if (WARN_ON_ONCE(expr->vlen != 3))
++			return -EFAULT;
++		err = pack_bv_params(st, expr, expr->args[0], false);
++		err = err ?: pack_bv_params(st, expr, expr->args[1], true);
++		if (err)
++			return err;
++		expr->vlen = 1;
++		expr->args[0] = expr->args[2];
++		break;
++	}
++	default:
++		break;
++	}
++	if (is_rw_sym_val(cur->rw_expr)) {
++		/* @bv val size */
++		if (WARN_ON_ONCE(expr->vlen != 2))
++			return -EFAULT;
++		u32 val_expr_id = expr->args[0];
++		u32 size_expr_id = expr->args[1];
++		err = pack_bv_params(st, expr, size_expr_id, true);
++		err = err ?: eval_const_expr(st, val_expr_id, &eval_res);
++		if (err)
++			return err;
++		if (WARN_ON_ONCE(bv_size(expr) > 64 ||
++				 eval_res.bv_res > bv_max(bv_size(expr))))
++			return -EFAULT;
++		set_bv_val(expr, eval_res.bv_res);
++		expr_id_put(st, val_expr_id);
++	} else if (is_rw_bvmax(cur->rw_expr)) {
++		u32 vlen;
++		/* @bvmax size */
++		err = pack_bv_params(st, expr, expr->args[0], true);
++		if (err)
++			return err;
++		if (WARN_ON_ONCE(bv_size(expr) > 64))
++			return -EFAULT;
++		vlen = bv_val_vlen(bv_size(expr));
++		if (vlen > expr->vlen) {
++			expr = realloc_expr(st, cur->expr_id, vlen);
++			if (IS_ERR(expr))
++				return PTR_ERR(expr);
++		}
++		set_bv_val(expr, bv_max(bv_size(expr)));
++	} else if (is_bool_ite(cur->rw_expr->code)) {
++		/* Unlike BV_ITE, ITE is generic over types. */
++		if (WARN_ON_ONCE(expr->vlen != 3))
++			return -EFAULT;
++		struct bcf_expr *ite_branch = id_to_expr(st, expr->args[1]);
++		expr->code = BCF_ITE;
++		if (WARN_ON_ONCE(is_list(ite_branch->code)))
++			return -EFAULT;
++		expr->code |= BCF_TYPE(ite_branch->code);
++	}
++
++	/*
++	 * Flatten list operands:
++	 * If an operator with id-args receives list-typed children, splice their
++	 * elements into the argument list. This keeps variadic ops flat. Invalid
++	 * arities/types are caught by subsequent type_check().
++	 */
++	if (expr->vlen && expr_arg_is_id(expr->code)) {
++		u32 arg_i;
++
++		expr_buf = get_expr_buf(st);
++		bcf_for_each_arg_expr(arg_i, arg, expr, st) {
++			if (is_list(arg->code)) {
++				err = append_expr_args(expr_buf, arg);
++				if (err)
++					return err;
++			} else {
++				if (expr_buf->vlen >= U8_MAX)
++					return -E2BIG;
++				expr_buf->args[expr_buf->vlen++] =
++					expr->args[arg_i];
++			}
++		}
++		if (WARN_ON_ONCE(!expr_buf->vlen)) {
++			return -EOPNOTSUPP;
++		} else if (expr_buf->vlen == 1 &&
++			   reducible_variadic(expr->code)) {
++			u32 elem = expr_buf->args[0];
++			expr_id_get(st, elem);
++			expr_put(st, expr);
++			cur->expr_id = elem;
++			expr = id_to_expr(st, elem);
++		} else {
++			if (expr_buf->vlen > expr->vlen) {
++				expr = realloc_expr(st, cur->expr_id,
++						    expr_buf->vlen);
++				if (IS_ERR(expr))
++					return PTR_ERR(expr);
++			}
++			copy_expr_args(expr, expr_buf);
++		}
++	}
++
++	/* Resolve bv size */
++	if (is_bv(expr->code) && expr_arg_is_id(expr->code) && expr->vlen) {
++		switch (BCF_OP(expr->code)) {
++		case BCF_EXTRACT:
++			break;
++		case BCF_ITE:
++			set_bv_sz(expr, bv_size(id_to_expr(st, expr->args[1])));
++			break;
++		case BCF_SIGN_EXTEND:
++		case BCF_ZERO_EXTEND: {
++			u32 ext = BCF_EXT_LEN(expr->params);
++			u32 sz = bv_size(id_to_expr(st, expr->args[0]));
++			set_bv_sz(expr, sz + ext);
++			break;
++		}
++		case BCF_CONCAT: {
++			u32 sz = 0;
++			bcf_for_each_expr(arg, expr, st)
++				sz += bv_size(arg);
++			set_bv_sz(expr, sz);
++			break;
++		}
++		case BCF_BVSIZE:
++			set_bv_sz(expr, 32);
++			break;
++		case BCF_FROM_BOOL:
++			set_bv_sz(expr, expr->vlen);
++			break;
++		case BCF_REPEAT: {
++			u32 sz = bv_size(id_to_expr(st, expr->args[0]));
++			sz *= BCF_REPEAT_N(expr->params);
++			set_bv_sz(expr, sz);
++			break;
++		}
++		default:
++			bcf_for_each_expr(arg, expr, st) {
++				if (is_bv(arg->code)) {
++					set_bv_sz(expr, bv_size(arg));
++					break;
++				}
++			}
++			break;
++		}
++	}
++
++	err = type_check(st, expr);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++static int pop_rw_expr(struct bcf_checker_state *st,
++		       struct bcf_rw_parse_state *cur,
++		       struct bcf_rw_parse_state *parent)
++{
++	if (!is_rw_var(cur->rw_expr)) {
++		int err = convert_rw_expr(st, cur);
++		if (err)
++			return err;
++	}
++
++	/* Propagate self to parent. */
++	if (parent) {
++		struct bcf_expr *p_expr = id_to_expr(st, parent->expr_id);
++		p_expr->args[p_expr->vlen++] = cur->expr_id;
++		parent->size += cur->size;
++	}
++	return 0;
++}
++
++static int push_rw_expr(struct bcf_checker_state *st,
++			struct bcf_rw_parse_state *cur,
++			struct bcf_rw_parse_state *parent, u32 *args, u32 arg_n)
++{
++	const struct bcf_expr_nullary *rw_expr = cur->rw_expr;
++	const struct bcf_expr *expr = (void *)rw_expr;
++
++	if (is_rw_var(rw_expr)) {
++		BUG_ON(rw_expr->vlen);
++		cur->expr_id = args[rw_var_id(rw_expr)];
++		expr_id_get(st, cur->expr_id);
++	} else if (is_true(expr)) {
++		cur->expr_id = st->true_expr;
++	} else if (is_false(expr)) {
++		cur->expr_id = st->false_expr;
++	} else if (is_rw_bv_val(rw_expr)) {
++		struct bcf_expr_ref *val = alloc_expr(st, rw_expr->vlen);
++		u32 i;
++
++		if (IS_ERR(val))
++			return PTR_ERR(val);
++		val->code = BCF_BV | BCF_VAL;
++		val->vlen = rw_expr->vlen;
++		val->params = rw_expr->params;
++		for (i = 0; i < rw_expr->vlen; i++)
++			val->args[i] = rw_bv_val(rw_expr + i + 1);
++		cur->size += rw_expr->vlen; /* skip value nodes */
++		cur->cur_arg += rw_expr->vlen;
++		cur->expr_id = val->id;
++	} else {
++		struct bcf_expr_ref *eref = alloc_expr(st, rw_expr->vlen);
++
++		if (IS_ERR(eref))
++			return PTR_ERR(eref);
++		if (WARN_ON_ONCE(!rw_expr->vlen))
++			return -EFAULT;
++		eref->code = rw_expr->code;
++		eref->vlen = 0;
++		eref->params = 0;
++		cur->expr_id = eref->id;
++	}
++
++	return 0;
++}
++static int parse_rw_expr(struct bcf_checker_state *st,
++			 const struct bcf_expr_nullary *rw_exprs, u32 len,
++			 u32 *args, u32 arg_n, u32 *expr_id)
++{
++	enum { BCF_MAX_PARSE_STACK = 64 };
++	struct bcf_rw_parse_state stack[BCF_MAX_PARSE_STACK];
++	u32 sp = 0;
++	int err;
++
++	stack[sp++] = (struct bcf_rw_parse_state){
++		.rw_expr = rw_exprs,
++		.cur_arg = 0,
++		.size = 1,
++	};
++	while (sp) {
++		struct bcf_rw_parse_state *cur = &stack[sp - 1];
++		struct bcf_rw_parse_state *parent = NULL;
++
++		if (sp > 1)
++			parent = &stack[sp - 2];
++
++		if (!cur->cur_arg) {
++			err = push_rw_expr(st, cur, parent, args, arg_n);
++			if (err)
++				return err;
++		}
++
++		if (cur->cur_arg < cur->rw_expr->vlen) {
++			if (sp >= BCF_MAX_PARSE_STACK)
++				return -E2BIG;
++			stack[sp++] = (struct bcf_rw_parse_state){
++				.rw_expr = cur->rw_expr + cur->size,
++				.cur_arg = 0,
++				.size = 1,
++			};
++			cur->cur_arg++;
++			continue;
++		}
++
++		err = pop_rw_expr(st, cur, parent);
++		if (err)
++			return err;
++		sp--;
++	}
++
++	/* Must consume all exprs */
++	if (WARN_ON_ONCE(stack[0].size != len))
++		return -EFAULT;
++
++	*expr_id = stack[0].expr_id;
++	return 0;
++}
++
++static bool rw_cond_match(struct bcf_checker_state *st, struct bcf_expr *cond,
++			  struct bcf_expr *pm)
++{
++	if (expr_equiv(st, cond, pm) == 1)
++		return true;
++	return is_bool_eq(pm->code) && is_true(id_to_expr(st, pm->args[1])) &&
++	       (expr_equiv(st, cond, id_to_expr(st, pm->args[0])) == 1);
++}
++
++static int apply_rewrite(struct bcf_checker_state *st,
++			 struct bcf_expr_ref **fact, u32 rid, u32 *pm_steps,
++			 u32 pm_step_n, u32 *args, u32 arg_n)
++{
++	struct bcf_expr_ref *conclusion;
++	const struct bcf_rewrite *rw;
++	u32 match, target, i;
++	int err;
++
++	ENSURE(rid > BCF_REWRITE_UNSPEC && rid < __MAX_BCF_REWRITES);
++	rw = bcf_rewrites[rid];
++
++	/* Param type must match. */
++	ENSURE(arg_n == rw->param_cnt);
++	for (i = 0; i < arg_n; i++) {
++		struct bcf_expr *arg_expr = id_to_expr(st, args[i]);
++
++		err = rw_type_check(st, &rw->params[i], arg_expr);
++		if (err)
++			return err;
++	}
++
++	/* Conditions must be proved. */
++	ENSURE(!!rw->cond_len == !!pm_step_n);
++	if (rw->cond_len) {
++		struct bcf_expr *cond, *pm;
++		u32 cond_id;
++
++		err = parse_rw_expr(st, rw->cond, rw->cond_len, args, arg_n,
++				    &cond_id);
++		if (err)
++			return err;
++		cond = id_to_expr(st, cond_id);
++
++		if (is_bool_conj(cond->code)) {
++			struct bcf_expr *sub;
++
++			ENSURE(cond->vlen == pm_step_n);
++			bcf_for_each_arg_expr(i, sub, cond, st) {
++				pm = st->step_state[pm_steps[i]].fact;
++				ENSURE(rw_cond_match(st, sub, pm));
++			}
++		} else {
++			ENSURE(pm_step_n == 1);
++			pm = st->step_state[pm_steps[0]].fact;
++			ENSURE(rw_cond_match(st, cond, pm));
++		}
++		expr_put(st, cond); /* used for check only */
++	}
++
++	/* substitude args, and assert match = target. */
++	err = parse_rw_expr(st, rw->match, rw->match_len, args, arg_n, &match);
++	err = err   ?:
++		      parse_rw_expr(st, rw->target, rw->target_len, args, arg_n,
++				    &target);
++	if (err)
++		return err;
++	conclusion = build_bool_eq_move(st, match, target);
++	if (IS_ERR(conclusion))
++		return PTR_ERR(conclusion);
++	err = type_check(st, &conclusion->expr);
++	if (err)
++		return err;
++
++	*fact = conclusion;
++	return 0;
++}
++
+ #define RULE_TBL(rule) [BCF_RULE_NAME(rule)] = &&rule,
+ #define DEFINE_JUMP_TABLE(rule_set)                                         \
+ 	static const void                                                   \
+@@ -2107,7 +2587,21 @@ ABSORB: { /* Absorption of conjunctions */
+ }
+ 
+ REWRITE: { /* Rewrite equality to equivalent expression */
+-	return -EOPNOTSUPP;
++	u32 arg_n, pm_step_n;
++	u32 *args, *pm_steps;
++	u32 rewrite_id;
++
++	ENSURE(param_cnt);
++	pm_steps = step->args;
++	pm_step_n = step->premise_cnt;
++	rewrite_id = step->args[pm_step_n];
++	args = step->args + step->premise_cnt + 1;
++	arg_n = step->param_cnt - 1;
++	err = apply_rewrite(st, &fact, rewrite_id, pm_steps, pm_step_n, args,
++			    arg_n);
++	if (err)
++		return err;
++	return set_step_fact(st, fact);
+ }
+ 
+ REFL: /* A ⊢ A = A */
+-- 
+2.34.1
+

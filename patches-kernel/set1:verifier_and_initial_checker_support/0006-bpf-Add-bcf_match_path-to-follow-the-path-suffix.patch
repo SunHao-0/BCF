@@ -1,0 +1,112 @@
+From 918894bb56ee50553b2b317ca748bcb647c1e1db Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 29 Oct 2025 10:06:13 +0100
+Subject: [PATCH RFC 06/17] bpf: Add bcf_match_path() to follow the path suffix
+
+Add `bcf_match_path()` to constrain `bcf_track()` to the recorded path suffix
+from parent states. The function consumes the per-state jump history arrays in
+order and compares each (prev_idx, idx) pair against the verifier’s current
+(prev_insn_idx, insn_idx):
+- If the current pair matches the top entry, advance to the next history entry;
+  when the last entry is consumed and the last state's last_insn matches, stop
+  tracking (PATH_DONE).
+- If the pair mismatches at a branch point, abandon the current fork
+  (PATH_MISMATCH) so the tracker pops the path.
+- Otherwise, continue (PATH_MATCH).
+
+`do_check()` is updated under tracking mode to call `bcf_match_path()` before
+processing each instruction and to terminate early on PATH_DONE, ensuring only
+suffix instructions are symbolically analyzed.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 66 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 725ea503c1c7..3ecee219605f 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -20082,6 +20082,63 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
+ 	return 0;
+ }
+ 
++static struct bpf_jmp_history_entry *
++get_top_jmp_entry(struct bpf_verifier_env *env)
++{
++	struct bcf_refine_state *bcf = &env->bcf;
++	struct bpf_verifier_state *vstate;
++next:
++	if (bcf->cur_vstate >= bcf->vstate_cnt)
++		return NULL;
++	vstate = bcf->parents[bcf->cur_vstate];
++	if (bcf->cur_jmp_entry >= vstate->jmp_history_cnt) {
++		bcf->cur_vstate++;
++		bcf->cur_jmp_entry = 0;
++		goto next;
++	}
++	return &vstate->jmp_history[bcf->cur_jmp_entry];
++}
++
++enum { PATH_MATCH, PATH_MISMATCH, PATH_DONE };
++
++static int bcf_match_path(struct bpf_verifier_env *env)
++{
++	struct bcf_refine_state *bcf = &env->bcf;
++	struct bpf_jmp_history_entry *top = get_top_jmp_entry(env);
++	struct bpf_verifier_state *last_state;
++	int prev_idx;
++
++	last_state = bcf->parents[bcf->vstate_cnt - 1];
++	if (!top)
++		return last_state->last_insn_idx == env->prev_insn_idx ?
++			       PATH_DONE :
++			       PATH_MATCH;
++
++	prev_idx = top->prev_idx;
++	/* entry->prev_idx is u32:20, compiler does not sign extend this */
++	if (prev_idx == 0xfffff)
++		prev_idx = -1;
++
++	if (prev_idx == env->prev_insn_idx) {
++		if (top->idx == env->insn_idx) {
++			bcf->cur_jmp_entry++;
++			/* Check if we have consumed the last entry */
++			top = get_top_jmp_entry(env);
++			if (!top &&
++			    last_state->last_insn_idx == env->prev_insn_idx)
++				return PATH_DONE;
++			return PATH_MATCH;
++		}
++		return PATH_MISMATCH;
++	}
++
++	/* cur_state is branch taken, but the recorded one is not */
++	if (is_jmp_point(env, env->insn_idx))
++		return PATH_MISMATCH;
++
++	return PATH_MATCH;
++}
++
+ static int do_check(struct bpf_verifier_env *env)
+ {
+ 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
+@@ -20144,6 +20201,15 @@ static int do_check(struct bpf_verifier_env *env)
+ 				return err;
+ 		}
+ 
++		if (env->bcf.tracking) {
++			int path = bcf_match_path(env);
++
++			if (path == PATH_MISMATCH)
++				goto process_bpf_exit;
++			else if (path == PATH_DONE)
++				return 0;
++		}
++
+ 		if (signal_pending(current))
+ 			return -EAGAIN;
+ 
+-- 
+2.34.1
+

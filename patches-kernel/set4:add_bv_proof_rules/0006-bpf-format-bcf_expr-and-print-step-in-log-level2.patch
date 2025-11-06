@@ -1,0 +1,289 @@
+From 9e0122f319265465d6610fa2b98ca31050dfba8a Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 19:47:27 +0200
+Subject: [PATCH RFC 6/7] bpf: format bcf_expr and print step in log level2
+
+Add printers for BCF expressions and proof steps and integrate them with
+BPF_LOG_LEVEL2. Expressions are printed as s-exprs with bounded depth;
+steps show rule name, premise/parameter ids, and the derived fact.
+
+No functional changes; logging is gated behind verbose level.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 244 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 243 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 0de051ca36c6..d4105ff957a0 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -568,6 +568,16 @@ static bool in_codetable(u8 code)
+ 	return codetable[code];
+ }
+ 
++static const char *code_str(u8 code)
++{
++#define CODE_TBL(ty, ty_name, op, op_name, _arity) \
++	[ty | op] = __stringify(ty_name##_##op_name),
++	static const char *strtable[256] = { [0 ... 255] = "unknown",
++					     BCF_OP_TABLE(CODE_TBL) };
++#undef CODE_TBL
++	return strtable[code];
++}
++
+ /*
+  * Variadic operators that reduce to their single argument when given only one operand.
+  * For example, (xor bv0) is equivalent to bv0. This property is used in rule applications.
+@@ -4661,6 +4671,231 @@ POLY_NORM_EQ: { /* Polynomial normalization for relations */
+ #undef DEFINE_JUMP_TABLE
+ #undef RULE_TBL
+ 
++/*
++ * Format a bcf_expr as an s-expression into buf. Returns number of bytes
++ * written (excluding the trailing NUL) or a negative errno on error.
++ */
++static int format_sexpr(struct bcf_checker_state *st, struct bcf_expr *root,
++			char *buf, size_t buf_size, u32 depth)
++{
++	struct bcf_expr_stack_elem stack[BCF_MAX_ITER_STACK];
++	u32 sp = 0;
++	size_t off = 0;
++
++#define APPENDF(fmt, ...)                                                   \
++	do {                                                                \
++		size_t __n = scnprintf(buf + off,                           \
++				       buf_size > off ? buf_size - off : 0, \
++				       fmt, ##__VA_ARGS__);                 \
++		if (__n <= 0 || off + __n >= buf_size)                      \
++			return -ENOSPC;                                     \
++		off += __n;                                                 \
++	} while (0)
++
++	stack[sp++] =
++		(struct bcf_expr_stack_elem){ .expr = root, .cur_arg = 0 };
++
++	while (sp) {
++		struct bcf_expr_stack_elem *top = &stack[sp - 1];
++		struct bcf_expr *e = top->expr;
++		u8 ty = BCF_TYPE(e->code);
++		u8 op = BCF_OP(e->code);
++
++		if (!top->cur_arg) {
++			/* Leaf constants. */
++			if (is_bool_val(e->code)) {
++				APPENDF("%s", BCF_BOOL_LITERAL(e->params) ?
++						      "true" :
++						      "false");
++				sp--;
++				continue;
++			}
++			if (is_bv_val(e->code)) {
++				/* (_ bv<val> <width>) */
++				APPENDF("(_ bv%llu %u)", bv_val(e), bv_size(e));
++				sp--;
++				continue;
++			}
++
++			/* Open node */
++			if (ty == BCF_BV &&
++			    (op == BCF_EXTRACT || op == BCF_SIGN_EXTEND ||
++			     op == BCF_ZERO_EXTEND || op == BCF_REPEAT)) {
++				/* Indexed ops. Close inner index list before args. */
++				if (op == BCF_EXTRACT) {
++					APPENDF("((_ extract %u %u) ",
++						BCF_EXTRACT_START(e->params),
++						BCF_EXTRACT_END(e->params));
++				} else if (op == BCF_SIGN_EXTEND) {
++					APPENDF("((_ sign_extend %u) ",
++						BCF_EXT_LEN(e->params));
++				} else if (op == BCF_ZERO_EXTEND) {
++					APPENDF("((_ zero_extend %u) ",
++						BCF_EXT_LEN(e->params));
++				} else { /* BCF_REPEAT */
++					APPENDF("((_ repeat %u) ",
++						BCF_REPEAT_N(e->params));
++				}
++			} else if (ty == BCF_BOOL && op == BCF_BITOF) {
++				/* Boolean bit-of (indexed). */
++				APPENDF("((_ bit %u) ",
++					BCF_BITOF_BIT(e->params));
++			} else {
++				APPENDF("(%s(%u)", code_str(e->code), e->vlen);
++				/* Embed BV size. */
++				if (ty == BCF_BV && op == BCF_VAR)
++					APPENDF(" %u", bv_size(e));
++				if (e->vlen)
++					APPENDF(" ");
++			}
++
++			if (!e->vlen) {
++				/* Nullary node */
++				APPENDF(")");
++				sp--;
++				continue;
++			}
++		}
++
++		/* Emit arguments */
++		if (top->cur_arg < e->vlen) {
++			u32 arg_id = e->args[top->cur_arg++];
++
++			if (!expr_arg_is_id(e->code))
++				/* Non-ID args only occur for BV_VAL and were handled above. */
++				return -EFAULT;
++
++			if (top->cur_arg > 1)
++				APPENDF(" ");
++
++			if (top->cur_arg > 4) {
++				APPENDF("...");
++				top->cur_arg = e->vlen;
++				continue;
++			}
++
++			if (sp >= depth) {
++				APPENDF("@t%u", arg_id);
++				continue;
++			}
++
++			if (sp >= BCF_MAX_ITER_STACK)
++				return -E2BIG;
++			stack[sp++] = (struct bcf_expr_stack_elem){
++				.expr = id_to_expr(st, arg_id), .cur_arg = 0
++			};
++			continue;
++		}
++
++		/* Close node */
++		APPENDF(")");
++		sp--;
++	}
++#undef APPENDF
++	return off;
++}
++
++static void verbose_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
++			 u32 depth)
++{
++	char buf[1024];
++	int ret;
++
++	ret = format_sexpr(st, expr, buf, 1024, depth);
++	if (ret < 0)
++		return;
++	verbose(st, "%s", buf);
++}
++
++static void verbose_expr_id(struct bcf_checker_state *st, u32 id, u32 depth)
++{
++	verbose_expr(st, id_to_expr(st, id), depth);
++}
++
++static const char *rule_str(u16 rule)
++{
++#define RULE_STR_TBL(rule) [BCF_RULE_NAME(rule)] = __stringify(rule),
++	static const char *const core_rule_str[__MAX_BCF_CORE_RULES] = {
++		[0 ... __MAX_BCF_CORE_RULES - 1] = "unknown core rule",
++		BCF_CORE_RULES(RULE_STR_TBL)
++	};
++	static const char *const bool_rule_str[__MAX_BCF_BOOL_RULES] = {
++		[0 ... __MAX_BCF_BOOL_RULES - 1] = "unknown boolean rule",
++		BCF_BOOL_RULES(RULE_STR_TBL)
++	};
++	static const char *const bv_rule_str[__MAX_BCF_BV_RULES] = {
++		[0 ... __MAX_BCF_BV_RULES - 1] = "unknown bv rule",
++		BCF_BV_RULES(RULE_STR_TBL)
++	};
++#undef RULE_STR_TBL
++	u8 class_rule = BCF_STEP_RULE(rule);
++
++	switch (BCF_RULE_CLASS(rule)) {
++	case BCF_RULE_CORE:
++		return core_rule_str[class_rule];
++	case BCF_RULE_BOOL:
++		return bool_rule_str[class_rule];
++	case BCF_RULE_BV:
++		return bv_rule_str[class_rule];
++	default:
++		WARN_ONCE(1, "Unknown rule class: %u", BCF_RULE_CLASS(rule));
++		return "unknown rule class";
++	}
++}
++
++static void verbose_step(struct bcf_checker_state *st,
++			 struct bcf_proof_step *step, u32 step_id)
++{
++	const char *rule_name = rule_str(step->rule);
++	struct bcf_expr *fact;
++	u32 i, j;
++
++	verbose(st, "(#%d %s (", step_id, rule_name);
++
++	/* Print premises */
++	for (i = 0; i < step->premise_cnt; i++) {
++		if (i >= 3) {
++			verbose(st, "...");
++			break;
++		}
++
++		verbose(st, "@p%d", step->args[i]);
++		if (i + 1 != step->premise_cnt)
++			verbose(st, " ");
++	}
++
++	verbose(st, ") (");
++
++	/* Print parameters */
++	for (i = 0, j = step->premise_cnt; i < step->param_cnt; i++, j++) {
++		if (i >= 3) {
++			verbose(st, "...");
++			break;
++		}
++		if (i != 0) {
++			verbose(st, ", @t%d", step->args[j]);
++			continue;
++		}
++
++		/* Print the first arg expr. */
++		if (step->rule == (BCF_RULE_BV | BCF_RULE_BITBLAST))
++			verbose_expr_id(st, step->args[j], 2);
++		else if (valid_arg_id(st, step->args[j]))
++			verbose_expr_id(st, step->args[j], 1);
++		else
++			verbose(st, "@t%d", step->args[j]);
++	}
++	verbose(st, ")");
++
++	fact = st->step_state[step_id].fact;
++	if (fact) {
++		verbose(st, " ");
++		verbose_expr(st, fact, 2);
++	}
++
++	verbose(st, ")\n");
++}
++
+ static int apply_rules(struct bcf_checker_state *st)
+ {
+ 	struct bcf_expr *fact;
+@@ -4687,8 +4922,15 @@ static int apply_rules(struct bcf_checker_state *st)
+ 			WARN_ONCE(1, "Unknown rule class: %u", class);
+ 			err = -EFAULT;
+ 		}
+-		if (err)
++
++		if (err) {
++			verbose(st, "invalid step: ");
++			verbose_step(st, step, st->cur_step);
+ 			return err;
++		}
++
++		if (st->level & BPF_LOG_LEVEL2)
++			verbose_step(st, step, st->cur_step);
+ 
+ 		st->cur_step_idx += STEP_SZ(step);
+ 		st->cur_step++;
+-- 
+2.34.1
+

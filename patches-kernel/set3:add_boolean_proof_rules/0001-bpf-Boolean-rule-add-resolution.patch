@@ -1,0 +1,233 @@
+From fb451896e00fa6d101c5aad2d54a78011c57b913 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 18:27:14 +0200
+Subject: [PATCH RFC 1/4] bpf: Add boolean rule: resolution
+
+Implement chain resolution over clauses. The step encodes a pivot list and a
+polarity bitmap; starting from the first clause, iteratively eliminate each
+pivot l by merging with the next clause that contains not l (or l) and dropping
+one occurrence of the complementary literal. The result is a resolvent clause;
+if it becomes empty, derive false.
+
+Format:
+- premises: clauses (disjunctions) in order
+- params: [polarity bitmap | literal ids], one literal per merge
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 168 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 167 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 579d032a8dbb..1f5acbe5d177 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -90,6 +90,16 @@ struct bcf_eval_stack_elem {
+ 	};
+ };
+ 
++/* Fixed-size expr for common cases */
++struct bcf_expr_unary {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 arg0;
++};
++static_assert(sizeof(struct bcf_expr_unary) ==
++	      struct_size_t(struct bcf_expr, args, 1));
++
+ struct bcf_expr_buf {
+ 	u8 code;
+ 	u8 vlen;
+@@ -145,6 +155,7 @@ struct bcf_checker_state {
+ 
+ 	/* Pre-allocated expr bufs used by different routines. */
+ 	struct bcf_expr_buf expr_buf;
++	struct bcf_expr_unary not_expr; /* Used by resolution. */
+ 
+ 	/*
+ 	 * Shared stack space: used either by equivalence comparison or by
+@@ -435,6 +446,20 @@ static int copy_expr_args(struct bcf_expr *dst, struct bcf_expr *src)
+ 	return __copy_expr_args(dst, src, false);
+ }
+ 
++static void remove_expr_arg(struct bcf_checker_state *st, struct bcf_expr *expr,
++			    u32 i, bool own_args)
++{
++	u32 rest;
++
++	if (own_args && expr_arg_is_id(expr->code))
++		expr_id_put(st, expr->args[i]);
++
++	rest = expr->vlen - (i + 1);
++	if (rest)
++		memmove(&expr->args[i], &expr->args[i + 1], sizeof(u32) * rest);
++	expr->vlen--;
++}
++
+ /* type/operation/arity table */
+ #define Nullary { 0, 0 }
+ #define Unary { 1, 1 }
+@@ -2739,17 +2764,158 @@ REWRITE: { /* Rewrite equality to equivalent expression */
+ 	return -EFAULT;
+ }
+ 
++/* Parse the polarity and literal indices from the step parameters. */
++static int parse_resolution_params(struct bcf_checker_state *st,
++				   struct bcf_proof_step *step,
++				   u32 **pol_bitmap_out, u32 **lits_out)
++{
++	u32 pm_cnt = step->premise_cnt;
++	u32 lit_cnt = pm_cnt - 1, mask;
++	u32 pol_vlen, tail_bits, i;
++	u32 *pol_bitmap, *lits;
++
++	pol_vlen = DIV_ROUND_UP_POW2(lit_cnt, 32);
++	ENSURE(pol_vlen + lit_cnt == step->param_cnt);
++
++	pol_bitmap = &step->args[pm_cnt];
++	tail_bits = lit_cnt & 31;
++	if (tail_bits) {
++		mask = ~GENMASK(tail_bits - 1, 0);
++		ENSURE((pol_bitmap[pol_vlen - 1] & mask) == 0);
++	}
++
++	lits = &step->args[pm_cnt + pol_vlen];
++	for (i = 0; i < lit_cnt; i++) {
++		struct bcf_expr *expr = get_bool_arg(st, lits[i]);
++		if (IS_ERR(expr))
++			return PTR_ERR(expr);
++	}
++
++	*pol_bitmap_out = pol_bitmap;
++	*lits_out = lits;
++	return 0;
++}
++
++static int copy_literals(struct bcf_checker_state *st, struct bcf_expr *lits,
++			 u32 clause, struct bcf_expr *pivot)
++{
++	struct bcf_expr *clause_expr;
++
++	clause_expr = id_to_expr(st, clause);
++	if (is_bool_disj(clause_expr->code)) {
++		int ret;
++
++		ret = expr_equiv(st, clause_expr, pivot);
++		if (ret < 0)
++			return ret;
++		if (ret == 0)
++			return copy_expr_args(lits, clause_expr);
++	}
++
++	lits->args[0] = clause;
++	lits->vlen = 1;
++	return 0;
++}
++
++static int elim_pivot(struct bcf_checker_state *st, struct bcf_expr *lits,
++		      struct bcf_expr *pivot)
++{
++	struct bcf_expr *lit;
++	int ret;
++	u32 i;
++
++	bcf_for_each_arg_expr(i, lit, lits, st) {
++		ret = expr_equiv(st, lit, pivot);
++		if (ret < 0)
++			return ret;
++		if (ret == 0)
++			continue;
++		remove_expr_arg(st, lits, i, false);
++		/* Only eliminate the first occurrence. */
++		break;
++	}
++	return 0;
++}
++
++static void get_pivots(struct bcf_checker_state *st, struct bcf_expr **pivots,
++		       u32 pivot, bool pol)
++{
++	st->not_expr = (struct bcf_expr_unary){
++		.code = BCF_BOOL | BCF_NOT,
++		.vlen = 1,
++		.params = 0,
++		.arg0 = pivot,
++	};
++	pivots[0] = id_to_expr(st, pivot);
++	pivots[1] = (void *)&st->not_expr;
++	if (!pol)
++		swap(pivots[0], pivots[1]);
++}
++
++#define bcf_test_pol(_nr, _p) ((_p[_nr >> 5] >> (_nr & 31)) & 1)
++
++static int chain_resolution(struct bcf_checker_state *st,
++			    struct bcf_proof_step *step)
++{
++	DEFINE_RAW_FLEX(struct bcf_expr, lhs_lits, args, U8_MAX);
++	struct bcf_expr *pivots[2], *rhs_lits;
++	u32 *lits = NULL, *pols = NULL;
++	u32 pm_cnt = step->premise_cnt, i, rhs;
++	u32 lit_cnt = pm_cnt - 1, lhs_pm;
++	struct bcf_expr_ref *fact;
++	int err;
++
++	/* Parse polarity and pivots */
++	err = parse_resolution_params(st, step, &pols, &lits);
++	if (err)
++		return err;
++
++	/* Set up the first clause */
++	lhs_lits->vlen = 0;
++	lhs_lits->params = 0;
++	lhs_pm = get_premise_id(st, step, 0);
++	get_pivots(st, pivots, lits[0], bcf_test_pol(0, pols));
++	err = copy_literals(st, lhs_lits, lhs_pm, pivots[0]);
++	if (err)
++		return err;
++
++	rhs_lits = get_expr_buf(st);
++	for (i = 0, rhs = 1; i < lit_cnt; i++, rhs++) {
++		u32 rhs_pm = get_premise_id(st, step, rhs);
++
++		get_pivots(st, pivots, lits[i], bcf_test_pol(i, pols));
++		err = elim_pivot(st, lhs_lits, pivots[0]);
++		err = err ?: copy_literals(st, rhs_lits, rhs_pm, pivots[1]);
++		err = err ?: elim_pivot(st, rhs_lits, pivots[1]);
++		err = err ?: append_expr_args(lhs_lits, rhs_lits);
++		if (err)
++			return err;
++	}
++
++	if (!lhs_lits->vlen)
++		return set_step_fact_id(st, st->false_expr);
++	else if (lhs_lits->vlen == 1)
++		return set_step_fact_id(st, lhs_lits->args[0]);
++
++	lhs_lits->code = BCF_BOOL | BCF_DISJ;
++	fact = clone_expr(st, lhs_lits);
++	return set_step_fact(st, fact);
++}
++
+ static int apply_bool_rule(struct bcf_checker_state *st,
+ 			   struct bcf_proof_step *step)
+ {
+ 	DEFINE_JUMP_TABLE(BCF_BOOL_RULES);
+ 	u16 rule = BCF_STEP_RULE(step->rule);
++	u16 pm_cnt = step->premise_cnt;
++	u16 param_cnt = step->param_cnt;
+ 
+ 	goto *checkers[rule];
+ 
+ RESOLUTION: /* (A ∨ l), (¬l ∨ B) ⊢ (A ∨ B) */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt >= 2 && param_cnt);
++	return chain_resolution(st, step);
+ }
+ 
+ FACTORING: /* (A ∨ l ∨ l) ⊢ (A ∨ l) */
+-- 
+2.34.1
+

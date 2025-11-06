@@ -1,0 +1,264 @@
+From 8048a9f25fbe2ec3ab02f9ef26d16da9a303f3d5 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 3 Nov 2025 11:06:31 +0100
+Subject: [PATCH RFC 15/17] bpf: Preserve verifier_env and request BCF
+
+Preserve the verifier environment when a refinement request is issued and
+export the expression arena and condition to userspace, so that the analysis
+can resume later with a proof.
+
+- Track the currently analyzed subprog (`env->subprog`) so resume can pick up
+  where the request occurred. 
+- In `do_check_common()`, if a request is pending, return early without
+  freeing states (bcf/tracking-aware). In `bpf_prog_load()`, if the request was
+  issued, return the verifier error immediately to userspace.
+- Add anon-fd : create an anon inode (`bcf_fops`) that owns the `verifier_env`.
+  On fd release, free verifier state, release maps/btfs/prog.
+- Implement `do_request_bcf()`: copy conditions into `bcf_buf`; set
+  `bcf_flags = BCF_F_PROOF_REQUESTED`; allocate and return
+  `bcf_fd` if this is the first request.
+- Adjust verifier time accounting to multi-rounds analysis.
+- Minor cleanups: make zext/hi32 optimization read flags from `env`.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |   3 +
+ kernel/bpf/syscall.c         |   2 +
+ kernel/bpf/verifier.c        | 113 +++++++++++++++++++++++++++++++++--
+ 3 files changed, 112 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 05e8e3feea30..67eac7b2778e 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -774,6 +774,7 @@ struct bpf_verifier_env {
+ 	bool strict_alignment;		/* perform strict pointer alignment checks */
+ 	bool test_state_freq;		/* test verifier with different pruning frequency */
+ 	bool test_reg_invariants;	/* fail verification on register invariants violations */
++	bool test_rnd_hi32;		/* randomize high 32-bit to test subreg def/use */
+ 	struct bpf_verifier_state *cur_state; /* current verifier state */
+ 	/* Search pruning optimization, array of list_heads for
+ 	 * lists of struct bpf_verifier_state_list.
+@@ -867,6 +868,8 @@ struct bpf_verifier_env {
+ 	u32 scc_cnt;
+ 	struct bpf_iarray *succ;
+ 	struct bcf_refine_state bcf;
++	/* The subprog being verified. */
++	u32 subprog;
+ };
+ 
+ static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 5968b74ed7b2..97914494bd18 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -3096,6 +3096,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ 
+ 	/* run eBPF verifier */
+ 	err = bpf_check(&prog, attr, uattr, uattr_size);
++	if (prog->aux->bcf_requested)
++		return err;
+ 	if (err < 0)
+ 		goto free_used_maps;
+ 
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 22a068bfd0f2..3b631cea827e 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -15,6 +15,8 @@
+ #include <linux/filter.h>
+ #include <net/netlink.h>
+ #include <linux/file.h>
++#include <linux/anon_inodes.h>
++#include <linux/fdtable.h>
+ #include <linux/vmalloc.h>
+ #include <linux/stringify.h>
+ #include <linux/bsearch.h>
+@@ -636,6 +638,11 @@ static void mark_bcf_requested(struct bpf_verifier_env *env)
+ 	env->prog->aux->bcf_requested = true;
+ }
+ 
++static void unmark_bcf_requested(struct bpf_verifier_env *env)
++{
++	env->prog->aux->bcf_requested = false;
++}
++
+ static int bcf_alloc_expr(struct bpf_verifier_env *env, u32 cnt)
+ {
+ 	struct bcf_refine_state *bcf = &env->bcf;
+@@ -22036,8 +22043,7 @@ static int opt_remove_nops(struct bpf_verifier_env *env)
+ 	return 0;
+ }
+ 
+-static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+-					 const union bpf_attr *attr)
++static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env)
+ {
+ 	struct bpf_insn *patch;
+ 	/* use env->insn_buf as two independent buffers */
+@@ -22049,7 +22055,7 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+ 	struct bpf_prog *new_prog;
+ 	bool rnd_hi32;
+ 
+-	rnd_hi32 = attr->prog_flags & BPF_F_TEST_RND_HI32;
++	rnd_hi32 = env->test_rnd_hi32;
+ 	zext_patch[1] = BPF_ZEXT_REG(0);
+ 	rnd_hi32_patch[1] = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, 0);
+ 	rnd_hi32_patch[2] = BPF_ALU64_IMM(BPF_LSH, BPF_REG_AX, 32);
+@@ -24233,7 +24239,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	ret = do_check(env);
+ 
+ 	/* Invoked by bcf_track(), just return. */
+-	if (env->bcf.tracking)
++	if (env->bcf.tracking || bcf_requested(env))
+ 		return ret;
+ out:
+ 	if (!ret && pop_log)
+@@ -24573,6 +24579,7 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
+ 		if (!sub_aux->called || sub_aux->verified)
+ 			continue;
+ 
++		env->subprog = i;
+ 		env->insn_idx = env->subprog_info[i].start;
+ 		WARN_ON_ONCE(env->insn_idx == 0);
+ 		ret = do_check_common(env, i);
+@@ -25766,6 +25773,85 @@ static int compute_scc(struct bpf_verifier_env *env)
+ 	return err;
+ }
+ 
++static int bcf_release(struct inode *inode, struct file *filp)
++{
++	struct bpf_verifier_env *env = filp->private_data;
++
++	if (!env)
++		return 0;
++
++	free_states(env);
++	kvfree(env->explored_states);
++
++	if (!env->prog->aux->used_maps)
++		release_maps(env);
++	if (!env->prog->aux->used_btfs)
++		release_btfs(env);
++	bpf_prog_put(env->prog);
++
++	module_put(env->attach_btf_mod);
++	vfree(env->insn_aux_data);
++	bpf_stack_liveness_free(env);
++	kvfree(env->cfg.insn_postorder);
++	kvfree(env->scc_info);
++	kvfree(env->succ);
++	kvfree(env->bcf.exprs);
++	kvfree(env);
++	filp->private_data = NULL;
++	return 0;
++}
++
++static const struct file_operations bcf_fops = {
++	.release = bcf_release,
++};
++
++static int do_request_bcf(struct bpf_verifier_env *env, union bpf_attr *attr,
++			  bpfptr_t uattr)
++{
++	bpfptr_t bcf_buf = make_bpfptr(attr->bcf_buf, uattr.is_kernel);
++	int ret, bcf_fd = -1, flags = BCF_F_PROOF_REQUESTED;
++	struct bcf_refine_state *bcf = &env->bcf;
++	u32 sz, sz_off, expr_sz;
++
++	/* All exprs, followed by path_cond and refine_cond. */
++	expr_sz = bcf->expr_cnt * sizeof(struct bcf_expr);
++	sz = expr_sz + sizeof(bcf->path_cond) + sizeof(bcf->refine_cond);
++	sz_off = offsetof(union bpf_attr, bcf_buf_true_size);
++
++	ret = -EFAULT;
++	if (copy_to_bpfptr_offset(uattr, sz_off, &sz, sizeof(sz)))
++		return ret;
++	if (sz > attr->bcf_buf_size)
++		return -ENOSPC;
++
++	if (copy_to_bpfptr_offset(bcf_buf, 0, bcf->exprs, expr_sz) ||
++	    copy_to_bpfptr_offset(bcf_buf, expr_sz, &bcf->path_cond,
++				  sizeof(u32)) ||
++	    copy_to_bpfptr_offset(bcf_buf, expr_sz + sizeof(u32),
++				  &bcf->refine_cond, sizeof(u32)))
++		return ret;
++
++	if (copy_to_bpfptr_offset(uattr, offsetof(union bpf_attr, bcf_flags),
++				  &flags, sizeof(flags)))
++		return ret;
++
++	/* Allocate fd if first request. */
++	if (!(attr->bcf_flags & BCF_F_PROOF_PROVIDED)) {
++		bcf_fd = anon_inode_getfd("bcf", &bcf_fops, env,
++					  O_RDONLY | O_CLOEXEC);
++		if (bcf_fd < 0)
++			return bcf_fd;
++		if (copy_to_bpfptr_offset(uattr,
++					  offsetof(union bpf_attr, bcf_fd),
++					  &bcf_fd, sizeof(bcf_fd))) {
++			close_fd(bcf_fd);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
+ {
+ 	u64 start_time = ktime_get_ns();
+@@ -25846,6 +25932,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	if (is_priv)
+ 		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
+ 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
++	env->test_rnd_hi32 = attr->prog_flags & BPF_F_TEST_RND_HI32;
+ 
+ 	env->explored_states = kvcalloc(state_htab_size(env),
+ 				       sizeof(struct list_head),
+@@ -25915,10 +26002,24 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	ret = do_check_main(env);
+ 	ret = ret ?: do_check_subprogs(env);
+ 
++	if (ret && bcf_requested(env)) {
++		u64 vtime = ktime_get_ns() - start_time;
++
++		env->verification_time += vtime;
++		if (do_request_bcf(env, attr, uattr) == 0)
++			return ret;
++
++		unmark_bcf_requested(env);
++		env->verification_time -= vtime;
++	}
++
+ 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
+ 		ret = bpf_prog_offload_finalize(env);
+ 
+ skip_full_check:
++	/* If bcf_requested(), the last state is preserved, free now. */
++	if (env->cur_state)
++		free_states(env);
+ 	kvfree(env->explored_states);
+ 
+ 	/* might decrease stack depth, keep it before passes that
+@@ -25957,7 +26058,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	 * insns could be handled correctly.
+ 	 */
+ 	if (ret == 0 && !bpf_prog_is_offloaded(env->prog->aux)) {
+-		ret = opt_subreg_zext_lo32_rnd_hi32(env, attr);
++		ret = opt_subreg_zext_lo32_rnd_hi32(env);
+ 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
+ 								     : false;
+ 	}
+@@ -25965,7 +26066,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 	if (ret == 0)
+ 		ret = fixup_call_args(env);
+ 
+-	env->verification_time = ktime_get_ns() - start_time;
++	env->verification_time += ktime_get_ns() - start_time;
+ 	print_verification_stats(env);
+ 	env->prog->aux->verified_insns = env->insn_processed;
+ 
+-- 
+2.34.1
+

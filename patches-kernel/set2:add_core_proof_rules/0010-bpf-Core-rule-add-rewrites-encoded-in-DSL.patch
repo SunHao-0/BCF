@@ -1,0 +1,187 @@
+From 392209c5482ea75f191159cb6209a6d50e0a758a Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 18:14:46 +0200
+Subject: [PATCH RFC 10/11] bpf: Core rule: add rewrites encoded in DSL
+
+Add the initial of boolean/UF/BV rewrites generated via the DSL.
+The set contains simplifications, BV normalizations, and simple
+order/elim rewrites.
+
+The checker references these descriptors when applying the REWRITE rule; it
+parses match/target/conditions with actual parameters, type-checks, and asserts
+the instantiated equality.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_rewrites.h | 159 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 159 insertions(+)
+ create mode 100644 kernel/bpf/bcf_rewrites.h
+
+diff --git a/kernel/bpf/bcf_rewrites.h b/kernel/bpf/bcf_rewrites.h
+new file mode 100644
+index 000000000000..77a0016b6c1f
+--- /dev/null
++++ b/kernel/bpf/bcf_rewrites.h
+@@ -0,0 +1,159 @@
++// AUTOMATICALLY GENERATED, DO NOT EDIT
++// Rewrite Rules from: ['rewrites/builtin-rewrites']
++REWRITE(ITE_TRUE_COND, (Q, Q), ite(_TRUE, V(0), V(1)), V(0));
++REWRITE(ITE_FALSE_COND, (Q, Q), ite(_FALSE, V(0), V(1)), V(1));
++REWRITE(ITE_NOT_COND, (Bool, Q, Q), ite(not(V(0)), V(1), V(2)), ite(V(0), V(2), V(1)));
++REWRITE(ITE_EQ_BRANCH, (Bool, Q), ite(V(0), V(1), V(1)), V(1));
++REWRITE(ITE_THEN_LOOKAHEAD, (Bool, Q, Q, Q), ite(V(0), ite(V(0), V(1), V(2)), V(3)), ite(V(0), V(1), V(3)));
++REWRITE(ITE_ELSE_LOOKAHEAD, (Bool, Q, Q, Q), ite(V(0), V(1), ite(V(0), V(2), V(3))), ite(V(0), V(1), V(3)));
++REWRITE(ITE_THEN_NEG_LOOKAHEAD, (Bool, Q, Q, Q), ite(V(0), ite(not(V(0)), V(1), V(2)), V(3)), ite(V(0), V(2), V(3)));
++REWRITE(ITE_ELSE_NEG_LOOKAHEAD, (Bool, Q, Q, Q), ite(V(0), V(1), ite(not(V(0)), V(2), V(3))), ite(V(0), V(1), V(2)));
++// Rewrite Rules from: ['rewrites/uf-rewrites']
++REWRITE(EQ_REFL, (Q), eq(V(0), V(0)), _TRUE);
++REWRITE(EQ_SYMM, (Q, Q), eq(V(0), V(1)), eq(V(1), V(0)));
++REWRITE(EQ_ITE_LIFT, (Bool, Q, Q, Q), eq(ite(V(0), V(1), V(2)), V(3)), ite(V(0), eq(V(1), V(3)), eq(V(2), V(3))));
++REWRITE(DISTINCT_BINARY_ELIM, (Q, Q), neq(V(0), V(1)), not(eq(V(0), V(1))));
++// Conditional Rewrite Rules from: ['rewrites/uf-rewrites']
++REWRITE_COND(EQ_COND_DEQ, (Q, Q, Q), eq(eq(V(1), V(2)), _FALSE), eq(eq(V(0), V(1)), eq(V(0), V(2))), conj(not(eq(V(0), V(1))), not(eq(V(0), V(2)))));
++// Rewrite Rules from: ['rewrites/boolean-rewrites']
++REWRITE(BOOL_DOUBLE_NOT_ELIM, (Bool), not(not(V(0))), V(0));
++REWRITE(BOOL_EQ_TRUE, (Bool), eq(V(0), _TRUE), V(0));
++REWRITE(BOOL_EQ_FALSE, (Bool), eq(V(0), _FALSE), not(V(0)));
++REWRITE(BOOL_EQ_NREFL, (Bool), eq(V(0), not(V(0))), _FALSE);
++REWRITE(BOOL_IMPL_FALSE1, (Bool), implies(V(0), _FALSE), not(V(0)));
++REWRITE(BOOL_IMPL_FALSE2, (Bool), implies(_FALSE, V(0)), _TRUE);
++REWRITE(BOOL_IMPL_TRUE1, (Bool), implies(V(0), _TRUE), _TRUE);
++REWRITE(BOOL_IMPL_TRUE2, (Bool), implies(_TRUE, V(0)), V(0));
++REWRITE(BOOL_IMPL_ELIM, (Bool, Bool), implies(V(0), V(1)), disj(not(V(0)), V(1)));
++REWRITE(BOOL_DUAL_IMPL_EQ, (Bool, Bool), conj(implies(V(0), V(1)), implies(V(1), V(0))), eq(V(0), V(1)));
++REWRITE(BOOL_AND_CONF, (Bools, Bool, Bools, Bools), conj(V(0), V(1), V(2), not(V(1)), V(3)), _FALSE);
++REWRITE(BOOL_AND_CONF2, (Bools, Bool, Bools, Bools), conj(V(0), not(V(1)), V(2), V(1), V(3)), _FALSE);
++REWRITE(BOOL_OR_TAUT, (Bools, Bool, Bools, Bools), disj(V(0), V(1), V(2), not(V(1)), V(3)), _TRUE);
++REWRITE(BOOL_OR_TAUT2, (Bools, Bool, Bools, Bools), disj(V(0), not(V(1)), V(2), V(1), V(3)), _TRUE);
++REWRITE(BOOL_IMPLIES_DE_MORGAN, (Bool, Bool), not(implies(V(0), V(1))), conj(V(0), not(V(1))));
++REWRITE(BOOL_XOR_REFL, (Bool), xor(V(0), V(0)), _FALSE);
++REWRITE(BOOL_XOR_NREFL, (Bool), xor(V(0), not(V(0))), _TRUE);
++REWRITE(BOOL_XOR_FALSE, (Bool), xor(V(0), _FALSE), V(0));
++REWRITE(BOOL_XOR_TRUE, (Bool), xor(V(0), _TRUE), not(V(0)));
++REWRITE(BOOL_XOR_COMM, (Bool, Bool), xor(V(0), V(1)), xor(V(1), V(0)));
++REWRITE(BOOL_XOR_ELIM, (Bool, Bool), xor(V(0), V(1)), eq(not(V(0)), V(1)));
++REWRITE(BOOL_NOT_XOR_ELIM, (Bool, Bool), not(xor(V(0), V(1))), eq(V(0), V(1)));
++REWRITE(BOOL_NOT_EQ_ELIM1, (Bool, Bool), not(eq(V(0), V(1))), eq(not(V(0)), V(1)));
++REWRITE(BOOL_NOT_EQ_ELIM2, (Bool, Bool), not(eq(V(0), V(1))), eq(V(0), not(V(1))));
++REWRITE(ITE_THEN_TRUE, (Bool, Bool), ite(V(0), _TRUE, V(1)), disj(V(0), V(1)));
++REWRITE(ITE_ELSE_FALSE, (Bool, Bool), ite(V(0), V(1), _FALSE), conj(V(0), V(1)));
++REWRITE(ITE_THEN_FALSE, (Bool, Bool), ite(V(0), _FALSE, V(1)), conj(not(V(0)), V(1)));
++REWRITE(ITE_ELSE_TRUE, (Bool, Bool), ite(V(0), V(1), _TRUE), disj(not(V(0)), V(1)));
++REWRITE(ITE_THEN_LOOKAHEAD_SELF, (Bool, Bool), ite(V(0), V(0), V(1)), ite(V(0), _TRUE, V(1)));
++REWRITE(ITE_ELSE_LOOKAHEAD_SELF, (Bool, Bool), ite(V(0), V(1), V(0)), ite(V(0), V(1), _FALSE));
++REWRITE(ITE_THEN_LOOKAHEAD_NOT_SELF, (Bool, Bool), ite(V(0), not(V(0)), V(1)), ite(V(0), _FALSE, V(1)));
++REWRITE(ITE_ELSE_LOOKAHEAD_NOT_SELF, (Bool, Bool), ite(V(0), V(1), not(V(0))), ite(V(0), V(1), _TRUE));
++REWRITE(ITE_EXPAND, (Bool, Bool, Bool), ite(V(0), V(1), V(2)), conj(disj(not(V(0)), V(1)), disj(V(0), V(2))));
++REWRITE(BOOL_NOT_ITE_ELIM, (Bool, Bool, Bool), not(ite(V(0), V(1), V(2))), ite(V(0), not(V(1)), not(V(2))));
++// Conditional Rewrite Rules from: ['rewrites/boolean-rewrites']
++REWRITE_COND(BOOL_NOT_TRUE, (Bool), eq(V(0), _FALSE), not(V(0)), _TRUE);
++REWRITE_COND(BOOL_NOT_FALSE, (Bool), eq(V(0), _TRUE), not(V(0)), _FALSE);
++REWRITE_COND(ITE_NEG_BRANCH, (Bool, Bool, Bool), eq(not(V(2)), V(1)), ite(V(0), V(1), V(2)), eq(V(0), V(1)));
++// Rewrite Rules from: ['rewrites/bv-rewrites', 'rewrites/bv-rewrites-elimination', 'rewrites/bv-rewrites-simplification']
++REWRITE(BV_EXTRACT_NOT, (BVQ, Int, Int), extract(V(2), V(1), bvnot(V(0))), bvnot(extract(V(2), V(1), V(0))));
++REWRITE(BV_NOT_XOR, (BVQ, BVQ, BVQs), bvnot(bvxor(V(0), V(1), V(2))), bvxor(bvnot(V(0)), V(1), V(2)));
++REWRITE(BV_XOR_SIMPLIFY_2, (BVQs, BVQs, BVQs, BVQ), bvxor(V(0), V(3), V(1), bvnot(V(3)), V(2)), bvnot(bvxor(V(0), V(1), V(2))));
++REWRITE(BV_XOR_SIMPLIFY_3, (BVQs, BVQs, BVQs, BVQ), bvxor(V(0), bvnot(V(3)), V(1), V(3), V(2)), bvnot(bvxor(V(0), V(1), V(2))));
++REWRITE(BV_COMMUTATIVE_XOR, (BVQ, BVQ), bvxor(V(0), V(1)), bvxor(V(1), V(0)));
++REWRITE(BV_ZERO_EXTEND_ELIMINATE_0, (BVQ), zero_extend(bv_val(32, 0), V(0)), V(0));
++REWRITE(BV_SIGN_EXTEND_ELIMINATE_0, (BVQ), sign_extend(bv_val(32, 0), V(0)), V(0));
++REWRITE(BV_COMMUTATIVE_ADD, (BVQ, BVQ), bvadd(V(0), V(1)), bvadd(V(1), V(0)));
++REWRITE(BV_SUB_ELIMINATE, (BVQ, BVQ), bvsub(V(0), V(1)), bvadd(V(0), bvneg(V(1))));
++REWRITE(BV_ITE_WIDTH_ONE, (BVQ), ite(eq(V(0), bv_sym_val(bv_val(32, 0x1), bv_val(32, 0x1))), bv_sym_val(bv_val(32, 0x1), bv_val(32, 0x1)), bv_sym_val(bv_val(32, 0), bv_val(32, 0x1))), V(0));
++REWRITE(BV_ITE_WIDTH_ONE_NOT, (BVQ), ite(eq(V(0), bv_sym_val(bv_val(32, 0), bv_val(32, 0x1))), bv_sym_val(bv_val(32, 0x1), bv_val(32, 0x1)), bv_sym_val(bv_val(32, 0), bv_val(32, 0x1))), bvnot(V(0)));
++REWRITE(BV_EQ_XOR_SOLVE, (BVQ, BVQ, BVQ), eq(eq(bvxor(V(0), V(1)), V(2)), eq(V(0), bvxor(V(2), V(1)))), _TRUE);
++REWRITE(BV_EQ_NOT_SOLVE, (BVQ, BVQ), eq(eq(bvnot(V(0)), V(1)), eq(V(0), bvnot(V(1)))), _TRUE);
++REWRITE(BV_UGT_ELIMINATE, (BVQ, BVQ), bvugt(V(0), V(1)), bvult(V(1), V(0)));
++REWRITE(BV_UGE_ELIMINATE, (BVQ, BVQ), bvuge(V(0), V(1)), bvule(V(1), V(0)));
++REWRITE(BV_SGT_ELIMINATE, (BVQ, BVQ), bvsgt(V(0), V(1)), bvslt(V(1), V(0)));
++REWRITE(BV_SGE_ELIMINATE, (BVQ, BVQ), bvsge(V(0), V(1)), bvsle(V(1), V(0)));
++REWRITE(BV_SLE_ELIMINATE, (BVQ, BVQ), bvsle(V(0), V(1)), not(bvslt(V(1), V(0))));
++REWRITE(BV_ULE_ELIMINATE, (BVQ, BVQ), bvule(V(0), V(1)), not(bvult(V(1), V(0))));
++REWRITE(BV_ZERO_EXTEND_ELIMINATE, (BVQ, Int), zero_extend(V(1), V(0)), concat(bv_sym_val(bv_val(32, 0), V(1)), V(0)));
++REWRITE(BV_ITE_EQUAL_CHILDREN, (BV(1), BVQ), bvite(V(0), V(1), V(1)), V(1));
++REWRITE(BV_ITE_CONST_CHILDREN_1, (BV(1)), bvite(V(0), bv_sym_val(bv_val(32, 0), bv_val(32, 0x1)), bv_sym_val(bv_val(32, 0x1), bv_val(32, 0x1))), bvnot(V(0)));
++REWRITE(BV_ITE_CONST_CHILDREN_2, (BV(1)), bvite(V(0), bv_sym_val(bv_val(32, 0x1), bv_val(32, 0x1)), bv_sym_val(bv_val(32, 0), bv_val(32, 0x1))), V(0));
++REWRITE(BV_ITE_EQUAL_COND_1, (BV(1), BVQ, BVQ, BVQ), bvite(V(0), bvite(V(0), V(1), V(2)), V(3)), bvite(V(0), V(1), V(3)));
++REWRITE(BV_ITE_EQUAL_COND_2, (BV(1), BVQ, BVQ, BVQ), bvite(V(0), V(1), bvite(V(0), V(2), V(3))), bvite(V(0), V(1), V(3)));
++REWRITE(BV_ITE_EQUAL_COND_3, (BV(1), BVQ, BVQ, BVQ, BVQ), bvite(V(0), bvite(V(0), V(1), V(2)), bvite(V(0), V(3), V(4))), bvite(V(0), V(1), V(4)));
++REWRITE(BV_ITE_MERGE_THEN_IF, (BV(1), BV(1), BVQ, BVQ), bvite(V(0), bvite(V(1), V(2), V(3)), V(2)), bvite(bvand(V(0), bvnot(V(1))), V(3), V(2)));
++REWRITE(BV_ITE_MERGE_ELSE_IF, (BV(1), BV(1), BVQ, BVQ), bvite(V(0), bvite(V(1), V(2), V(3)), V(3)), bvite(bvand(V(0), V(1)), V(2), V(3)));
++REWRITE(BV_ITE_MERGE_THEN_ELSE, (BV(1), BV(1), BVQ, BVQ), bvite(V(0), V(2), bvite(V(1), V(2), V(3))), bvite(bvand(bvnot(V(0)), bvnot(V(1))), V(3), V(2)));
++REWRITE(BV_ITE_MERGE_ELSE_ELSE, (BV(1), BV(1), BVQ, BVQ), bvite(V(0), V(3), bvite(V(1), V(2), V(3))), bvite(bvand(bvnot(V(0)), V(1)), V(2), V(3)));
++REWRITE(BV_SHL_BY_CONST_0, (BVQ, Int), bvshl(V(0), bv_sym_val(bv_val(32, 0), V(1))), V(0));
++REWRITE(BV_LSHR_BY_CONST_0, (BVQ, Int), bvlshr(V(0), bv_sym_val(bv_val(32, 0), V(1))), V(0));
++REWRITE(BV_ASHR_BY_CONST_0, (BVQ, Int), bvashr(V(0), bv_sym_val(bv_val(32, 0), V(1))), V(0));
++REWRITE(BV_XOR_NOT, (BVQ, BVQ), bvxor(bvnot(V(0)), bvnot(V(1))), bvxor(V(0), V(1)));
++REWRITE(BV_NOT_IDEMP, (BVQ), bvnot(bvnot(V(0))), V(0));
++REWRITE(BV_ULT_ZERO_1, (BVQ, Int), bvult(bv_sym_val(bv_val(32, 0), V(1)), V(0)), not(eq(V(0), bv_sym_val(bv_val(32, 0), V(1)))));
++REWRITE(BV_ULT_ZERO_2, (BVQ, Int), bvult(V(0), bv_sym_val(bv_val(32, 0), V(1))), _FALSE);
++REWRITE(BV_ULT_SELF, (BVQ), bvult(V(0), V(0)), _FALSE);
++REWRITE(BV_LT_SELF, (BVQ), bvslt(V(0), V(0)), _FALSE);
++REWRITE(BV_ULE_SELF, (BVQ), bvule(V(0), V(0)), _TRUE);
++REWRITE(BV_ULE_ZERO, (BVQ, Int), bvule(V(0), bv_sym_val(bv_val(32, 0), V(1))), eq(V(0), bv_sym_val(bv_val(32, 0), V(1))));
++REWRITE(BV_ZERO_ULE, (BVQ, Int), bvule(bv_sym_val(bv_val(32, 0), V(1)), V(0)), _TRUE);
++REWRITE(BV_SLE_SELF, (BVQ), bvsle(V(0), V(0)), _TRUE);
++REWRITE(BV_NOT_ULT, (BVQ, BVQ), not(bvult(V(0), V(1))), bvule(V(1), V(0)));
++REWRITE(BV_SHL_ZERO, (BVQ, Int), bvshl(bv_sym_val(bv_val(32, 0), V(1)), V(0)), bv_sym_val(bv_val(32, 0), V(1)));
++REWRITE(BV_LSHR_ZERO, (BVQ, Int), bvlshr(bv_sym_val(bv_val(32, 0), V(1)), V(0)), bv_sym_val(bv_val(32, 0), V(1)));
++REWRITE(BV_ASHR_ZERO, (BVQ, Int), bvashr(bv_sym_val(bv_val(32, 0), V(1)), V(0)), bv_sym_val(bv_val(32, 0), V(1)));
++REWRITE(BV_ULT_ONE, (BVQ, Int), bvult(V(0), bv_sym_val(bv_val(32, 0x1), V(1))), eq(V(0), bv_sym_val(bv_val(32, 0), V(1))));
++// Conditional Rewrite Rules from: ['rewrites/bv-rewrites', 'rewrites/bv-rewrites-elimination', 'rewrites/bv-rewrites-simplification']
++REWRITE_COND(BV_CONCAT_EXTRACT_MERGE, (BVQs, BVQ, BVQs, Int, Int, Int, Int), eq(V(5), bvadd(V(4), bv_val(32, 0x1))), concat(V(0), extract(V(6), V(5), V(1)), extract(V(4), V(3), V(1)), V(2)), concat(V(0), extract(V(6), V(3), V(1)), V(2)));
++REWRITE_COND(BV_EXTRACT_EXTRACT, (BVQ, Int, Int, Int, Int, Int, Int), conj(eq(V(5), bvadd(V(1), V(4))), eq(V(6), bvadd(V(1), V(3)))), extract(V(4), V(3), extract(V(2), V(1), V(0))), extract(V(5), V(6), V(0)));
++REWRITE_COND(BV_EXTRACT_WHOLE, (BVQ, Int), bvsge(V(1), bvsub(bvsize(V(0)), bv_val(32, 0x1))), extract(V(1), bv_val(32, 0), V(0)), V(0));
++REWRITE_COND(BV_EXTRACT_CONCAT_1, (BVQ, BVQs, BVQ, Int, Int), bvsle(V(4), bvsize(V(0))), extract(V(4), V(3), concat(V(1), V(2), V(0))), extract(V(4), V(3), V(0)));
++REWRITE_COND(BV_EXTRACT_CONCAT_2, (BVQ, BVQs, BVQ, Int, Int, Int, Int), conj(bvslt(V(3), bvsize(V(0))), bvsge(V(4), bvsize(V(0))), eq(V(5), bvsub(V(4), bvsize(V(0)))), eq(V(6), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), extract(V(4), V(3), concat(V(1), V(2), V(0))), concat(extract(V(5), bv_val(32, 0), concat(V(1), V(2))), extract(V(6), V(3), V(0))));
++REWRITE_COND(BV_EXTRACT_CONCAT_3, (BVQ, BVQ, BVQs, Int, Int, Int, Int), conj(bvsge(V(3), bvsize(V(0))), eq(V(5), bvsub(V(4), bvsize(V(0)))), eq(V(6), bvsub(V(3), bvsize(V(0))))), extract(V(4), V(3), concat(V(2), V(1), V(0))), extract(V(5), V(6), concat(V(2), V(1))));
++REWRITE_COND(BV_EXTRACT_CONCAT_4, (BVQ, BVQ, BVQs, Int, Int), bvslt(V(4), bvsub(bvsize(concat(V(0), V(2), V(1))), bvsize(V(0)))), extract(V(4), V(3), concat(V(0), V(2), V(1))), extract(V(4), V(3), concat(V(2), V(1))));
++REWRITE_COND(BV_EQ_EXTRACT_ELIM1, (BVQ, BVQ, Int, Int, Int, Int, Int), conj(eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(5), bvadd(V(3), bv_val(32, 0x1))), eq(V(6), bvsub(V(2), bv_val(32, 0x1))), bvsgt(V(4), V(3)), bvsgt(V(2), bv_val(32, 0))), eq(extract(V(3), V(2), V(0)), V(1)), eq(V(0), concat(extract(V(4), V(5), V(0)), V(1), extract(V(6), bv_val(32, 0), V(0)))));
++REWRITE_COND(BV_EQ_EXTRACT_ELIM2, (BVQ, BVQ, Int, Int, Int), conj(eq(V(3), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(4), bvadd(V(2), bv_val(32, 0x1))), bvsgt(V(3), V(2))), eq(extract(V(2), bv_val(32, 0), V(0)), V(1)), eq(V(0), concat(extract(V(3), V(4), V(0)), V(1))));
++REWRITE_COND(BV_EQ_EXTRACT_ELIM3, (BVQ, BVQ, Int, Int, Int), conj(eq(V(3), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(4), bvsub(V(2), bv_val(32, 0x1))), bvsgt(V(2), bv_val(32, 0))), eq(extract(V(3), V(2), V(0)), V(1)), eq(V(0), concat(V(1), extract(V(4), bv_val(32, 0), V(0)))));
++REWRITE_COND(BV_EXTRACT_SIGN_EXTEND_1, (BVQ, Int, Int, Int), bvslt(V(2), bvsize(V(0))), extract(V(2), V(1), sign_extend(V(3), V(0))), extract(V(2), V(1), V(0)));
++REWRITE_COND(BV_EXTRACT_SIGN_EXTEND_2, (BVQ, Int, Int, Int, Int, Int), conj(bvslt(V(1), bvsize(V(0))), bvsge(V(2), bvsize(V(0))), eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(5), bvadd(bv_val(32, 0x1), bvsub(V(2), bvsize(V(0)))))), extract(V(2), V(1), sign_extend(V(3), V(0))), sign_extend(V(5), extract(V(4), V(1), V(0))));
++REWRITE_COND(BV_EXTRACT_SIGN_EXTEND_3, (BVQ, Int, Int, Int, Int, Int), conj(bvsge(V(1), bvsize(V(0))), eq(V(4), bvadd(bv_val(32, 0x1), bvsub(V(2), V(1)))), eq(V(5), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), extract(V(2), V(1), sign_extend(V(3), V(0))), repeat(V(4), extract(V(5), V(5), V(0))));
++REWRITE_COND(BV_AND_SIMPLIFY_1, (BVQs, BVQs, BVQs, BVQ, Int), eq(V(4), bvsize(V(3))), bvand(V(0), bvnot(V(3)), V(1), V(3), V(2)), bv_sym_val(bv_val(32, 0), V(4)));
++REWRITE_COND(BV_AND_SIMPLIFY_2, (BVQs, BVQs, BVQs, BVQ, Int), eq(V(4), bvsize(V(3))), bvand(V(0), V(3), V(1), bvnot(V(3)), V(2)), bv_sym_val(bv_val(32, 0), V(4)));
++REWRITE_COND(BV_OR_SIMPLIFY_1, (BVQs, BVQs, BVQs, BVQ, Int), eq(V(4), bvsize(V(3))), bvor(V(0), bvnot(V(3)), V(1), V(3), V(2)), bvnot(bv_sym_val(bv_val(32, 0), V(4))));
++REWRITE_COND(BV_OR_SIMPLIFY_2, (BVQs, BVQs, BVQs, BVQ, Int), eq(V(4), bvsize(V(3))), bvor(V(0), V(3), V(1), bvnot(V(3)), V(2)), bvnot(bv_sym_val(bv_val(32, 0), V(4))));
++REWRITE_COND(BV_ULT_ADD_ONE, (BVQ, BVQs, BVQs, BVQ, Int), conj(eq(V(3), bv_sym_val(bv_val(32, 0x1), V(4))), eq(V(4), bvsize(V(0)))), bvult(V(0), bvadd(V(1), V(3), V(2))), conj(not(eq(bvadd(V(1), V(2)), bvnot(bv_sym_val(bv_val(32, 0), V(4))))), not(bvult(bvadd(V(1), V(2)), V(0)))));
++REWRITE_COND(BV_MULT_SLT_MULT_1, (BVQ, BVQ, BVQ, Int, Int, Int, Int), conj(eq(V(5), bvsize(V(0))), eq(V(6), bvsize(V(2)))), bvslt(bvmul(sign_extend(V(3), V(1)), sign_extend(V(4), V(2))), bvmul(sign_extend(V(3), V(0)), sign_extend(V(4), V(2)))), conj(not(eq(bvsub(V(1), V(0)), bv_sym_val(bv_val(32, 0), V(5)))), not(eq(V(2), bv_sym_val(bv_val(32, 0), V(6)))), eq(bvslt(V(1), V(0)), bvsgt(V(2), bv_sym_val(bv_val(32, 0), V(6))))));
++REWRITE_COND(BV_MULT_SLT_MULT_2, (BVQ, BVQ, BVQ, Int, Int, Int, Int), conj(eq(V(5), bvsize(V(0))), eq(V(6), bvsize(V(2)))), bvslt(bvmul(zero_extend(V(3), V(1)), sign_extend(V(4), V(2))), bvmul(zero_extend(V(3), V(0)), sign_extend(V(4), V(2)))), conj(not(eq(bvsub(V(1), V(0)), bv_sym_val(bv_val(32, 0), V(5)))), not(eq(V(2), bv_sym_val(bv_val(32, 0), V(6)))), eq(bvult(V(1), V(0)), bvsgt(V(2), bv_sym_val(bv_val(32, 0), V(6))))));
++REWRITE_COND(BV_NOT_NEQ, (BVQ), bvsgt(bvsize(V(0)), bv_val(32, 0)), eq(V(0), bvnot(V(0))), _FALSE);
++REWRITE_COND(BV_ULT_ONES, (BVQ, Int, Int), eq(V(1), bvmax(V(2))), bvult(V(0), bv_sym_val(V(1), V(2))), neq(V(0), bv_sym_val(V(1), V(2))));
++REWRITE_COND(BV_CONCAT_MERGE_CONST, (BVQs, Int, Int, Int, Int, Int, BVQs), eq(V(5), bvadd(V(2), V(4))), concat(V(0), bv_sym_val(V(1), V(2)), bv_sym_val(V(3), V(4)), V(6)), concat(V(0), bv_sym_val(bvadd(bvmul(V(1), bvshl(bv_val(32, 0x1), V(4))), V(3)), V(5)), V(6)));
++REWRITE_COND(BV_SHL_BY_CONST_1, (BVQ, Int, Int, Int), conj(bvslt(V(1), bvsize(V(0))), eq(V(3), bvsub(bvsize(V(0)), bvadd(bv_val(32, 0x1), V(1))))), bvshl(V(0), bv_sym_val(V(1), V(2))), concat(extract(V(3), bv_val(32, 0), V(0)), bv_sym_val(bv_val(32, 0), V(1))));
++REWRITE_COND(BV_SHL_BY_CONST_2, (BVQ, Int, Int, Int), conj(bvsge(V(1), bvsize(V(0))), eq(V(3), bvsize(V(0)))), bvshl(V(0), bv_sym_val(V(1), V(2))), bv_sym_val(bv_val(32, 0), V(3)));
++REWRITE_COND(BV_LSHR_BY_CONST_1, (BVQ, Int, Int, Int), conj(bvslt(V(1), bvsize(V(0))), eq(V(3), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), bvlshr(V(0), bv_sym_val(V(1), V(2))), concat(bv_sym_val(bv_val(32, 0), V(1)), extract(V(3), V(1), V(0))));
++REWRITE_COND(BV_LSHR_BY_CONST_2, (BVQ, Int, Int), bvsge(V(1), bvsize(V(0))), bvlshr(V(0), bv_sym_val(V(1), V(2))), bv_sym_val(bv_val(32, 0), V(2)));
++REWRITE_COND(BV_ASHR_BY_CONST_1, (BVQ, Int, Int, Int), conj(bvslt(V(1), bvsize(V(0))), eq(V(3), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), bvashr(V(0), bv_sym_val(V(1), V(2))), concat(repeat(V(1), extract(V(3), V(3), V(0))), extract(V(3), V(1), V(0))));
++REWRITE_COND(BV_ASHR_BY_CONST_2, (BVQ, Int, Int, Int, Int), conj(bvsge(V(1), bvsize(V(0))), eq(V(3), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(4), bvsize(V(0)))), bvashr(V(0), bv_sym_val(V(1), V(2))), repeat(V(4), extract(V(3), V(3), V(0))));
++REWRITE_COND(BV_AND_CONCAT_PULLUP, (BVQs, BVQs, BVQ, BVQ, BVQs, Int, Int, Int), conj(eq(V(6), bvsize(V(2))), eq(V(5), bvsub(bvsize(bvand(V(0), V(1))), bv_val(32, 0x1))), eq(V(7), bvsub(bvsize(V(2)), bv_val(32, 0x1)))), bvand(V(0), concat(V(4), V(3), V(2)), V(1)), concat(bvand(extract(V(5), V(6), bvand(V(0), V(1))), concat(V(4), V(3))), bvand(extract(V(7), bv_val(32, 0), bvand(V(0), V(1))), V(2))));
++REWRITE_COND(BV_OR_CONCAT_PULLUP, (BVQs, BVQs, BVQ, BVQ, BVQs, Int, Int, Int), conj(eq(V(6), bvsize(V(2))), eq(V(5), bvsub(bvsize(bvor(V(0), V(1))), bv_val(32, 0x1))), eq(V(7), bvsub(bvsize(V(2)), bv_val(32, 0x1)))), bvor(V(0), concat(V(4), V(3), V(2)), V(1)), concat(bvor(extract(V(5), V(6), bvor(V(0), V(1))), concat(V(4), V(3))), bvor(extract(V(7), bv_val(32, 0), bvor(V(0), V(1))), V(2))));
++REWRITE_COND(BV_XOR_CONCAT_PULLUP, (BVQs, BVQs, BVQ, BVQ, BVQs, Int, Int, Int), conj(eq(V(6), bvsize(V(2))), eq(V(5), bvsub(bvsize(bvxor(V(0), V(1))), bv_val(32, 0x1))), eq(V(7), bvsub(bvsize(V(2)), bv_val(32, 0x1)))), bvxor(V(0), concat(V(4), V(3), V(2)), V(1)), concat(bvxor(extract(V(5), V(6), bvxor(V(0), V(1))), concat(V(4), V(3))), bvxor(extract(V(7), bv_val(32, 0), bvxor(V(0), V(1))), V(2))));
++REWRITE_COND(BV_AND_CONCAT_PULLUP2, (BVQs, BVQs, BVQ, BVQ, BVQs, Int, Int, Int), conj(eq(V(6), bvsize(concat(V(2), V(4)))), eq(V(5), bvsub(bvsize(bvand(V(0), V(1))), bv_val(32, 0x1))), eq(V(7), bvsub(bvsize(concat(V(2), V(4))), bv_val(32, 0x1)))), bvand(V(0), concat(V(3), V(2), V(4)), V(1)), concat(bvand(extract(V(5), V(6), bvand(V(0), V(1))), V(3)), bvand(extract(V(7), bv_val(32, 0), bvand(V(0), V(1))), concat(V(2), V(4)))));
++REWRITE_COND(BV_OR_CONCAT_PULLUP2, (BVQs, BVQs, BVQ, BVQ, BVQs, Int, Int, Int), conj(eq(V(6), bvsize(concat(V(2), V(4)))), eq(V(5), bvsub(bvsize(bvor(V(0), V(1))), bv_val(32, 0x1))), eq(V(7), bvsub(bvsize(concat(V(2), V(4))), bv_val(32, 0x1)))), bvor(V(0), concat(V(3), V(2), V(4)), V(1)), concat(bvor(extract(V(5), V(6), bvor(V(0), V(1))), V(3)), bvor(extract(V(7), bv_val(32, 0), bvor(V(0), V(1))), concat(V(2), V(4)))));
++REWRITE_COND(BV_XOR_CONCAT_PULLUP2, (BVQs, BVQs, BVQ, BVQ, BVQs, Int, Int, Int), conj(eq(V(6), bvsize(concat(V(2), V(4)))), eq(V(5), bvsub(bvsize(bvxor(V(0), V(1))), bv_val(32, 0x1))), eq(V(7), bvsub(bvsize(concat(V(2), V(4))), bv_val(32, 0x1)))), bvxor(V(0), concat(V(3), V(2), V(4)), V(1)), concat(bvxor(extract(V(5), V(6), bvxor(V(0), V(1))), V(3)), bvxor(extract(V(7), bv_val(32, 0), bvxor(V(0), V(1))), concat(V(2), V(4)))));
++REWRITE_COND(BV_AND_CONCAT_PULLUP3, (BVQs, BVQs, BVQ, BVQ, BVQ, Int, Int, Int, Int, Int), conj(eq(V(5), bvsub(bvsize(bvand(V(0), V(1))), bv_val(32, 0x1))), eq(V(6), bvadd(bvsize(V(2)), bvsize(V(4)))), eq(V(7), bvsub(bvadd(bvsize(V(2)), bvsize(V(4))), bv_val(32, 0x1))), eq(V(8), bvsize(V(4))), eq(V(9), bvsub(bvsize(V(4)), bv_val(32, 0x1)))), bvand(V(0), concat(V(3), V(2), V(4)), V(1)), concat(bvand(extract(V(5), V(6), bvand(V(0), V(1))), V(3)), bvand(extract(V(7), V(8), bvand(V(0), V(1))), V(2)), bvand(extract(V(9), bv_val(32, 0), bvand(V(0), V(1))), V(4))));
++REWRITE_COND(BV_OR_CONCAT_PULLUP3, (BVQs, BVQs, BVQ, BVQ, BVQ, Int, Int, Int, Int, Int), conj(eq(V(5), bvsub(bvsize(bvor(V(0), V(1))), bv_val(32, 0x1))), eq(V(6), bvadd(bvsize(V(2)), bvsize(V(4)))), eq(V(7), bvsub(bvadd(bvsize(V(2)), bvsize(V(4))), bv_val(32, 0x1))), eq(V(8), bvsize(V(4))), eq(V(9), bvsub(bvsize(V(4)), bv_val(32, 0x1)))), bvor(V(0), concat(V(3), V(2), V(4)), V(1)), concat(bvor(extract(V(5), V(6), bvor(V(0), V(1))), V(3)), bvor(extract(V(7), V(8), bvor(V(0), V(1))), V(2)), bvor(extract(V(9), bv_val(32, 0), bvor(V(0), V(1))), V(4))));
++REWRITE_COND(BV_XOR_CONCAT_PULLUP3, (BVQs, BVQs, BVQ, BVQ, BVQ, Int, Int, Int, Int, Int), conj(eq(V(5), bvsub(bvsize(bvxor(V(0), V(1))), bv_val(32, 0x1))), eq(V(6), bvadd(bvsize(V(2)), bvsize(V(4)))), eq(V(7), bvsub(bvadd(bvsize(V(2)), bvsize(V(4))), bv_val(32, 0x1))), eq(V(8), bvsize(V(4))), eq(V(9), bvsub(bvsize(V(4)), bv_val(32, 0x1)))), bvxor(V(0), concat(V(3), V(2), V(4)), V(1)), concat(bvxor(extract(V(5), V(6), bvxor(V(0), V(1))), V(3)), bvxor(extract(V(7), V(8), bvxor(V(0), V(1))), V(2)), bvxor(extract(V(9), bv_val(32, 0), bvxor(V(0), V(1))), V(4))));
++REWRITE_COND(BV_XOR_DUPLICATE, (BVQ, Int), eq(V(1), bvsize(V(0))), bvxor(V(0), V(0)), bv_sym_val(bv_val(32, 0), V(1)));
++REWRITE_COND(BV_XOR_ONES, (BVQs, BVQs, Int, Int), eq(V(2), bvmax(V(3))), bvxor(V(0), bv_sym_val(V(2), V(3)), V(1)), bvnot(bvxor(V(0), V(1))));
++REWRITE_COND(BV_ULE_MAX, (BVQ, Int, Int), conj(eq(V(2), bvsize(V(0))), eq(V(1), bvmax(bvsize(V(0))))), bvule(V(0), bv_sym_val(V(1), V(2))), _TRUE);
++REWRITE_COND(BV_MERGE_SIGN_EXTEND_1, (BVQ, Int, Int, Int), eq(V(3), bvadd(V(1), V(2))), sign_extend(V(1), sign_extend(V(2), V(0))), sign_extend(V(3), V(0)));
++REWRITE_COND(BV_MERGE_SIGN_EXTEND_2, (BVQ, Int, Int, Int), conj(bvsgt(V(2), bv_val(32, 0)), eq(V(3), bvadd(V(1), V(2)))), sign_extend(V(1), zero_extend(V(2), V(0))), zero_extend(V(3), V(0)));
++REWRITE_COND(BV_SIGN_EXTEND_EQ_CONST_1, (BVQ, Int, Int, Int, Int, Int, Int), conj(eq(V(4), bvadd(V(1), bv_val(32, 0x1))), eq(V(5), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(6), bvsub(V(3), bv_val(32, 0x1)))), eq(sign_extend(V(1), V(0)), bv_sym_val(V(2), V(3))), conj(disj(eq(extract(V(6), V(5), bv_sym_val(V(2), V(3))), bv_sym_val(bv_val(32, 0), V(4))), eq(extract(V(6), V(5), bv_sym_val(V(2), V(3))), bvnot(bv_sym_val(bv_val(32, 0), V(4))))), eq(V(0), extract(V(5), bv_val(32, 0), bv_sym_val(V(2), V(3))))));
++REWRITE_COND(BV_SIGN_EXTEND_EQ_CONST_2, (BVQ, Int, Int, Int, Int, Int, Int), conj(eq(V(4), bvadd(V(1), bv_val(32, 0x1))), eq(V(5), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(6), bvsub(V(3), bv_val(32, 0x1)))), eq(bv_sym_val(V(2), V(3)), sign_extend(V(1), V(0))), conj(disj(eq(extract(V(6), V(5), bv_sym_val(V(2), V(3))), bv_sym_val(bv_val(32, 0), V(4))), eq(extract(V(6), V(5), bv_sym_val(V(2), V(3))), bvnot(bv_sym_val(bv_val(32, 0), V(4))))), eq(V(0), extract(V(5), bv_val(32, 0), bv_sym_val(V(2), V(3))))));
++REWRITE_COND(BV_ZERO_EXTEND_EQ_CONST_1, (BVQ, Int, Int, Int, Int, Int), conj(eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(5), bvsub(V(3), bv_val(32, 0x1)))), eq(zero_extend(V(1), V(0)), bv_sym_val(V(2), V(3))), conj(eq(extract(V(5), V(4), bv_sym_val(V(2), V(3))), bv_sym_val(bv_val(32, 0), V(1))), eq(V(0), extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3))))));
++REWRITE_COND(BV_ZERO_EXTEND_EQ_CONST_2, (BVQ, Int, Int, Int, Int, Int), conj(eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(V(5), bvsub(V(3), bv_val(32, 0x1)))), eq(bv_sym_val(V(2), V(3)), zero_extend(V(1), V(0))), conj(eq(extract(V(5), V(4), bv_sym_val(V(2), V(3))), bv_sym_val(bv_val(32, 0), V(1))), eq(V(0), extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3))))));
++REWRITE_COND(BV_ZERO_EXTEND_ULT_CONST_1, (BVQ, Int, Int, Int, Int), conj(eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(bv_sym_val(V(2), V(3)), zero_extend(V(1), extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3)))))), bvult(zero_extend(V(1), V(0)), bv_sym_val(V(2), V(3))), bvult(V(0), extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3)))));
++REWRITE_COND(BV_ZERO_EXTEND_ULT_CONST_2, (BVQ, Int, Int, Int, Int), conj(eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1))), eq(bv_sym_val(V(2), V(3)), zero_extend(V(1), extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3)))))), bvult(bv_sym_val(V(2), V(3)), zero_extend(V(1), V(0))), bvult(extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3))), V(0)));
++REWRITE_COND(BV_SIGN_EXTEND_ULT_CONST_1, (BVQ, Int, Int, Int, Int), conj(disj(bvule(bv_sym_val(V(2), V(3)), bvshl(bv_sym_val(bv_val(32, 0x1), V(3)), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3)))), bvuge(bv_sym_val(V(2), V(3)), bvshl(bvnot(bv_sym_val(bv_val(32, 0), V(3))), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3))))), eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), bvult(sign_extend(V(1), V(0)), bv_sym_val(V(2), V(3))), bvult(V(0), extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3)))));
++REWRITE_COND(BV_SIGN_EXTEND_ULT_CONST_2, (BVQ, Int, Int, Int, Int), conj(bvult(bvshl(bv_sym_val(bv_val(32, 0x1), V(3)), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3))), bv_sym_val(V(2), V(3))), bvule(bv_sym_val(V(2), V(3)), bvshl(bvnot(bv_sym_val(bv_val(32, 0), V(3))), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3)))), eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), bvult(sign_extend(V(1), V(0)), bv_sym_val(V(2), V(3))), eq(extract(V(4), V(4), V(0)), bv_sym_val(bv_val(32, 0), bv_val(32, 0x1))));
++REWRITE_COND(BV_SIGN_EXTEND_ULT_CONST_3, (BVQ, Int, Int, Int, Int), conj(disj(bvult(bv_sym_val(V(2), V(3)), bvshl(bv_sym_val(bv_val(32, 0x1), V(3)), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3)))), bvuge(bv_sym_val(V(2), V(3)), bvnot(bvshl(bv_sym_val(bv_val(32, 0x1), V(3)), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3)))))), eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), bvult(bv_sym_val(V(2), V(3)), sign_extend(V(1), V(0))), bvult(extract(V(4), bv_val(32, 0), bv_sym_val(V(2), V(3))), V(0)));
++REWRITE_COND(BV_SIGN_EXTEND_ULT_CONST_4, (BVQ, Int, Int, Int, Int), conj(bvule(bvnot(bvshl(bvnot(bv_sym_val(bv_val(32, 0), V(3))), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3)))), bv_sym_val(V(2), V(3))), bvule(bv_sym_val(V(2), V(3)), bvnot(bvshl(bv_sym_val(bv_val(32, 0x1), V(3)), bv_sym_val(bvsub(bvsize(V(0)), bv_val(32, 0x1)), V(3))))), eq(V(4), bvsub(bvsize(V(0)), bv_val(32, 0x1)))), bvult(bv_sym_val(V(2), V(3)), sign_extend(V(1), V(0))), eq(extract(V(4), V(4), V(0)), bv_sym_val(bv_val(32, 0x1), bv_val(32, 0x1))));
+-- 
+2.34.1
+

@@ -1,0 +1,50 @@
+From 5be1d986dc48b6d60ea88d53ca8afe6035351d44 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 5 Nov 2025 16:36:47 +0100
+Subject: [PATCH RFC 00/11] bpf: Core proof rules and rewrite infrastructure
+
+This set adds the core building blocks for the in-kernel BCF proof checker:
+type checks for BCF expressions, a rule-application skeleton, a small set
+of core rules, and rewrite rules.
+
+- Expression checks: validate opcode/arity and types (BV/BOOL/LIST), including
+  BV widths for indexed ops (extract/extend/repeat), concat, size-of, and
+  from_bool; bound BV literals and boolean predicates.
+- Expression arena: refcounted nodes keyed by id with sharing/unification
+  during equivalence checks to shrink exprs.
+- Rule workflow: per-class dispatch (core/boolean/bv), premise/parameter
+  validation, and a single fact per step with early premise release.
+- Core rules: reflexivity/symmetry/transitivity, inequality of distinct
+  literals, congruence, true/false intro/elim, constant evaluation, and
+  algebraic ACI normalization/absorption checks.
+- Rewrites: UAPI enumerates rewrite ids; a macro DSL describes match/target
+  templates and optional conditions; the checker instantiates, type-checks,
+  and asserts the equality when side conditions hold.
+
+Hao Sun (11):
+  bpf: Add bcf expr type check
+  bpf: Add bcf_expr management routines
+  bpf: Add expr_equiv() for proof goal check
+  bpf: Add top-level workflow of rule application
+  bpf: Add basic core rules
+  bpf: Add core rule: evaluate
+  bpf: Add core rules: ACI_NORM and ABSORB
+  bpf: Core rule: Add rewrite rule uapi
+  bpf: Core rule: Add macro-based rewrite dsl
+  bpf: Core rule: add rewrites encoded in DSL
+  bpf: Core rule: apply_rewrite()
+
+ .clang-format                        |    3 +
+ include/uapi/linux/bcf.h             |  163 ++
+ kernel/bpf/bcf_checker.c             | 2677 +++++++++++++++++++++++++-
+ kernel/bpf/bcf_rewrite_dsl.h         |  258 +++
+ kernel/bpf/bcf_rewrite_dsl_cleanup.h |  106 +
+ kernel/bpf/bcf_rewrites.h            |  159 ++
+ 6 files changed, 3327 insertions(+), 39 deletions(-)
+ create mode 100644 kernel/bpf/bcf_rewrite_dsl.h
+ create mode 100644 kernel/bpf/bcf_rewrite_dsl_cleanup.h
+ create mode 100644 kernel/bpf/bcf_rewrites.h
+
+-- 
+2.34.1
+

@@ -1,0 +1,238 @@
+From c7012bf1eb29884c355eb87f6efce6caa15eaba3 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 19:23:58 +0200
+Subject: [PATCH RFC 2/7] bpf: BV rule: check basic bb term
+
+Validate bit-blasted BV terms (bv = bbt) for base operators:
+- variables, constants, not
+- bitwise and/or/xor (per-stage folding through a binary tree)
+- concat, extract, sign-extend, ite
+The checker requires bbt to be a from_bool vector and verifies that each output
+bit is built from the corresponding input bits according to the op.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 195 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 195 insertions(+)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 95f6731254fa..7ed97c6252aa 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -703,6 +703,22 @@ static bool is_ite_bool_cond(struct bcf_checker_state *st, struct bcf_expr *e)
+ 	return !is_bv_ite(e->code) || is_bool(id_to_expr(st, e->args[0])->code);
+ }
+ 
++static bool is_bool_disj_of(struct bcf_checker_state *st, u32 id, u32 a, u32 b)
++{
++	struct bcf_expr *e = id_to_expr(st, id);
++
++	return is_bool_disj(e->code) && e->vlen == 2 && e->args[0] == a &&
++	       e->args[1] == b;
++}
++
++static bool is_bitof(struct bcf_checker_state *st, u32 id, u32 bit, u32 bv_id)
++{
++	struct bcf_expr *e = id_to_expr(st, id);
++
++	return is_bool_bitof(e->code) && e->args[0] == bv_id &&
++	       BCF_BITOF_BIT(e->params) == bit;
++}
++
+ static bool is_bool_not_of(struct bcf_checker_state *st, u32 not_id, u32 e_id)
+ {
+ 	struct bcf_expr *not_expr = id_to_expr(st, not_id);
+@@ -4038,11 +4054,190 @@ static int check_bb_atom(struct bcf_checker_state *st, struct bcf_expr *atom,
+ 	return bb_slt(st, bbt, lbits, rbits, vlen, eq);
+ }
+ 
++static int bb_bitwise_op(struct bcf_checker_state *st, struct bcf_expr *term,
++			 struct bcf_expr *bbt, u8 op)
++{
++	struct bcf_expr *sub, *bit;
++	u32 bit_id, i, j;
++
++	for (i = 0; i < bbt->vlen; i++) {
++		bit_id = bbt->args[i];
++		bit = id_to_expr(st, bit_id);
++		for (j = term->vlen - 1; j > 0; j--) {
++			ENSURE(BCF_OP(bit->code) == op && bit->vlen == 2);
++			sub = id_to_expr(st, term->args[j]);
++			ENSURE(bit->args[1] == sub->args[i]);
++
++			bit_id = bit->args[0];
++			bit = id_to_expr(st, bit_id);
++		}
++		sub = id_to_expr(st, term->args[0]);
++		ENSURE(bit_id == sub->args[i]);
++	}
++	return 0;
++}
++
+ static int check_bb_term(struct bcf_checker_state *st, u32 term_id, u32 bbt_id)
+ {
++#define BB_TERM_CHECKER(_bv, ty_name, op, op_name, _arity) \
++	[op >> 3] = &&bb_##ty_name##_##op_name,
++	static const void *const bb_term_table[32] __annotate_jump_table = {
++		[0 ... 31] = &&not_supp_bb_term, BCF_BV_OP(BB_TERM_CHECKER)
++	};
++#undef BB_TERM_CHECKER
++	struct bcf_expr *term = id_to_expr(st, term_id);
++	struct bcf_expr *bbt = id_to_expr(st, bbt_id);
++	struct bcf_expr *sub, *bit;
++	u32 i, j;
++
++	ENSURE(is_bv_from_bool(bbt->code));
++	if (expr_arg_is_id(term->code)) {
++		bcf_for_each_arg_expr(i, sub, term, st) {
++			if (i == 0 && is_bv_ite(term->code)) {
++				ENSURE(is_bool(sub->code) ||
++				       is_bv_from_bool(sub->code));
++				continue;
++			}
++			ENSURE(is_bv_from_bool(sub->code));
++		}
++	}
++
++	goto *bb_term_table[BCF_OP(term->code) >> 3];
++
++bb_bv_var: {
++	for (i = 0; i < bbt->vlen; i++)
++		ENSURE(is_bitof(st, bbt->args[i], i, term_id));
++	return 0;
++}
++
++bb_bv_val: {
++	u64 val = bv_val(term);
++
++	bcf_for_each_arg_expr(i, bit, bbt, st)
++		ENSURE(val & (1ULL << i) ? is_true(bit) : is_false(bit));
++	return 0;
++}
++
++bb_bv_not: {
++	for (i = 0; i < bbt->vlen; i++)
++		ENSURE(is_bool_not_of(st, bbt->args[i], term->args[i]));
++	return 0;
++}
++
++/* Arith ops */
++bb_bv_neg: {
++	return -EOPNOTSUPP;
++}
++
++bb_bv_add: {
++	return -EOPNOTSUPP;
++}
++
++bb_bv_sub: {
+ 	return -EOPNOTSUPP;
+ }
+ 
++/* Bitwise ops */
++bb_bv_and:
++	return bb_bitwise_op(st, term, bbt, BPF_AND);
++
++bb_bv_or:
++	return bb_bitwise_op(st, term, bbt, BPF_OR);
++
++bb_bv_xor:
++	return bb_bitwise_op(st, term, bbt, BPF_XOR);
++
++bb_bv_lsh: {
++	return -EOPNOTSUPP;
++}
++
++bb_bv_rsh: {
++	return -EOPNOTSUPP;
++}
++
++bb_bv_arsh: {
++	return -EOPNOTSUPP;
++}
++
++/* BV ops */
++bb_bv_concat: {
++	u32 base = 0;
++	int arg_i;
++
++	for (arg_i = term->vlen - 1; arg_i >= 0; arg_i--) {
++		sub = id_to_expr(st, term->args[arg_i]);
++		for (j = 0; j < sub->vlen; j++)
++			ENSURE(bbt->args[base + j] == sub->args[j]);
++		base += sub->vlen;
++	}
++	return 0;
++}
++
++bb_bv_extract: {
++	u32 high = BCF_EXTRACT_START(term->params);
++	u32 low = BCF_EXTRACT_END(term->params);
++
++	sub = id_to_expr(st, term->args[0]);
++	for (i = low, j = 0; i <= high; i++, j++)
++		ENSURE(bbt->args[j] == sub->args[i]);
++	return 0;
++}
++
++bb_bv_sign_extend: {
++	u32 ext_sz = BCF_EXT_LEN(term->params);
++	u32 sign_bit;
++
++	sub = id_to_expr(st, term->args[0]);
++	for (i = 0; i < sub->vlen; i++)
++		ENSURE(sub->args[i] == bbt->args[i]);
++
++	sign_bit = sub->args[sub->vlen - 1];
++	for (i = sub->vlen, j = 0; j < ext_sz; j++, i++)
++		ENSURE(bbt->args[i] == sign_bit);
++	return 0;
++}
++
++bb_bv_ite: {
++	struct bcf_expr *then, *el;
++	u32 cond;
++
++	cond = term->args[0];
++	then = id_to_expr(st, term->args[1]);
++	el = id_to_expr(st, term->args[2]);
++	for (i = 0; i < bbt->vlen; i++) {
++		/* Each bit must be: (!cond or then[i]) and (cond or el[i]) */
++		sub = id_to_expr(st, bbt->args[i]);
++		ENSURE(is_bool_conj2(st, bbt->args[i]));
++
++		ENSURE(is_bool_disj_of(st, sub->args[1], cond, el->args[i]));
++
++		sub = id_to_expr(st, sub->args[0]);
++		ENSURE(is_bool_disj(sub->code) && sub->vlen == 2);
++		ENSURE(is_bool_not_of(st, sub->args[0], cond));
++		ENSURE(sub->args[1] == then->args[i]);
++	}
++	return 0;
++}
++
++/* Skip non-linear arith, add mul when needed. */
++bb_bv_mul:
++bb_bv_div:
++bb_bv_sdiv:
++bb_bv_mod:
++bb_bv_smod:
++	return -EOPNOTSUPP;
++
++/* Should be rewritten */
++bb_bv_repeat:
++bb_bv_zero_extend:
++/* Not bitblast candidates. */
++bb_bv_from_bool:
++bb_bv_bvsize:
++	return -EINVAL;
++not_supp_bb_term:
++	return -EFAULT;
++}
++
+ static int apply_bv_rule(struct bcf_checker_state *st,
+ 			 struct bcf_proof_step *step)
+ {
+-- 
+2.34.1
+

@@ -1,0 +1,543 @@
+From 10b5d8a80531371a15d03ac4ea8aa8d26250813c Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 09:50:04 +0200
+Subject: [PATCH RFC 02/17] bpf: Add bcf_checker top-level workflow
+
+Introduce the in-kernel BCF proof checker skeleton and public entry point.
+The checker validates userspace proofs of refinement conditions.
+Proof size hard limit: MAX_BCF_PROOF_SIZE 8M.
+
+kernel/bpf/bcf_checker.c implements:
+- Buffer/header validation (check_hdr): enforces BCF_MAGIC, size alignment,
+  and overflow-safe size arithmetic for expr/step regions.
+
+- Expression arena load (check_exprs):
+  builds a bitmap of validated indices, enforces that each non-VAL argument
+  points to an earlier index, stubs type_check() for future semantic checks,
+  and records the arena size as the starting point for dynamic ids (id_gen).
+
+- Step load/validation (check_steps): copies steps, verifies per-step size,
+  rule class/id bounds via rule_class_max(), that all premises refer to
+  strictly earlier steps, records the single ASSUME step (check_assume stub),
+  computes last_ref for each step for lifetime mgmt, and requires every
+  non-final step to be referenced later.
+
+- Rule application loop (apply_rules): iterates steps in order, dispatches by
+  rule class to apply_core_rule/apply_bool_rule/apply_bv_rule (stubs now),
+
+- Memory management: bcf_checker_state owns copied arenas and per-step state;
+  dynamically created exprs (facts) are ref-counted, and tracked in an xarray
+  indexed by new ids >= expr_size, to be added in the next patch set.
+
+Rule semantics, type checking, and integration with the verifier appear in
+later patches; this change only defines the top-level checker structure.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ .clang-format               |   2 +
+ include/linux/bcf_checker.h |  18 ++
+ kernel/bpf/Makefile         |   2 +-
+ kernel/bpf/bcf_checker.c    | 440 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 461 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/bcf_checker.h
+ create mode 100644 kernel/bpf/bcf_checker.c
+
+diff --git a/.clang-format b/.clang-format
+index f371a13b4d19..7f2f85bc4c1f 100644
+--- a/.clang-format
++++ b/.clang-format
+@@ -747,6 +747,8 @@ ForEachMacros:
+   - 'ynl_attr_for_each_nested'
+   - 'ynl_attr_for_each_payload'
+   - 'zorro_for_each_dev'
++  - 'bcf_for_each_arg'
++  - 'bcf_for_each_pm_step'
+ 
+ IncludeBlocks: Preserve
+ IncludeCategories:
+diff --git a/include/linux/bcf_checker.h b/include/linux/bcf_checker.h
+new file mode 100644
+index 000000000000..220552653c80
+--- /dev/null
++++ b/include/linux/bcf_checker.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __LINUX_BCF_CHECKER_H__
++#define __LINUX_BCF_CHECKER_H__
++
++#include <uapi/linux/bcf.h>
++#include <linux/stdarg.h>
++#include <linux/bpfptr.h>
++#include <linux/bpf_verifier.h> /* For log level. */
++
++#define MAX_BCF_PROOF_SIZE (8 * 1024 * 1024)
++
++typedef void (*bcf_logger_cb)(void *private, const char *fmt, va_list args);
++
++int bcf_check_proof(struct bcf_expr *goal_exprs, u32 goal, bpfptr_t proof,
++		    u32 proof_size, bcf_logger_cb logger, u32 level,
++		    void *private);
++
++#endif /* __LINUX_BCF_CHECKER_H__ */
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index 7fd0badfacb1..5084a0a918e4 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -6,7 +6,7 @@ cflags-nogcse-$(CONFIG_X86)$(CONFIG_CC_IS_GCC) := -fno-gcse
+ endif
+ CFLAGS_core.o += -Wno-override-init $(cflags-nogcse-yy)
+ 
+-obj-$(CONFIG_BPF_SYSCALL) += syscall.o verifier.o inode.o helpers.o tnum.o log.o token.o liveness.o
++obj-$(CONFIG_BPF_SYSCALL) += syscall.o verifier.o inode.o helpers.o tnum.o log.o token.o liveness.o bcf_checker.o
+ obj-$(CONFIG_BPF_SYSCALL) += bpf_iter.o map_iter.o task_iter.o prog_iter.o link_iter.o
+ obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o bloom_filter.o
+ obj-$(CONFIG_BPF_SYSCALL) += local_storage.o queue_stack_maps.o ringbuf.o
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+new file mode 100644
+index 000000000000..33b6e5f04e7f
+--- /dev/null
++++ b/kernel/bpf/bcf_checker.c
+@@ -0,0 +1,440 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/kernel.h>
++#include <linux/overflow.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/cleanup.h>
++#include <linux/slab.h>
++#include <linux/xarray.h>
++#include <linux/refcount.h>
++#include <linux/bitmap.h>
++#include <linux/sched/signal.h>
++#include <linux/sched.h>
++#include <linux/bcf_checker.h>
++
++/* Per proof step state. */
++struct bcf_step_state {
++	/* The conclusion of the current step. */
++	struct bcf_expr *fact;
++	u32 fact_id;
++	/*
++	 * The last step referring to the current step. After `last_ref`, the
++	 * `fact` is no longer used by any other steps and can be freed.
++	 */
++	u32 last_ref;
++};
++
++/*
++ * The expr buffer `exprs` below as well as `steps` rely on the fact that the
++ * size of each arg is the same as the size of the struct bcf_expr, and no
++ * padings in between and after.
++ */
++static_assert(struct_size_t(struct bcf_expr, args, 1) ==
++	      sizeof_field(struct bcf_expr, args[0]) * 2);
++static_assert(struct_size_t(struct bcf_proof_step, args, 1) ==
++	      sizeof_field(struct bcf_proof_step, args[0]) * 2);
++
++/* Size of expr/step in u32 plus the node itself */
++#define EXPR_SZ(expr) ((expr)->vlen + 1)
++#define STEP_SZ(step) ((step)->premise_cnt + (step)->param_cnt + 1)
++
++#define bcf_for_each_arg(arg_id, expr)                                   \
++	for (u32 ___i = 0;                                               \
++	     ___i < (expr)->vlen && (arg_id = (expr)->args[___i], true); \
++	     ___i++)
++
++#define bcf_for_each_pm_step(step_id, step)                      \
++	for (u32 ___i = 0; ___i < (step)->premise_cnt &&         \
++			   (step_id = (step)->args[___i], true); \
++	     ___i++)
++
++struct bcf_checker_state {
++	/*
++	 * Exprs from the proof, referred to as `static expr`. They exist
++	 * during the entire checking phase.
++	 */
++	struct bcf_expr *exprs;
++	/*
++	 * Each expr of `exprs` is followed by their arguments. The `valid_idx`
++	 * bitmap records the valid indices of exprs.
++	 */
++	unsigned long *valid_idx;
++	/* Size of exprs array. */
++	u32 expr_size;
++	/*
++	 * For exprs that are allocated dynamically during proof checking, e.g.,
++	 * conclusions from proof steps, they are refcounted, and each allocated
++	 * expr has an id (increased after `expr_size`) and is stored in xarray.
++	 *
++	 * With this xarray, any routines below can exit early on any error
++	 * without worrying about freeing the exprs allocated; they can be
++	 * freed once when freeing the xarray, see free_checker_state().
++	 */
++	u32 id_gen;
++	struct xarray expr_id_map; /* Id (u32) to `struct bcf_expr_ref` */
++
++	/* Step state tracking */
++	struct bcf_proof_step *steps;
++	struct bcf_step_state *step_state;
++	u32 step_size; /* size of steps array */
++	u32 step_cnt; /* valid number of steps */
++	u32 cur_step;
++	u32 cur_step_idx;
++
++	bcf_logger_cb logger;
++	void *logger_private;
++	u32 level;
++
++	u32 goal;
++	struct bcf_expr *goal_exprs;
++};
++
++static void free_checker_state(struct bcf_checker_state *st)
++{
++	unsigned long id;
++	void *expr;
++
++	kvfree(st->exprs);
++	kvfree(st->valid_idx);
++	xa_for_each(&st->expr_id_map, id, expr) {
++		kfree(expr);
++	}
++	xa_destroy(&st->expr_id_map);
++	kvfree(st->steps);
++	kvfree(st->step_state);
++
++	kfree(st);
++}
++DEFINE_FREE(free_checker, struct bcf_checker_state *,
++	    if (_T) free_checker_state(_T))
++
++__printf(2, 3) static void verbose(struct bcf_checker_state *st,
++				   const char *fmt, ...)
++{
++	va_list args;
++
++	if (!st->logger || !st->level)
++		return;
++	va_start(args, fmt);
++	st->logger(st->logger_private, fmt, args);
++	va_end(args);
++}
++
++/*
++ * Every expr has an id: (1) for static exprs, the idx to `exprs` is its id;
++ * (2) dynamically-allocated ones get one from st->id_gen++.
++ */
++static bool is_static_expr_id(struct bcf_checker_state *st, u32 id)
++{
++	return id < st->expr_size;
++}
++
++/*
++ * Each arg of a bcf_expr must be an id, except for bv_val, which is a
++ * sequence of u32 values.
++ */
++static bool expr_arg_is_id(u8 code)
++{
++	return code != (BCF_BV | BCF_VAL);
++}
++
++static bool is_false(const struct bcf_expr *expr)
++{
++	return expr->code == (BCF_BOOL | BCF_VAL) &&
++	       BCF_BOOL_LITERAL(expr->params) == BCF_FALSE;
++}
++
++/*
++ * Exprs referred to by the proof steps are static exprs from the proof.
++ * Hence, must be valid id in st->exprs.
++ */
++static bool valid_arg_id(struct bcf_checker_state *st, u32 id)
++{
++	return is_static_expr_id(st, id) && test_bit(id, st->valid_idx);
++}
++
++/*
++ * Rather than using:
++ *	if (!correct_condition0 or !correct_condition1)
++ *		return err;
++ * the `ENSURE` macro make this more readable:
++ *	ENSURE(c0 && c1);
++ */
++#define ENSURE(cond)                    \
++	do {                            \
++		if (!(cond))            \
++			return -EINVAL; \
++	} while (0)
++
++static int type_check(struct bcf_checker_state *st, struct bcf_expr *expr)
++{
++	return -EOPNOTSUPP;
++}
++
++static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
++		       u32 expr_size)
++{
++	u32 idx = 0;
++	int err;
++
++	st->exprs =
++		kvmemdup_bpfptr(bcf_buf, expr_size * sizeof(struct bcf_expr));
++	if (IS_ERR(st->exprs)) {
++		err = PTR_ERR(st->exprs);
++		st->exprs = NULL;
++		return err;
++	}
++	st->expr_size = expr_size;
++	st->id_gen = expr_size;
++
++	st->valid_idx = kvzalloc(bitmap_size(expr_size), GFP_KERNEL);
++	if (!st->valid_idx) {
++		kvfree(st->exprs);
++		st->exprs = NULL;
++		return -ENOMEM;
++	}
++
++	while (idx < expr_size) {
++		struct bcf_expr *expr = st->exprs + idx;
++		u32 expr_sz = EXPR_SZ(expr), arg_id;
++
++		ENSURE(idx + expr_sz <= expr_size);
++
++		bcf_for_each_arg(arg_id, expr) {
++			if (!expr_arg_is_id(expr->code))
++				break;
++			/*
++			 * The bitmap enforces that each expr can refer only to
++			 * valid, previous exprs.
++			 */
++			ENSURE(valid_arg_id(st, arg_id));
++		}
++
++		err = type_check(st, expr);
++		if (err)
++			return err;
++
++		set_bit(idx, st->valid_idx);
++		idx += expr_sz;
++	}
++	ENSURE(idx == expr_size);
++
++	return 0;
++}
++
++static int check_assume(struct bcf_checker_state *st,
++			struct bcf_proof_step *step)
++{
++	return -EOPNOTSUPP;
++}
++
++static bool is_assume(u16 rule)
++{
++	return rule == (BCF_RULE_CORE | BCF_RULE_ASSUME);
++}
++
++static u16 rule_class_max(u16 rule)
++{
++	switch (BCF_RULE_CLASS(rule)) {
++	case BCF_RULE_CORE:
++		return __MAX_BCF_CORE_RULES;
++	case BCF_RULE_BOOL:
++		return __MAX_BCF_BOOL_RULES;
++	case BCF_RULE_BV:
++		return __MAX_BCF_BV_RULES;
++	default:
++		return 0;
++	}
++}
++
++static int check_steps(struct bcf_checker_state *st, bpfptr_t bcf_buf,
++		       u32 step_size)
++{
++	u32 pos = 0, cur_step = 0, rule, step_id;
++	struct bcf_proof_step *step;
++	bool goal_found = false;
++	int err;
++
++	st->steps = kvmemdup_bpfptr(bcf_buf,
++				    step_size * sizeof(struct bcf_proof_step));
++	if (IS_ERR(st->steps)) {
++		err = PTR_ERR(st->steps);
++		st->steps = NULL;
++		return err;
++	}
++	st->step_size = step_size;
++
++	/*
++	 * First pass: validate each step and count how many there are.  While
++	 * iterating we also ensure that premises only reference *earlier* steps.
++	 */
++	while (pos < step_size) {
++		step = st->steps + pos;
++		rule = BCF_STEP_RULE(step->rule);
++
++		ENSURE(pos + STEP_SZ(step) <= step_size);
++		ENSURE(rule && rule < rule_class_max(step->rule));
++
++		/* Every step must only refer to previous established steps */
++		bcf_for_each_pm_step(step_id, step)
++			ENSURE(step_id < cur_step);
++
++		/* Must introduce a goal that is consistent to the one required */
++		if (is_assume(step->rule)) {
++			ENSURE(!goal_found); /* only one goal intro step */
++			goal_found = true;
++
++			err = check_assume(st, step);
++			if (err)
++				return err;
++		}
++
++		pos += STEP_SZ(step);
++		cur_step++;
++	}
++
++	/* No trailing garbage and at least two valid steps. */
++	ENSURE(pos == step_size && cur_step >= 2 && goal_found);
++
++	st->step_cnt = cur_step;
++	st->step_state =
++		kvcalloc(cur_step, sizeof(*st->step_state), GFP_KERNEL);
++	if (!st->step_state) {
++		kvfree(st->steps);
++		st->steps = NULL;
++		return -ENOMEM;
++	}
++
++	/* Second pass: fill in last reference index for each step. */
++	for (pos = 0, cur_step = 0; pos < step_size; cur_step++) {
++		step = st->steps + pos;
++		bcf_for_each_pm_step(step_id, step)
++			st->step_state[step_id].last_ref = cur_step;
++
++		pos += STEP_SZ(step);
++	}
++
++	/*
++	 * Every step (except the last one) must be referenced by at
++	 * least one later step.
++	 */
++	for (cur_step = 0; cur_step < st->step_cnt - 1; cur_step++)
++		ENSURE(st->step_state[cur_step].last_ref);
++
++	return 0;
++}
++
++static int apply_core_rule(struct bcf_checker_state *st,
++			   struct bcf_proof_step *step)
++{
++	return -EOPNOTSUPP;
++}
++
++static int apply_bool_rule(struct bcf_checker_state *st,
++			   struct bcf_proof_step *step)
++{
++	return -EOPNOTSUPP;
++}
++
++static int apply_bv_rule(struct bcf_checker_state *st,
++			 struct bcf_proof_step *step)
++{
++	return -EOPNOTSUPP;
++}
++
++static int apply_rules(struct bcf_checker_state *st)
++{
++	struct bcf_expr *fact;
++	int err;
++
++	verbose(st, "checking %u proof steps\n", st->step_cnt);
++
++	while (st->cur_step_idx < st->step_size) {
++		struct bcf_proof_step *step = st->steps + st->cur_step_idx;
++		u16 class = BCF_RULE_CLASS(step->rule);
++
++		if (signal_pending(current))
++			return -EAGAIN;
++		if (need_resched())
++			cond_resched();
++
++		if (class == BCF_RULE_CORE)
++			err = apply_core_rule(st, step);
++		else if (class == BCF_RULE_BOOL)
++			err = apply_bool_rule(st, step);
++		else if (class == BCF_RULE_BV)
++			err = apply_bv_rule(st, step);
++		else {
++			WARN_ONCE(1, "Unknown rule class: %u", class);
++			err = -EFAULT;
++		}
++		if (err)
++			return err;
++
++		st->cur_step_idx += STEP_SZ(step);
++		st->cur_step++;
++	}
++
++	/* The last step must refute the goal by concluding `false` */
++	fact = st->step_state[st->step_cnt - 1].fact;
++	ENSURE(is_false(fact));
++	verbose(st, "proof accepted\n");
++
++	return 0;
++}
++
++static int check_hdr(struct bcf_proof_header *hdr, bpfptr_t proof,
++		     u32 proof_size)
++{
++	u32 expr_size, step_size, sz;
++	bool overflow = false;
++
++	ENSURE(proof_size < MAX_BCF_PROOF_SIZE && proof_size > sizeof(*hdr) &&
++	       (proof_size % sizeof(u32) == 0));
++
++	if (copy_from_bpfptr(hdr, proof, sizeof(*hdr)))
++		return -EFAULT;
++
++	ENSURE(hdr->magic == BCF_MAGIC && hdr->expr_cnt && hdr->step_cnt > 1);
++
++	overflow |= check_mul_overflow(hdr->expr_cnt, sizeof(struct bcf_expr),
++				       &expr_size);
++	overflow |= check_mul_overflow(
++		hdr->step_cnt, sizeof(struct bcf_proof_step), &step_size);
++	overflow |= check_add_overflow(expr_size, step_size, &sz);
++	ENSURE(!overflow && (proof_size - sizeof(*hdr)) == sz);
++
++	return 0;
++}
++
++int bcf_check_proof(struct bcf_expr *goal_exprs, u32 goal, bpfptr_t proof,
++		    u32 proof_size, bcf_logger_cb logger, u32 level,
++		    void *private)
++{
++	struct bcf_checker_state *st __free(free_checker) = NULL;
++	struct bcf_proof_header hdr;
++	int err;
++
++	err = check_hdr(&hdr, proof, proof_size);
++	if (err)
++		return err;
++
++	st = kzalloc(sizeof(*st), GFP_KERNEL_ACCOUNT);
++	if (!st)
++		return -ENOMEM;
++	xa_init(&st->expr_id_map);
++	st->goal_exprs = goal_exprs;
++	st->goal = goal;
++	st->logger = logger;
++	st->logger_private = private;
++	st->level = level;
++
++	bpfptr_add(&proof, sizeof(struct bcf_proof_header));
++	err = check_exprs(st, proof, hdr.expr_cnt);
++
++	bpfptr_add(&proof, hdr.expr_cnt * sizeof(struct bcf_expr));
++	err = err ?: check_steps(st, proof, hdr.step_cnt);
++	err = err ?: apply_rules(st);
++	return err;
++}
++EXPORT_SYMBOL_GPL(bcf_check_proof);
+-- 
+2.34.1
+

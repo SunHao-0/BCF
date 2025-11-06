@@ -1,0 +1,38 @@
+From 14a420c26797f4350af69a31c880b416ad09e2e5 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 5 Nov 2025 16:49:55 +0100
+Subject: [PATCH RFC 0/7] bpf: Bitvector proof rules for BCF checker
+
+This set implements bitvector (BV) proof rules in the in-kernel BCF checker,
+covering standard bit-blast validations for atoms and terms, arithmetic and
+shift operators, and a small polynomial normalization step. It also adds
+structured logging helpers and a temporary trusted escape for RFC prototyping.
+
+Overview
+- BB atoms: verify JEQ/J(S)(L|G)(T|E) encodings (per-bit eq, unsigned
+  comparator, signed comparator with MSB guard).
+- BB terms: variables/constants/not; bitwise and/or/xor; concat/extract;
+  sign-extend; boolean-ITE lowered per bit.
+- Arithmetic: neg (two’s complement), k-ary add via peeled ripple-carry,
+  sub as add(a, ~b, 1).
+- Shifts: left/logical-right/arithmetic-right via guarded barrel shifters,
+  with bound checks (b < width) and fill semantics.
+- Poly normalization: derive (x0 = x1) = (y0 = y1) from c0*(x0 - x1) =
+  c1*(y0 - y1) for odd c0,c1; equality case of normalization.
+- Logging: s-expr formatting and per-step printing at verbose level 2.
+
+Hao Sun (7):
+  bpf: BV rule: add check_bb_atom()
+  bpf: BV rule: check basic bb term
+  bpf: BV rule: Add arith bb checks
+  bpf: BV rule: check shift bb term
+  bpf: BV rule: Poly normalization
+  bpf: format bcf_expr and print step in log level2
+  bpf: Temporarily treat unsupported as trusted in bcf_checker
+
+ kernel/bpf/bcf_checker.c | 1028 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1024 insertions(+), 4 deletions(-)
+
+-- 
+2.34.1
+

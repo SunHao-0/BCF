@@ -1,0 +1,214 @@
+From 6a474c76e073b1ac3708141bdf6a79b574d37be2 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 19:32:55 +0200
+Subject: [PATCH RFC 4/7] bpf: BV rule: check shift bb term
+
+Validate bit-blast encodings for shifts (lsh, lshr, ashr):
+- Guard: each output bit is ITE(b < width, stage_out[i], fill)
+  where fill is false (logical) or sign(a) (arithmetic right)
+- Barrel shifter: peel stages i = floor(log2(width))..0, with threshold 2^i,
+  checking per-bit ITE to keep/shift inputs and boundary injection
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 171 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 168 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 0f041fb6082b..02af716e3fcb 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -4154,6 +4154,127 @@ static int extract_pre_adder(struct bcf_checker_state *st, u32 vlen, u32 *sum,
+ 	return 0;
+ }
+ 
++/*
++ * Validate the outer guard and fill semantics for bit-blasted shifts.
++ * RHS bits must be ITE(cond, stage_out[i], fill), where:
++ *   - cond = (b < bit_sz) encoded as a bit-blasted unsigned compare,
++ *   - stage_out[i] is the per-stage barrel-shift network output (collected into
++ *     res[i] = then-branch),
++ *   - fill is False (logical) or MSB(a) (arithmetic) for right shifts, and
++ *     False for left shifts.
++ * The same cond node must be shared by all bits to ensure a single guard.
++ */
++static int bb_shift_limit(struct bcf_checker_state *st, struct bcf_expr *term,
++			  struct bcf_expr *bbt, bool logic_shift, u32 *res)
++{
++	struct bcf_expr *ite, *cond, *b, *bit, *a;
++	u32 *bb_size, checked_cond, i;
++	u64 bit_sz = bv_size(term);
++	int err;
++
++	a = id_to_expr(st, term->args[0]);
++	b = id_to_expr(st, term->args[1]);
++	ite = id_to_expr(st, bbt->args[0]);
++	ENSURE(is_bool_ite(ite->code));
++
++	/*
++	 * The top level of bbt must assert that each bit is either a result
++	 * of shift, or a zero if b is bigger then the bit sz:
++	 * 	b < bit_sz ? res : 0
++	 */
++	cond = id_to_expr(st, ite->args[0]);
++	/* Bitblasted representation of bit_sz. */
++	bb_size = get_expr_buf(st)->args;
++	for (i = 0; i < b->vlen; i++) {
++		if (i < 64 && bit_sz & (1ULL << i))
++			bb_size[i] = st->true_expr;
++		else
++			bb_size[i] = st->false_expr;
++	}
++	err = bb_ult(st, cond, b->args, bb_size, b->vlen, false);
++	if (err)
++		return err;
++
++	checked_cond = ite->args[0];
++	bcf_for_each_arg_expr(i, bit, bbt, st) {
++		ENSURE(is_bool_ite(bit->code) && bit->args[0] == checked_cond);
++		if (logic_shift)
++			ENSURE(is_false(id_to_expr(st, bit->args[2])));
++		else
++			/* must be the sign bit */
++			ENSURE(bit->args[2] == a->args[a->vlen - 1]);
++		res[i] = bit->args[1];
++	}
++
++	return 0;
++}
++
++/*
++ * Validate right shifts (logical if logic_shift=true, arithmetic otherwise)
++ * using a staged barrel shifter peeled from the guarded RHS.
++ * For stages i = floor(log2(bit_sz)) .. 0 with threshold = 1 << i:
++ *   - For in-range positions (j + threshold < width):
++ *       Each bit must be ITE(!b[i], keep, shift), with
++ *         keep  = previous_stage[j],
++ *         shift = previous_stage[j + threshold].
++ *   - For overflow positions (j + threshold >= width):
++ *       Each bit must be ITE(b[i], fill, keep), with
++ *         fill = False (logical) or MSB(a) (arithmetic),
++ *         keep = previous_stage[j].
++ * After peeling all stages, the remaining vector must equal a’s bits.
++ */
++static int bb_rsh(struct bcf_checker_state *st, struct bcf_expr *term,
++		  struct bcf_expr *bbt, bool logic_shift)
++{
++	u64 bit_sz = bv_size(term);
++	u32 bit_limit = order_base_2(bit_sz);
++	struct bcf_expr *a, *b, *bit;
++	u32 *res, *pre_res;
++	u32 arg_buf[U8_MAX];
++	int err, i, j;
++
++	res = arg_buf;
++	err = bb_shift_limit(st, term, bbt, logic_shift, res);
++	if (err)
++		return err;
++
++	a = id_to_expr(st, term->args[0]);
++	b = id_to_expr(st, term->args[1]);
++	pre_res = get_expr_buf(st)->args;
++	for (i = bit_limit - 1; i >= 0; i--) {
++		u64 threshold = 1 << i;
++
++		for (j = a->vlen - 1; j >= 0; j--) {
++			u32 shift_bit = b->args[i];
++
++			bit = id_to_expr(st, res[j]);
++			ENSURE(is_bool_ite(bit->code));
++
++			if (j + threshold >= a->vlen) {
++				u32 sign_bit = a->args[a->vlen - 1];
++				u32 arg1 = bit->args[1];
++				struct bcf_expr *sub;
++
++				ENSURE(bit->args[0] == shift_bit);
++				sub = id_to_expr(st, arg1);
++				ENSURE(logic_shift ? is_false(sub) :
++						     arg1 == sign_bit);
++
++				pre_res[j] = bit->args[2];
++			} else {
++				ENSURE(is_bool_not_of(st, bit->args[0],
++						      shift_bit));
++				ENSURE(bit->args[2] == pre_res[j + threshold]);
++				pre_res[j] = bit->args[1];
++			}
++		}
++
++		res = pre_res;
++	}
++	ENSURE(memcmp(res, a->args, sizeof(u32) * a->vlen) == 0);
++	return 0;
++}
++
+ static int check_bb_term(struct bcf_checker_state *st, u32 term_id, u32 bbt_id)
+ {
+ #define BB_TERM_CHECKER(_bv, ty_name, op, op_name, _arity) \
+@@ -4308,15 +4429,59 @@ bb_bv_sub: {
+ 	return bb_bitwise_op(st, term, bbt, BPF_XOR);
+ 
+ bb_bv_lsh: {
+-	return -EOPNOTSUPP;
++	/*
++	 * Validate left shift via staged barrel shifter peeled from the guarded RHS.
++	 * For stages i = floor(log2(bit_sz)) .. 0 with threshold = 1 << i:
++	 *   Each bit must be ITE(b[i], inject, keep), with
++	 *     inject = False if j < threshold, else previous_stage[j - threshold],
++	 *     keep   = previous_stage[j].
++	 * After peeling all stages, the remaining vector must equal a’s bits.
++	 */
++	u64 bit_sz = bv_size(term);
++	u32 bit_limit = order_base_2(bit_sz);
++	struct bcf_expr *a, *b;
++	u32 *res, *pre_res;
++	int bit_i;
++
++	ENSURE(bit_limit <= 64);
++
++	res = arg_buf;
++	err = bb_shift_limit(st, term, bbt, true, res);
++	if (err)
++		return err;
++
++	/* Barrel shifter check. */
++	a = id_to_expr(st, term->args[0]);
++	b = id_to_expr(st, term->args[1]);
++	pre_res = get_expr_buf(st)->args;
++	for (bit_i = bit_limit - 1; bit_i >= 0; bit_i--) {
++		u64 threshold = 1 << bit_i;
++
++		for (j = 0; j < a->vlen; j++) {
++			bit = id_to_expr(st, res[j]);
++			ENSURE(is_bool_ite(bit->code));
++			ENSURE(bit->args[0] == b->args[bit_i]);
++
++			if (j < threshold)
++				ENSURE(is_false(id_to_expr(st, bit->args[1])));
++			else
++				ENSURE(bit->args[1] == pre_res[j - threshold]);
++
++			pre_res[j] = bit->args[2];
++		}
++
++		res = pre_res;
++	}
++	ENSURE(memcmp(res, a->args, sizeof(u32) * a->vlen) == 0);
++	return 0;
+ }
+ 
+ bb_bv_rsh: {
+-	return -EOPNOTSUPP;
++	return bb_rsh(st, term, bbt, true);
+ }
+ 
+ bb_bv_arsh: {
+-	return -EOPNOTSUPP;
++	return bb_rsh(st, term, bbt, false);
+ }
+ 
+ /* BV ops */
+-- 
+2.34.1
+

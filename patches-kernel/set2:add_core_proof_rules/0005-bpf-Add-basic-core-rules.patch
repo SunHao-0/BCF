@@ -1,0 +1,351 @@
+From 2104ad286aaba836f953786314a28d66f6007449 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 12:45:24 +0200
+Subject: [PATCH RFC 05/11] bpf: Add basic core rules
+
+Implement a subset of core rules:
+- DISTINCT_VALUES: v0≠v1 for distinct BV/BOOL literals; emits ¬(v0 = v1)
+- REFL: A = A
+- SYMM: from A = B derive B = A (preserves negation context)
+- TRANS: from A = B, B = C, ... derive A = C (n-ary chain)
+- CONG: from (Aᵢ = Bᵢ) derive f(A₀..Aₙ) = f(B₀..Bₙ), with type-checked f
+- TRUE_INTRO/ELIM, FALSE_INTRO/ELIM: move between A and A = true/false
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ .clang-format            |   1 +
+ kernel/bpf/bcf_checker.c | 202 +++++++++++++++++++++++++++++++++++----
+ 2 files changed, 187 insertions(+), 16 deletions(-)
+
+diff --git a/.clang-format b/.clang-format
+index a357a3c723d4..c318487f90ae 100644
+--- a/.clang-format
++++ b/.clang-format
+@@ -751,6 +751,7 @@ ForEachMacros:
+   - 'bcf_for_each_expr'
+   - 'bcf_for_each_arg_expr'
+   - 'bcf_for_each_pm_step'
++  - 'bcf_for_each_pm_expr'
+ 
+ IncludeBlocks: Preserve
+ IncludeCategories:
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index ff4709be1fca..3403166e9670 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -61,6 +61,13 @@ static_assert(struct_size_t(struct bcf_proof_step, args, 1) ==
+ 			   (step_id = (step)->args[___i], true); \
+ 	     ___i++)
+ 
++#define bcf_for_each_pm_expr(pm, step, st)                  \
++	for (u32 ___i = 0, ___step_id;                      \
++	     ___i < (step)->premise_cnt &&                  \
++	     (___step_id = (step)->args[___i],              \
++	     pm = (st)->step_state[___step_id].fact, true); \
++	     ___i++)
++
+ /* For expr equivalence comparison, see __expr_equiv(). */
+ #define BCF_MAX_CMP_STACK 128
+ struct bcf_cmp_stack_elem {
+@@ -68,6 +75,15 @@ struct bcf_cmp_stack_elem {
+ 	u32 cur_arg;
+ };
+ 
++struct bcf_expr_buf {
++	u8 code;
++	u8 vlen;
++	u16 params;
++	u32 args[U8_MAX];
++};
++static_assert(sizeof(struct bcf_expr_buf) ==
++	      struct_size_t(struct bcf_expr, args, U8_MAX));
++
+ struct bcf_checker_state {
+ 	/*
+ 	 * Exprs from the proof, referred to as `static expr`. They exist
+@@ -112,6 +128,9 @@ struct bcf_checker_state {
+ 	u32 true_expr;
+ 	u32 false_expr;
+ 
++	/* Pre-allocated expr bufs used by different routines. */
++	struct bcf_expr_buf expr_buf;
++
+ 	struct bcf_cmp_stack_elem cmp[BCF_MAX_CMP_STACK];
+ };
+ 
+@@ -326,6 +345,26 @@ static struct bcf_expr_ref *new_expr(struct bcf_checker_state *st, bool move,
+ #define build_expr_move(st, code, params, ...) \
+ 	new_expr(st, true, code, params, COUNT_ARGS(__VA_ARGS__), __VA_ARGS__)
+ 
++static struct bcf_expr_ref *clone_expr(struct bcf_checker_state *st,
++				       struct bcf_expr *expr)
++{
++	struct bcf_expr_ref *eref;
++	u32 i;
++
++	eref = alloc_expr(st, expr->vlen);
++	if (IS_ERR(eref))
++		return eref;
++	eref->expr = *expr;
++
++	for (i = 0; i < expr->vlen; i++) {
++		if (expr_arg_is_id(expr->code))
++			expr_id_get(st, expr->args[i]);
++		eref->args[i] = expr->args[i];
++	}
++
++	return eref;
++}
++
+ /* type/operation/arity table */
+ #define Nullary { 0, 0 }
+ #define Unary { 1, 1 }
+@@ -501,6 +540,11 @@ static bool is_list(u8 code)
+ 	return BCF_TYPE(code) == BCF_LIST;
+ }
+ 
++static bool is_val(u8 code)
++{
++	return BCF_OP(code) == BCF_VAL;
++}
++
+ static bool is_var(u8 code)
+ {
+ 	return BCF_OP(code) == BCF_VAR;
+@@ -1025,15 +1069,15 @@ static int __expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
+ 	return 1;
+ }
+ 
+-__used static int expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
+-			     struct bcf_expr *e1)
++static int expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
++		      struct bcf_expr *e1)
+ {
+ 	/* own_args is false since the e0/e1 may be tmp exprs. */
+ 	return __expr_equiv(st, e0, e1, /* from_checker */ true,
+ 			    /* own_args */ false);
+ }
+ 
+-__used static int expr_id_equiv(struct bcf_checker_state *st, u32 i0, u32 i1)
++static int expr_id_equiv(struct bcf_checker_state *st, u32 i0, u32 i1)
+ {
+ 	/* Each id increases the expr ref, hence owns the expr and its args. */
+ 	return __expr_equiv(st, id_to_expr(st, i0), id_to_expr(st, i1), true,
+@@ -1197,8 +1241,8 @@ static void __set_step_fact(struct bcf_checker_state *st,
+ 	}
+ }
+ 
+-__used static int set_step_fact(struct bcf_checker_state *st,
+-				struct bcf_expr_ref *fact)
++static int set_step_fact(struct bcf_checker_state *st,
++			 struct bcf_expr_ref *fact)
+ {
+ 	if (IS_ERR(fact))
+ 		return PTR_ERR(fact);
+@@ -1212,6 +1256,26 @@ static int set_step_fact_id(struct bcf_checker_state *st, u32 fact_id)
+ 	return 0;
+ }
+ 
++static struct bcf_expr *get_premise(struct bcf_checker_state *st,
++				    struct bcf_proof_step *step, u32 arg)
++{
++	return st->step_state[step->args[arg]].fact;
++}
++
++static u32 get_premise_id(struct bcf_checker_state *st,
++			  struct bcf_proof_step *step, u32 arg)
++{
++	return st->step_state[step->args[arg]].fact_id;
++}
++
++static struct bcf_expr *get_expr_buf(struct bcf_checker_state *st)
++{
++	st->expr_buf.code = 0;
++	st->expr_buf.vlen = 0;
++	st->expr_buf.params = 0;
++	return (struct bcf_expr *)&st->expr_buf;
++}
++
+ #define RULE_TBL(rule) [BCF_RULE_NAME(rule)] = &&rule,
+ #define DEFINE_JUMP_TABLE(rule_set)                                         \
+ 	static const void                                                   \
+@@ -1227,8 +1291,10 @@ static int apply_core_rule(struct bcf_checker_state *st,
+ 	u16 rule = BCF_STEP_RULE(step->rule);
+ 	u8 param_cnt = step->param_cnt;
+ 	u8 pm_cnt = step->premise_cnt;
+-	struct bcf_expr *param;
+-	u32 arg_i;
++	struct bcf_expr_ref *fact = NULL;
++	struct bcf_expr *premise, *param;
++	u32 premise_id, arg_i;
++	int err;
+ 
+ 	/* Must refer to valid exprs in the proof. */
+ 	for (arg_i = 0; arg_i < param_cnt; arg_i++) {
+@@ -1251,7 +1317,21 @@ EVALUATE: { /* Evaluate constant boolean/bitvector expression */
+ }
+ 
+ DISTINCT_VALUES: { /* Inequality of distinct values */
+-	return -EOPNOTSUPP;
++	struct bcf_expr *v0, *v1;
++
++	ENSURE(!pm_cnt && param_cnt == 2);
++
++	v0 = id_to_expr(st, step->args[0]);
++	v1 = id_to_expr(st, step->args[1]);
++	ENSURE(is_val(v0->code) && is_val(v1->code));
++	ENSURE(same_type(v0, v1));
++	ENSURE(expr_equiv(st, v0, v1) == 0);
++
++	fact = build_bool_eq(st, step->args[0], step->args[1]);
++	if (IS_ERR(fact))
++		return PTR_ERR(fact);
++	fact = build_bool_not_move(st, fact->id);
++	return set_step_fact(st, fact);
+ }
+ 
+ ACI_NORM: { /* Equality of ACI normal form */
+@@ -1268,42 +1348,132 @@ REWRITE: { /* Rewrite equality to equivalent expression */
+ 
+ REFL: /* A ⊢ A = A */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 1);
++	param = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(param))
++		return PTR_ERR(param);
++	fact = build_bool_eq(st, step->args[0], step->args[0]);
++	return set_step_fact(st, fact);
+ }
+ 
+ SYMM: /* A = B ⊢ B = A */
+ {
+-	return -EOPNOTSUPP;
++	struct bcf_expr *eq;
++
++	ENSURE(pm_cnt == 1 && !param_cnt);
++	premise = get_premise(st, step, 0);
++	eq = premise;
++	if (is_bool_not(premise->code))
++		eq = id_to_expr(st, premise->args[0]);
++	ENSURE(is_bool_eq(eq->code));
++
++	fact = build_bool_eq(st, eq->args[1], eq->args[0]);
++	if (IS_ERR(fact))
++		return PTR_ERR(fact);
++	if (is_bool_not(premise->code))
++		fact = build_bool_not_move(st, fact->id);
++
++	return set_step_fact(st, fact);
+ }
+ 
+ TRANS: /* A = B, B = C ⊢ A = C */
+ {
+-	return -EOPNOTSUPP;
++	u32 lhs_id = 0, rhs_id = 0;
++	bool first = true;
++
++	ENSURE(pm_cnt && !param_cnt);
++
++	bcf_for_each_pm_expr(premise, step, st) {
++		ENSURE(is_bool_eq(premise->code));
++
++		if (first) {
++			lhs_id = premise->args[0];
++			rhs_id = premise->args[1];
++			first = false;
++		} else {
++			/* Transitivity chain: current LHS matches previous RHS */
++			// clang-format off
++			ENSURE(expr_id_equiv(st, rhs_id, premise->args[0]) == 1);
++			// clang-format on
++			rhs_id = premise->args[1];
++		}
++	}
++
++	fact = build_bool_eq(st, lhs_id, rhs_id);
++	return set_step_fact(st, fact);
+ }
+ 
+ CONG: /* A = B ⊢ f(A) = f(B) */
+ {
+-	return -EOPNOTSUPP;
++	struct bcf_expr *expr_buf = get_expr_buf(st);
++	struct bcf_expr_ref *lhs, *rhs;
++	u32 *args;
++
++	ENSURE(pm_cnt && param_cnt == 1);
++	/* The first param encodes the expr (function) to apply*/
++	*(u32 *)expr_buf = step->args[pm_cnt];
++
++	/* Build expression with LHS arguments */
++	args = expr_buf->args;
++	bcf_for_each_pm_expr(premise, step, st) {
++		ENSURE(is_bool_eq(premise->code));
++		*args++ = premise->args[0];
++	}
++	err = type_check(st, expr_buf);
++	if (err)
++		return err;
++	lhs = clone_expr(st, expr_buf);
++	if (IS_ERR(lhs))
++		return PTR_ERR(lhs);
++
++	/* Build expression with RHS. LHS is type-checked, safe to clone. */
++	args = expr_buf->args;
++	bcf_for_each_pm_expr(premise, step, st) {
++		*args++ = premise->args[1];
++	}
++	rhs = clone_expr(st, expr_buf);
++	if (IS_ERR(rhs))
++		return PTR_ERR(rhs);
++
++	fact = build_bool_eq_move(st, lhs->id, rhs->id);
++	return set_step_fact(st, fact);
+ }
+ 
+ TRUE_INTRO: /* A ⊢ A = True */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt == 1 && !param_cnt);
++	premise_id = get_premise_id(st, step, 0);
++	fact = build_bool_eq(st, premise_id, st->true_expr);
++	return set_step_fact(st, fact);
+ }
+ 
+ TRUE_ELIM: /* A = True ⊢ A */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt == 1 && !param_cnt);
++	premise = get_premise(st, step, 0);
++	ENSURE(is_bool_eq(premise->code));
++	ENSURE(expr_id_equiv(st, premise->args[1], st->true_expr) == 1);
++	set_step_fact_id(st, premise->args[0]);
++	return 0;
+ }
+ 
+ FALSE_INTRO: /* ¬A ⊢ A = False */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt == 1 && !param_cnt);
++	premise = get_premise(st, step, 0);
++	ENSURE(is_bool_not(premise->code));
++	fact = build_bool_eq(st, premise->args[0], st->false_expr);
++	return set_step_fact(st, fact);
+ }
+ 
+ FALSE_ELIM: /* A = False ⊢ ¬A */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt == 1 && !param_cnt);
++	premise = get_premise(st, step, 0);
++	ENSURE(is_bool_eq(premise->code));
++	ENSURE(expr_id_equiv(st, premise->args[1], st->false_expr) == 1);
++	fact = build_bool_not(st, premise->args[0]);
++	return set_step_fact(st, fact);
+ }
+ 
+ bad_rule:
+-- 
+2.34.1
+

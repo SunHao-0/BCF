@@ -1,0 +1,366 @@
+From 1f71930f4dad4b4bdbfd7ef9c8497a8a8efeecd6 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 11:59:29 +0200
+Subject: [PATCH RFC 02/11] bpf: Add bcf_expr management routines
+
+Introduce refcounted dynamic expression management in the checker:
+- map expr-id -> expr node (`struct bcf_expr_ref`) with refcount
+- `alloc_expr()/krealloc()` for variable-length args; `expr_id_get/put()` to
+  share subtrees; safe recursive release via a small worklist
+- macro-generated builders and predicate helpers for common ops
+- track builtin `true`/`false` ids and ensure they exist
+
+The checker constructs and compares temporary expressions (e.g., rewrites,
+congruence) during validation. A refcounted arena allows sharing DAGs between
+steps and frees subgraphs precisely when the last premise reference.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 261 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 258 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 6926493c04cf..83288129b6b4 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -100,6 +100,10 @@ struct bcf_checker_state {
+ 
+ 	u32 goal;
+ 	struct bcf_expr *goal_exprs;
++
++	/* Builtin expr id. */
++	u32 true_expr;
++	u32 false_expr;
+ };
+ 
+ static void free_checker_state(struct bcf_checker_state *st)
+@@ -133,6 +137,33 @@ __printf(2, 3) static void verbose(struct bcf_checker_state *st,
+ 	va_end(args);
+ }
+ 
++/* Ref-counted bcf_expr */
++struct bcf_expr_ref {
++	union {
++		struct {
++			refcount_t refcnt;
++			u32 id;
++		};
++		/*
++		 * When the refcnt is zero, its id and the counter are not used
++		 * anymore, so reuse the space for free list, see expr_put()
++		 */
++		struct bcf_expr_ref *free_next;
++	};
++	union {
++		/* Identical to struct bcf_expr, access helper. */
++		struct {
++			u8 code;
++			u8 vlen;
++			u16 params;
++			u32 args[];
++		};
++		struct bcf_expr expr;
++	};
++};
++static_assert(offsetof(struct bcf_expr_ref, code) ==
++	      offsetof(struct bcf_expr_ref, expr.code));
++
+ /*
+  * Every expr has an id: (1) for static exprs, the idx to `exprs` is its id;
+  * (2) dynamically-allocated ones get one from st->id_gen++.
+@@ -151,18 +182,141 @@ static bool expr_arg_is_id(u8 code)
+ 	return code != (BCF_BV | BCF_VAL);
+ }
+ 
++/* Use eref to refer to a ref-counted expr. */
++static void expr_id_get(struct bcf_checker_state *st, u32 id)
++{
++	struct bcf_expr_ref *eref;
++
++	if (is_static_expr_id(st, id))
++		return;
++	eref = xa_load(&st->expr_id_map, id);
++	refcount_inc(&eref->refcnt);
++}
++
++static void __push_free(struct bcf_checker_state *st,
++			struct bcf_expr_ref **head, struct bcf_expr_ref *eref)
++{
++	/* Never free builtin exprs. */
++	if (eref->id == st->true_expr || eref->id == st->false_expr)
++		return;
++
++	if (refcount_dec_and_test(&eref->refcnt)) {
++		xa_erase(&st->expr_id_map, eref->id);
++		eref->free_next = *head;
++		*head = eref;
++	}
++}
++
++static void expr_put(struct bcf_checker_state *st, struct bcf_expr *expr)
++{
++	struct bcf_expr_ref *free_head = NULL;
++	struct bcf_expr_ref *eref;
++	u32 arg_id;
++
++	if (expr >= st->exprs && expr < st->exprs + st->expr_size)
++		return;
++
++	eref = container_of(expr, struct bcf_expr_ref, expr);
++	__push_free(st, &free_head, eref);
++
++	while (free_head) {
++		eref = free_head;
++		free_head = free_head->free_next;
++
++		bcf_for_each_arg(arg_id, &eref->expr) {
++			if (!expr_arg_is_id(eref->code))
++				break;
++
++			if (is_static_expr_id(st, arg_id))
++				continue;
++
++			__push_free(st, &free_head,
++				    xa_load(&st->expr_id_map, arg_id));
++		}
++		kfree(eref);
++	}
++}
++
+ /*
+  * REQUIRES: id must be valid, i.e., either a static id or from id_gen.
+  * ENSURES: returned ptr is non-null.
+  */
+ static struct bcf_expr *id_to_expr(struct bcf_checker_state *st, u32 id)
+ {
++	struct bcf_expr_ref *eref;
++
+ 	if (is_static_expr_id(st, id))
+ 		return st->exprs + id;
+ 
+-	return ERR_PTR(-EOPNOTSUPP);
++	eref = xa_load(&st->expr_id_map, id);
++	return &eref->expr;
++}
++
++__used static void expr_id_put(struct bcf_checker_state *st, u32 id)
++{
++	expr_put(st, id_to_expr(st, id));
++}
++
++static struct bcf_expr_ref *alloc_expr(struct bcf_checker_state *st, u8 vlen)
++{
++	struct bcf_expr_ref *eref;
++	void *entry;
++
++	eref = kmalloc(struct_size(eref, args, vlen), GFP_KERNEL);
++	if (!eref)
++		return ERR_PTR(-ENOMEM);
++	eref->id = st->id_gen++;
++	entry = xa_store(&st->expr_id_map, eref->id, eref, GFP_KERNEL);
++	if (xa_is_err(entry)) {
++		kfree(eref);
++		return ERR_PTR(xa_err(entry));
++	}
++
++	/* The caller owns the expr. */
++	refcount_set(&eref->refcnt, 1);
++	return eref;
+ }
+ 
++static struct bcf_expr_ref *new_expr(struct bcf_checker_state *st, bool move,
++				     u8 code, u16 params, u32 vlen, ...)
++{
++	struct bcf_expr_ref *eref;
++	va_list args;
++	u32 i;
++
++	if (WARN_ON_ONCE(vlen > U8_MAX))
++		return ERR_PTR(-EFAULT);
++
++	eref = alloc_expr(st, vlen);
++	if (IS_ERR(eref))
++		return eref;
++	eref->code = code;
++	eref->vlen = vlen;
++	eref->params = params;
++
++	va_start(args, vlen);
++	for (i = 0; i < vlen; i++) {
++		u32 arg = va_arg(args, u32);
++
++		if (!move && expr_arg_is_id(code))
++			expr_id_get(st, arg);
++		eref->args[i] = arg;
++	}
++	va_end(args);
++
++	return eref;
++}
++
++/* Create a new expr with args ref increased. */
++#define build_expr(st, code, params, ...) \
++	new_expr(st, false, code, params, COUNT_ARGS(__VA_ARGS__), __VA_ARGS__)
++/*
++ * Create a new expr *without* increasing arg ref, i.e., move the ownership of
++ * the args to the current expr.
++ */
++#define build_expr_move(st, code, params, ...) \
++	new_expr(st, true, code, params, COUNT_ARGS(__VA_ARGS__), __VA_ARGS__)
++
+ /* type/operation/arity table */
+ #define Nullary { 0, 0 }
+ #define Unary { 1, 1 }
+@@ -274,6 +428,55 @@ static bool valid_arity(u8 code, u8 vlen)
+ 	return vlen >= arity[code].min && vlen <= arity[code].max;
+ }
+ 
++/* Define code checks, e.g., is_bool_eq(u8 code). */
++#define DEFINE_CODE_CHECK(ty, ty_name, op, op_name, _arity) \
++	static bool is_##ty_name##_##op_name(u8 code)       \
++	{                                                   \
++		return code == ((ty) | (op));               \
++	}
++
++#define BCF_ARGS_DECL_Nullary
++#define BCF_ARGS_DECL_Unary , u32 e0
++#define BCF_ARGS_DECL_Binary , u32 e0, u32 e1
++#define BCF_ARGS_DECL_Ternary , u32 e0, u32 e1, u32 e2
++
++#define BCF_ARGS_PASS_Nullary
++#define BCF_ARGS_PASS_Unary , e0
++#define BCF_ARGS_PASS_Binary , e0, e1
++#define BCF_ARGS_PASS_Ternary , e0, e1, e2
++
++/* Define build rountines for ops with fixed arity, e.g., build_bool_eq(st, e0, e1). */
++#define DEFINE_EXPR_BUILD(ty, ty_name, op, op_name, arity)              \
++	static struct bcf_expr_ref *build_##ty_name##_##op_name(        \
++		struct bcf_checker_state *st BCF_ARGS_DECL_##arity)     \
++	{                                                               \
++		u32 _arity[] = arity;                                   \
++		return new_expr(st, false, (ty) | (op), 0,              \
++				_arity[0] BCF_ARGS_PASS_##arity);       \
++	}                                                               \
++	static struct bcf_expr_ref *build_##ty_name##_##op_name##_move( \
++		struct bcf_checker_state *st BCF_ARGS_DECL_##arity)     \
++	{                                                               \
++		u32 _arity[] = arity;                                   \
++		return new_expr(st, true, (ty) | (op), 0,               \
++				_arity[0] BCF_ARGS_PASS_##arity);       \
++	}
++
++__diag_push();
++__diag_ignore_all("-Wunused-function",
++		  "Allow unused functions for macro-defined functions");
++BCF_OP_TABLE(DEFINE_CODE_CHECK)
++
++BCF_BV_OP_NULLARY(DEFINE_EXPR_BUILD)
++BCF_BOOL_OP_NULLARY(DEFINE_EXPR_BUILD)
++BCF_BV_OP_UNARY(DEFINE_EXPR_BUILD)
++BCF_BOOL_OP_UNARY(DEFINE_EXPR_BUILD)
++BCF_BV_OP_BINARY(DEFINE_EXPR_BUILD)
++BCF_BOOL_OP_BINARY(DEFINE_EXPR_BUILD)
++BCF_BV_OP_TERNARY(DEFINE_EXPR_BUILD)
++BCF_BOOL_OP_TERNARY(DEFINE_EXPR_BUILD)
++__diag_pop();
++
+ static bool is_bool(u8 code)
+ {
+ 	return BCF_TYPE(code) == BCF_BOOL;
+@@ -289,12 +492,30 @@ static bool is_list(u8 code)
+ 	return BCF_TYPE(code) == BCF_LIST;
+ }
+ 
++static bool is_true(const struct bcf_expr *expr)
++{
++	return is_bool_val(expr->code) &&
++	       BCF_BOOL_LITERAL(expr->params) == BCF_TRUE;
++}
++
+ static bool is_false(const struct bcf_expr *expr)
+ {
+-	return expr->code == (BCF_BOOL | BCF_VAL) &&
++	return is_bool_val(expr->code) &&
+ 	       BCF_BOOL_LITERAL(expr->params) == BCF_FALSE;
+ }
+ 
++static const struct bcf_expr bcf_bool_false = {
++	.code = BCF_BOOL | BCF_VAL,
++	.vlen = 0,
++	.params = BCF_FALSE,
++};
++
++static const struct bcf_expr bcf_bool_true = {
++	.code = BCF_BOOL | BCF_VAL,
++	.vlen = 0,
++	.params = BCF_TRUE,
++};
++
+ /*
+  * Exprs referred to by the proof steps are static exprs from the proof.
+  * Hence, must be valid id in st->exprs.
+@@ -533,6 +754,36 @@ static int type_check(struct bcf_checker_state *st, struct bcf_expr *expr)
+ 	}
+ }
+ 
++static void record_builtins(struct bcf_checker_state *st, struct bcf_expr *expr,
++			    u32 id)
++{
++	if (st->true_expr == U32_MAX && is_true(expr))
++		st->true_expr = id;
++	if (st->false_expr == U32_MAX && is_false(expr))
++		st->false_expr = id;
++}
++
++static int alloc_builtins(struct bcf_checker_state *st)
++{
++	struct bcf_expr_ref *eref;
++
++	if (st->true_expr == U32_MAX) {
++		eref = build_bool_val(st);
++		if (IS_ERR(eref))
++			return PTR_ERR(eref);
++		eref->params = BCF_TRUE;
++		st->true_expr = eref->id;
++	}
++	if (st->false_expr == U32_MAX) {
++		eref = build_bool_val(st);
++		if (IS_ERR(eref))
++			return PTR_ERR(eref);
++		eref->params = BCF_FALSE;
++		st->false_expr = eref->id;
++	}
++	return 0;
++}
++
+ static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
+ 		       u32 expr_size)
+ {
+@@ -556,6 +807,9 @@ static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
+ 		return -ENOMEM;
+ 	}
+ 
++	st->true_expr = U32_MAX;
++	st->false_expr = U32_MAX;
++
+ 	while (idx < expr_size) {
+ 		struct bcf_expr *expr = st->exprs + idx;
+ 		u32 expr_sz = EXPR_SZ(expr), arg_id;
+@@ -576,12 +830,13 @@ static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
+ 		if (err)
+ 			return err;
+ 
++		record_builtins(st, expr, idx);
+ 		set_bit(idx, st->valid_idx);
+ 		idx += expr_sz;
+ 	}
+ 	ENSURE(idx == expr_size);
+ 
+-	return 0;
++	return alloc_builtins(st);
+ }
+ 
+ static int check_assume(struct bcf_checker_state *st,
+-- 
+2.34.1
+

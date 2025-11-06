@@ -1,0 +1,185 @@
+From d85180b4af462b14aa71393f3ee10de598d765ec Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 29 Oct 2025 17:53:29 +0100
+Subject: [PATCH RFC 09/17] bpf: Track alu operations in bcf_track()
+
+Model scalar and pointer ALU operations in the symbolic tracking.
+
+- Scalar ALU: when either operand is non-constant, lazily bind `dst_reg` to a
+  symbolic expr and emit the BV op; If both operands are constants, rely on
+  the verifier’s result and skip emitting a symbolic node.
+  Achieved by hooking `adjust_scalar_min_max_vals()`,
+
+- Pointer ALU: follow verifier logic in `adjust_ptr_min_max_vals()` and record
+  only the variable part into `dst_reg->bcf_expr`, carrying constants in
+  `reg->off`.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 80 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 4491d665cc49..66682d365e5e 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -14865,6 +14865,41 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
+ 	return 0;
+ }
+ 
++static int bcf_alu(struct bpf_verifier_env *env, struct bpf_reg_state *dst_reg,
++		   struct bpf_reg_state *src_reg, u8 op, bool alu32)
++{
++	DEFINE_RAW_FLEX(struct bcf_expr, alu_expr, args, 2);
++	bool unary = (op == BPF_NEG);
++	int dst, src = 0, bits;
++
++	if (!env->bcf.tracking)
++		return 0;
++	if (tnum_is_const(dst_reg->var_off)) {
++		dst_reg->bcf_expr = -1;
++		return 0;
++	}
++
++	dst = bcf_reg_expr(env, dst_reg, alu32);
++	if (!unary)
++		src = bcf_reg_expr(env, src_reg, alu32);
++	if (dst < 0 || src < 0)
++		return -ENOMEM;
++
++	bits = alu32 ? 32 : 64;
++	alu_expr->code = BCF_BV | op;
++	alu_expr->vlen = unary ? 1 : 2;
++	alu_expr->params = bits;
++	alu_expr->args[0] = dst;
++	alu_expr->args[1] = src;
++	dst_reg->bcf_expr = bcf_add_expr(env, alu_expr);
++	if (alu32)
++		bcf_zext_32_to_64(env, dst_reg);
++	if (dst_reg->bcf_expr < 0)
++		return dst_reg->bcf_expr;
++
++	return 0;
++}
++
+ /* Handles arithmetic on a pointer and a scalar: computes new min/max and var_off.
+  * Caller should also handle BPF_MOV case separately.
+  * If we return -EACCES, caller may want to try again treating pointer as a
+@@ -14872,12 +14907,12 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
+  */
+ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 				   struct bpf_insn *insn,
+-				   const struct bpf_reg_state *ptr_reg,
+-				   const struct bpf_reg_state *off_reg)
++				   struct bpf_reg_state *ptr_reg,
++				   struct bpf_reg_state *off_reg)
+ {
+ 	struct bpf_verifier_state *vstate = env->cur_state;
+ 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
+-	struct bpf_reg_state *regs = state->regs, *dst_reg;
++	struct bpf_reg_state *regs = state->regs, *dst_reg, *src_reg;
+ 	bool known = tnum_is_const(off_reg->var_off);
+ 	s64 smin_val = off_reg->smin_value, smax_val = off_reg->smax_value,
+ 	    smin_ptr = ptr_reg->smin_value, smax_ptr = ptr_reg->smax_value;
+@@ -14889,6 +14924,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 	int ret, bounds_ret;
+ 
+ 	dst_reg = &regs[dst];
++	src_reg = dst_reg == ptr_reg ? off_reg : ptr_reg;
+ 
+ 	if ((known && (smin_val != smax_val || umin_val != umax_val)) ||
+ 	    smin_val > smax_val || umin_val > umax_val) {
+@@ -14989,8 +15025,15 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			dst_reg->var_off = ptr_reg->var_off;
+ 			dst_reg->off = ptr_reg->off + smin_val;
+ 			dst_reg->raw = ptr_reg->raw;
++			dst_reg->bcf_expr = ptr_reg->bcf_expr;
+ 			break;
+ 		}
++
++		if (env->bcf.tracking) {
++			bcf_reg_expr(env, dst_reg, false);
++			if (dst_reg->bcf_expr < 0)
++				return dst_reg->bcf_expr;
++		}
+ 		/* A new variable offset is created.  Note that off_reg->off
+ 		 * == 0, since it's a scalar.
+ 		 * dst_reg gets the pointer type and since some positive
+@@ -15018,6 +15061,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			/* something was added to pkt_ptr, set range to zero */
+ 			memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
+ 		}
++
++		ret = bcf_alu(env, dst_reg, src_reg, opcode, false);
++		if (ret)
++			return ret;
+ 		break;
+ 	case BPF_SUB:
+ 		if (dst_reg == off_reg) {
+@@ -15046,8 +15093,15 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			dst_reg->id = ptr_reg->id;
+ 			dst_reg->off = ptr_reg->off - smin_val;
+ 			dst_reg->raw = ptr_reg->raw;
++			dst_reg->bcf_expr = ptr_reg->bcf_expr;
+ 			break;
+ 		}
++
++		if (env->bcf.tracking) {
++			bcf_reg_expr(env, dst_reg, false);
++			if (dst_reg->bcf_expr < 0)
++				return dst_reg->bcf_expr;
++		}
+ 		/* A new variable offset is created.  If the subtrahend is known
+ 		 * nonnegative, then any reg->range we had before is still good.
+ 		 */
+@@ -15075,6 +15129,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+ 			if (smin_val < 0)
+ 				memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
+ 		}
++
++		ret = bcf_alu(env, dst_reg, src_reg, opcode, false);
++		if (ret)
++			return ret;
+ 		break;
+ 	case BPF_AND:
+ 	case BPF_OR:
+@@ -15728,7 +15786,7 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+ {
+ 	u8 opcode = BPF_OP(insn->code);
+ 	bool alu32 = (BPF_CLASS(insn->code) != BPF_ALU64);
+-	int ret;
++	int ret, dst_expr = dst_reg->bcf_expr;
+ 
+ 	if (!is_safe_to_compute_dst_reg_range(insn, &src_reg)) {
+ 		__mark_reg_unknown(env, dst_reg);
+@@ -15741,6 +15799,14 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+ 			return sanitize_err(env, insn, ret, NULL, NULL);
+ 	}
+ 
++	/* Constants alu produces constant, skip it; otherwise, bind expr. */
++	if (env->bcf.tracking && (!tnum_is_const(dst_reg->var_off) ||
++				   !tnum_is_const(src_reg.var_off))) {
++		dst_expr = bcf_reg_expr(env, dst_reg, false);
++		if (dst_expr < 0)
++			return dst_expr;
++	}
++
+ 	/* Calculate sign/unsigned bounds and tnum for alu32 and alu64 bit ops.
+ 	 * There are two classes of instructions: The first class we track both
+ 	 * alu32 and alu64 sign/unsigned bounds independently this provides the
+@@ -15819,6 +15885,12 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+ 	if (alu32)
+ 		zext_32_to_64(dst_reg);
+ 	reg_bounds_sync(dst_reg);
++
++	dst_reg->bcf_expr = dst_expr;
++	ret = bcf_alu(env, dst_reg, &src_reg, opcode, alu32);
++	if (ret)
++		return ret;
++
+ 	return 0;
+ }
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,462 @@
+From 3870dfc132eae338fdfca7fb00db579b6997d251 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 19:04:11 +0200
+Subject: [PATCH RFC 4/4] bpf: Add boolean rule: CNF rules
+
+Add CNF rules:
+- CNF_AND_POS/NEG, CNF_OR_POS/NEG move between clause-level forms
+- CNF_IMPLIES_POS/NEG normalize implications to clauses
+- CNF_EQUIV_POS/NEG and CNF_XOR_POS/NEG expand imply/xor into disjunctions
+- CNF_ITE_POS/NEG and ITE_EQ reduce boolean ITE into small clause sets
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 377 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 364 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index aec277a741a3..20c68e23781c 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -3116,6 +3116,106 @@ static int not_equiv_elim(struct bcf_checker_state *st,
+ 	return set_step_fact(st, fact);
+ }
+ 
++static int __cnf_equiv_pos(struct bcf_checker_state *st, u32 arg, u32 form,
++			   bool xor)
++{
++	struct bcf_expr_ref *not_expr, *fact;
++	struct bcf_expr *arg_expr;
++	u8 code = xor ? (BCF_BOOL | BCF_XOR) : (BCF_BOOL | BPF_JEQ);
++	u32 e0, e1, e2;
++
++	ENSURE(form == 0 || form == 1);
++
++	arg_expr = get_arg_expr(st, arg);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(arg_expr->code == code);
++
++	e0 = arg;
++	if (!xor) {
++		not_expr = build_bool_not(st, arg);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e0 = not_expr->id;
++	}
++
++	e1 = arg_expr->args[0];
++	e2 = arg_expr->args[1];
++	if (form) {
++		not_expr = build_bool_not(st, e2);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e2 = not_expr->id;
++	} else {
++		not_expr = build_bool_not(st, e1);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e1 = not_expr->id;
++	}
++
++	fact = build_disj_move(st, e0, e1, e2);
++	return set_step_fact(st, fact);
++}
++
++static int cnf_equiv_pos(struct bcf_checker_state *st, u32 arg, u32 form)
++{
++	return __cnf_equiv_pos(st, arg, form, false);
++}
++
++static int cnf_xor_neg(struct bcf_checker_state *st, u32 arg, u32 form)
++{
++	return __cnf_equiv_pos(st, arg, form, true);
++}
++
++static int __cnf_equiv_neg(struct bcf_checker_state *st, u32 arg, u32 lit,
++			   bool xor)
++{
++	u8 code = xor ? (BCF_BOOL | BCF_XOR) : (BCF_BOOL | BPF_JEQ);
++	struct bcf_expr_ref *not_expr, *fact;
++	struct bcf_expr *arg_expr;
++	u32 e0, e1, e2;
++
++	ENSURE(lit == 0 || lit == 1);
++
++	arg_expr = get_arg_expr(st, arg);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(arg_expr->code == code);
++
++	e0 = arg;
++	if (xor) { /* equiv_neg == xor_pos */
++		not_expr = build_bool_not(st, arg);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e0 = not_expr->id;
++	}
++
++	e1 = arg_expr->args[0];
++	e2 = arg_expr->args[1];
++	if (lit) {
++		not_expr = build_bool_not(st, e1);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e1 = not_expr->id;
++		not_expr = build_bool_not(st, e2);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e2 = not_expr->id;
++	}
++	fact = build_disj_move(st, e0, e1, e2);
++	return set_step_fact(st, fact);
++}
++
++static int cnf_equiv_neg(struct bcf_checker_state *st, u32 arg, u32 lit)
++{
++	return __cnf_equiv_neg(st, arg, lit, false);
++}
++
++static int cnf_xor_pos(struct bcf_checker_state *st, u32 arg, u32 lit)
++{
++	return __cnf_equiv_neg(st, arg, lit, true);
++}
++
+ static int apply_bool_rule(struct bcf_checker_state *st,
+ 			   struct bcf_proof_step *step)
+ {
+@@ -3454,67 +3554,318 @@ static int apply_bool_rule(struct bcf_checker_state *st,
+ 
+ CNF_AND_POS: /* ¬(A ∧ B) ∨ A */
+ {
+-	return -EOPNOTSUPP;
++	u32 lit;
++
++	ENSURE(!pm_cnt && param_cnt == 2);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_bool_conj(arg_expr->code));
++
++	lit = step->args[1];
++	ENSURE(lit < arg_expr->vlen);
++
++	not_expr = build_bool_not(st, step->args[0]);
++	if (IS_ERR(not_expr))
++		return PTR_ERR(not_expr);
++	expr_id_get(st, arg_expr->args[lit]);
++
++	fact = build_disj_move(st, not_expr->id, arg_expr->args[lit]);
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_AND_NEG: /* (A ∧ B) ∨ ¬A ∨ ¬B */
+ {
+-	return -EOPNOTSUPP;
++	u32 *args, arg;
++
++	ENSURE(!pm_cnt && param_cnt == 1);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_bool_conj(arg_expr->code) && arg_expr->vlen < U8_MAX);
++
++	fact = alloc_expr(st, arg_expr->vlen + 1);
++	if (IS_ERR(fact))
++		return PTR_ERR(fact);
++	fact->code = BCF_BOOL | BCF_DISJ;
++	fact->vlen = arg_expr->vlen + 1;
++	fact->params = 0;
++	args = fact->args;
++	*args++ = step->args[0];
++	bcf_for_each_arg(arg, arg_expr) {
++		not_expr = build_bool_not(st, arg);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		*args++ = not_expr->id;
++	}
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_OR_POS: /* ¬(A ∨ B) ∨ A ∨ B */
+ {
+-	return -EOPNOTSUPP;
++	u32 *args, arg;
++
++	ENSURE(!pm_cnt && param_cnt == 1);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_bool_disj(arg_expr->code) && arg_expr->vlen < U8_MAX);
++
++	not_expr = build_bool_not(st, step->args[0]);
++	if (IS_ERR(not_expr))
++		return PTR_ERR(not_expr);
++
++	fact = alloc_expr(st, arg_expr->vlen + 1);
++	if (IS_ERR(fact))
++		return PTR_ERR(fact);
++	fact->code = BCF_BOOL | BCF_DISJ;
++	fact->vlen = arg_expr->vlen + 1;
++	fact->params = 0;
++	args = fact->args;
++	*args++ = not_expr->id;
++	bcf_for_each_arg(arg, arg_expr) {
++		expr_id_get(st, arg);
++		*args++ = arg;
++	}
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_OR_NEG: /* (A ∨ B) ∨ ¬A */
+ {
+-	return -EOPNOTSUPP;
++	u32 lit;
++
++	ENSURE(!pm_cnt && param_cnt == 2);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_bool_disj(arg_expr->code));
++	lit = step->args[1];
++	ENSURE(lit < arg_expr->vlen);
++
++	not_expr = build_bool_not(st, arg_expr->args[lit]);
++	if (IS_ERR(not_expr))
++		return PTR_ERR(not_expr);
++	fact = build_disj_move(st, step->args[0], not_expr->id);
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_IMPLIES_POS: /* (A ⇒ B) ∨ ¬A ∨ B */
+ {
+-	return -EOPNOTSUPP;
++	struct bcf_expr_ref *not_term;
++
++	ENSURE(!pm_cnt && param_cnt == 1);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_bool_implies(arg_expr->code));
++
++	not_expr = build_bool_not(st, step->args[0]);
++	if (IS_ERR(not_expr))
++		return PTR_ERR(not_expr);
++	not_term = build_bool_not(st, arg_expr->args[0]);
++	if (IS_ERR(not_term))
++		return PTR_ERR(not_term);
++
++	fact = build_disj_move(st, not_expr->id, not_term->id,
++			       arg_expr->args[1]);
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_IMPLIES_NEG: /* (A ⇒ B) ∨ (A ∧ ¬B) */
+ {
+-	return -EOPNOTSUPP;
++	u32 lit, e0, e1;
++
++	ENSURE(!pm_cnt && param_cnt == 2);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_bool_implies(arg_expr->code));
++	lit = step->args[1];
++	ENSURE(lit == 0 || lit == 1);
++
++	e0 = step->args[0];
++	e1 = arg_expr->args[0];
++	if (lit) {
++		not_expr = build_bool_not(st, arg_expr->args[1]);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e1 = not_expr->id;
++	}
++	fact = build_disj_move(st, e0, e1);
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_EQUIV_POS: /* ¬(A ⇔ B) ∨ ¬A ∨ B */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 2);
++	return cnf_equiv_pos(st, step->args[0], step->args[1]);
+ }
+ 
+ CNF_EQUIV_NEG: /* (A ⇔ B) ∨ A ∨ B */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 2);
++	return cnf_equiv_neg(st, step->args[0], step->args[1]);
+ }
+ 
+ CNF_XOR_POS: /* ¬(A ⊕ B) ∨ ¬A ∨ B */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 2);
++	return cnf_xor_pos(st, step->args[0], step->args[1]);
+ }
+ 
+ CNF_XOR_NEG: /* (A ⊕ B) ∨ A ∨ B */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 2);
++	return cnf_xor_neg(st, step->args[0], step->args[1]);
+ }
+ 
+ CNF_ITE_POS: /* ¬(C ? A : B) ∨ ¬C ∨ A*/
+ {
+-	return -EOPNOTSUPP;
++	/*
++	 * Produces a disjunction of three terms based on the value of 'lit':
++	 * - lit == 0: ¬(C ? A : B) ∨ ¬C ∨ A
++	 * - lit == 1: ¬(C ? A : B) ∨ C ∨ B
++	 * - lit == 2: ¬(C ? A : B) ∨ A ∨ B
++	 */
++	u32 lit;
++	u32 e0, e1, e2;
++
++	ENSURE(!pm_cnt && param_cnt == 2);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_ite_bool_cond(st, arg_expr));
++	lit = step->args[1];
++
++	e0 = step->args[0];
++	not_expr = build_bool_not(st, e0);
++	if (IS_ERR(not_expr))
++		return PTR_ERR(not_expr);
++	e0 = not_expr->id;
++
++	switch (lit) {
++	case 0:
++		e1 = arg_expr->args[0];
++		e2 = arg_expr->args[1];
++		not_expr = build_bool_not(st, e1);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e1 = not_expr->id;
++		break;
++	case 1:
++		e1 = arg_expr->args[0];
++		e2 = arg_expr->args[2];
++		break;
++	case 2:
++		e1 = arg_expr->args[1];
++		e2 = arg_expr->args[2];
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	fact = build_disj_move(st, e0, e1, e2);
++	return set_step_fact(st, fact);
+ }
+ 
+ CNF_ITE_NEG: /* (C ? A : B) ∨ ¬C ∨ ¬A */
+ {
+-	return -EOPNOTSUPP;
++	/*
++	 * Produces a disjunction of three terms based on the value of 'lit':
++	 * - lit == 0: (C ? A : B) ∨ ¬C ∨ ¬A
++	 * - lit == 1: (C ? A : B) ∨ C ∨ ¬B
++	 * - lit == 2: (C ? A : B) ∨ ¬A ∨ ¬B
++	 */
++	u32 lit;
++	u32 e0, e1, e2;
++
++	ENSURE(!pm_cnt && param_cnt == 2);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_ite_bool_cond(st, arg_expr));
++	lit = step->args[1];
++
++	e0 = step->args[0];
++
++	switch (lit) {
++	case 0:
++		e1 = arg_expr->args[0];
++		not_expr = build_bool_not(st, e1);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e1 = not_expr->id;
++
++		e2 = arg_expr->args[1];
++		not_expr = build_bool_not(st, e2);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e2 = not_expr->id;
++		break;
++	case 1:
++		e1 = arg_expr->args[0];
++		e2 = arg_expr->args[2];
++		not_expr = build_bool_not(st, e2);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e2 = not_expr->id;
++		break;
++	case 2:
++		e1 = arg_expr->args[1];
++		e2 = arg_expr->args[2];
++		not_expr = build_bool_not(st, e1);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e1 = not_expr->id;
++		not_expr = build_bool_not(st, e2);
++		if (IS_ERR(not_expr))
++			return PTR_ERR(not_expr);
++		e2 = not_expr->id;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	fact = build_disj_move(st, e0, e1, e2);
++	return set_step_fact(st, fact);
+ }
+ 
+ ITE_EQ: /* (C ? (C ? A : B) = A : (C ? A : B) = B) */
+ {
+-	return -EOPNOTSUPP;
++	struct bcf_expr_ref *eq_expr;
++	u32 c, t0, t1, e1, e2;
++
++	ENSURE(!pm_cnt && param_cnt == 1);
++
++	arg_expr = get_arg_expr(st, step->args[0]);
++	if (IS_ERR(arg_expr))
++		return PTR_ERR(arg_expr);
++	ENSURE(is_ite_bool_cond(st, arg_expr));
++
++	c = step->args[0];
++	t0 = arg_expr->args[1];
++	t1 = arg_expr->args[2];
++
++	eq_expr = build_bool_eq_move(st, c, t0);
++	if (IS_ERR(eq_expr))
++		return PTR_ERR(eq_expr);
++	e1 = eq_expr->id;
++
++	eq_expr = build_bool_eq_move(st, c, t1);
++	if (IS_ERR(eq_expr))
++		return PTR_ERR(eq_expr);
++	e2 = eq_expr->id;
++
++	fact = build_bool_ite_move(st, arg_expr->args[0], e1, e2);
++	return set_step_fact(st, fact);
+ }
+ 
+ bad_rule:
+-- 
+2.34.1
+

@@ -1,0 +1,438 @@
+From 92802b31168cfc1c1121ef7d52d6c625a0dd63b6 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 11:39:57 +0200
+Subject: [PATCH RFC 01/11] bpf: Add bcf expr type check
+
+Add structural and type checking for BCF expressions in the proof checker.
+Validate per-node opcode, arity, and operand types (BV/BOOL/LIST), and 
+compute widths for BV terms (including indexed ops EXTRACT/EXTEND/REPEAT,
+etc.).
+
+- opcode is in the supported table and arity matches the node
+- BV nodes carry a non-zero width and operands have the same BV width, except
+  for: EXTRACT (range within source), ZERO/SIGN_EXTEND (result width = src+ext),
+  REPEAT (result width = repetitions*src), CONCAT (sum of child widths).
+- BV literals fit the declared width; up to 64-bit payload supported
+- BOOL predicates operate on compatible BV widths or BOOLs (EQ/NE allow both)
+- LIST element types match the declared element type
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ .clang-format            |   2 +
+ kernel/bpf/bcf_checker.c | 364 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 365 insertions(+), 1 deletion(-)
+
+diff --git a/.clang-format b/.clang-format
+index 7f2f85bc4c1f..a357a3c723d4 100644
+--- a/.clang-format
++++ b/.clang-format
+@@ -748,6 +748,8 @@ ForEachMacros:
+   - 'ynl_attr_for_each_payload'
+   - 'zorro_for_each_dev'
+   - 'bcf_for_each_arg'
++  - 'bcf_for_each_expr'
++  - 'bcf_for_each_arg_expr'
+   - 'bcf_for_each_pm_step'
+ 
+ IncludeBlocks: Preserve
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 33b6e5f04e7f..6926493c04cf 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -43,6 +43,19 @@ static_assert(struct_size_t(struct bcf_proof_step, args, 1) ==
+ 	     ___i < (expr)->vlen && (arg_id = (expr)->args[___i], true); \
+ 	     ___i++)
+ 
++#define bcf_for_each_expr(arg_expr, expr, st)                                  \
++	for (u32 ___i = 0, ___id;                                              \
++	     ___i < (expr)->vlen && (___id = (expr)->args[___i],               \
++				    arg_expr = id_to_expr((st), ___id), true); \
++	     ___i++)
++
++/* Note: the defined iter variable is arg_i, not arg_id. */
++#define bcf_for_each_arg_expr(arg_i, arg_expr, expr, st)               \
++	for (arg_i = 0;                                                \
++	     arg_i < (expr)->vlen &&                                   \
++	     (arg_expr = id_to_expr((st), (expr)->args[arg_i]), true); \
++	     arg_i++)
++
+ #define bcf_for_each_pm_step(step_id, step)                      \
+ 	for (u32 ___i = 0; ___i < (step)->premise_cnt &&         \
+ 			   (step_id = (step)->args[___i], true); \
+@@ -138,6 +151,144 @@ static bool expr_arg_is_id(u8 code)
+ 	return code != (BCF_BV | BCF_VAL);
+ }
+ 
++/*
++ * REQUIRES: id must be valid, i.e., either a static id or from id_gen.
++ * ENSURES: returned ptr is non-null.
++ */
++static struct bcf_expr *id_to_expr(struct bcf_checker_state *st, u32 id)
++{
++	if (is_static_expr_id(st, id))
++		return st->exprs + id;
++
++	return ERR_PTR(-EOPNOTSUPP);
++}
++
++/* type/operation/arity table */
++#define Nullary { 0, 0 }
++#define Unary { 1, 1 }
++#define Binary { 2, 2 }
++#define Ternary { 3, 3 }
++#define Vari(l) { (l), U8_MAX }
++
++#define BCF_BV_OP_NULLARY(FN) FN(BCF_BV, bv, BCF_VAR, var, Nullary)
++
++#define BCF_BV_OP_UNARY(FN)                                 \
++	FN(BCF_BV, bv, BPF_NEG, neg, Unary)                 \
++	FN(BCF_BV, bv, BCF_EXTRACT, extract, Unary)         \
++	FN(BCF_BV, bv, BCF_SIGN_EXTEND, sign_extend, Unary) \
++	FN(BCF_BV, bv, BCF_ZERO_EXTEND, zero_extend, Unary) \
++	FN(BCF_BV, bv, BCF_BVSIZE, bvsize, Unary)           \
++	FN(BCF_BV, bv, BCF_REPEAT, repeat, Unary)           \
++	FN(BCF_BV, bv, BCF_BVNOT, not, Unary)
++
++#define BCF_BV_OP_BINARY(FN)                   \
++	FN(BCF_BV, bv, BPF_SUB, sub, Binary)   \
++	FN(BCF_BV, bv, BPF_LSH, lsh, Binary)   \
++	FN(BCF_BV, bv, BPF_RSH, rsh, Binary)   \
++	FN(BCF_BV, bv, BPF_ARSH, arsh, Binary) \
++	FN(BCF_BV, bv, BPF_DIV, div, Binary)   \
++	FN(BCF_BV, bv, BPF_MOD, mod, Binary)   \
++	FN(BCF_BV, bv, BCF_SDIV, sdiv, Binary) \
++	FN(BCF_BV, bv, BCF_SMOD, smod, Binary)
++
++#define BCF_BV_OP_TERNARY(FN) FN(BCF_BV, bv, BCF_ITE, ite, Ternary)
++
++#define BCF_BV_OP_VARIADIC(FN)                \
++	FN(BCF_BV, bv, BPF_ADD, add, Vari(2)) \
++	FN(BCF_BV, bv, BPF_MUL, mul, Vari(2)) \
++	FN(BCF_BV, bv, BPF_OR, or, Vari(2))   \
++	FN(BCF_BV, bv, BPF_AND, and, Vari(2)) \
++	FN(BCF_BV, bv, BPF_XOR, xor, Vari(2)) \
++	FN(BCF_BV, bv, BCF_CONCAT, concat, Vari(2))
++
++#define BCF_BV_OP_VAL_VARIADIC(FN)            \
++	FN(BCF_BV, bv, BCF_VAL, val, Vari(1)) \
++	FN(BCF_BV, bv, BCF_FROM_BOOL, from_bool, Vari(1))
++
++#define BCF_BV_OP(FN)          \
++	BCF_BV_OP_NULLARY(FN)  \
++	BCF_BV_OP_UNARY(FN)    \
++	BCF_BV_OP_BINARY(FN)   \
++	BCF_BV_OP_TERNARY(FN)  \
++	BCF_BV_OP_VARIADIC(FN) \
++	BCF_BV_OP_VAL_VARIADIC(FN)
++
++#define BCF_BOOL_OP_NULLARY(FN)                   \
++	FN(BCF_BOOL, bool, BCF_VAL, val, Nullary) \
++	FN(BCF_BOOL, bool, BCF_VAR, var, Nullary)
++
++#define BCF_BOOL_OP_UNARY(FN)                   \
++	FN(BCF_BOOL, bool, BCF_NOT, not, Unary) \
++	FN(BCF_BOOL, bool, BCF_BITOF, bitof, Unary)
++
++#define BCF_BOOL_OP_BINARY(FN)                        \
++	FN(BCF_BOOL, bool, BPF_JEQ, eq, Binary)       \
++	FN(BCF_BOOL, bool, BPF_JNE, distinct, Binary) \
++	FN(BCF_BOOL, bool, BPF_JGT, ugt, Binary)      \
++	FN(BCF_BOOL, bool, BPF_JGE, uge, Binary)      \
++	FN(BCF_BOOL, bool, BPF_JSGT, sgt, Binary)     \
++	FN(BCF_BOOL, bool, BPF_JSGE, sge, Binary)     \
++	FN(BCF_BOOL, bool, BPF_JLT, ult, Binary)      \
++	FN(BCF_BOOL, bool, BPF_JLE, ule, Binary)      \
++	FN(BCF_BOOL, bool, BPF_JSLT, slt, Binary)     \
++	FN(BCF_BOOL, bool, BPF_JSLE, sle, Binary)     \
++	FN(BCF_BOOL, bool, BCF_IMPLIES, implies, Binary)
++
++#define BCF_BOOL_OP_TERNARY(FN) FN(BCF_BOOL, bool, BCF_ITE, ite, Ternary)
++
++#define BCF_BOOL_OP_VARIADIC(FN)                    \
++	FN(BCF_BOOL, bool, BCF_CONJ, conj, Vari(2)) \
++	FN(BCF_BOOL, bool, BCF_DISJ, disj, Vari(2)) \
++	FN(BCF_BOOL, bool, BCF_XOR, xor, Vari(2))
++
++#define BCF_BOOL_OP(FN)         \
++	BCF_BOOL_OP_NULLARY(FN) \
++	BCF_BOOL_OP_UNARY(FN)   \
++	BCF_BOOL_OP_BINARY(FN)  \
++	BCF_BOOL_OP_TERNARY(FN) \
++	BCF_BOOL_OP_VARIADIC(FN)
++
++#define BCF_LIST_OP(FN) FN(BCF_LIST, list, BCF_VAL, val, Vari(0))
++
++#define BCF_OP_TABLE(FN) \
++	BCF_BV_OP(FN)    \
++	BCF_BOOL_OP(FN)  \
++	BCF_LIST_OP(FN)
++
++static bool in_codetable(u8 code)
++{
++#define CODE_TBL(ty, _t, op, _o, _arity) [ty | op] = true,
++	static const bool codetable[256] = { [0 ... 255] = false,
++					     BCF_OP_TABLE(CODE_TBL) };
++#undef CODE_TBL
++	return codetable[code];
++}
++
++static bool valid_arity(u8 code, u8 vlen)
++{
++#define ARITY_TBL(ty, _t, op, _o, arity) [ty | op] = arity,
++	static const struct bcf_arity {
++		u8 min, max;
++	} arity[256] = { [0 ... 255] = Nullary, BCF_OP_TABLE(ARITY_TBL) };
++#undef ARITY_TBL
++	return vlen >= arity[code].min && vlen <= arity[code].max;
++}
++
++static bool is_bool(u8 code)
++{
++	return BCF_TYPE(code) == BCF_BOOL;
++}
++
++static bool is_bv(u8 code)
++{
++	return BCF_TYPE(code) == BCF_BV;
++}
++
++static bool is_list(u8 code)
++{
++	return BCF_TYPE(code) == BCF_LIST;
++}
++
+ static bool is_false(const struct bcf_expr *expr)
+ {
+ 	return expr->code == (BCF_BOOL | BCF_VAL) &&
+@@ -153,6 +304,53 @@ static bool valid_arg_id(struct bcf_checker_state *st, u32 id)
+ 	return is_static_expr_id(st, id) && test_bit(id, st->valid_idx);
+ }
+ 
++static u8 bv_size(struct bcf_expr *expr)
++{
++	if (BCF_OP(expr->code) == BCF_EXTRACT)
++		return BCF_EXTRACT_START(expr->params) -
++		       BCF_EXTRACT_END(expr->params) + 1;
++
++	if (BCF_OP(expr->code) == BCF_FROM_BOOL)
++		return expr->vlen;
++
++	return BCF_BV_WIDTH(expr->params);
++}
++
++static u8 bv_val_vlen(u8 sz)
++{
++	return DIV_ROUND_UP_POW2(sz, 32);
++}
++
++static u64 bv_val(struct bcf_expr *bv)
++{
++	u64 val = bv->args[0];
++
++	if (bv->vlen > 1) {
++		WARN_ON_ONCE(bv->vlen != 2);
++		val |= ((u64)bv->args[1] << 32);
++	}
++	return val;
++}
++
++static u64 bv_max(u8 bw)
++{
++	WARN_ON_ONCE(bw > 64);
++	return GENMASK_ULL(bw - 1, 0);
++}
++
++static bool same_type(struct bcf_expr *e0, struct bcf_expr *e1)
++{
++	u8 ty0 = BCF_TYPE(e0->code), ty1 = BCF_TYPE(e1->code);
++
++	if (ty0 != ty1)
++		return false;
++	if (ty0 == BCF_BV)
++		return bv_size(e0) == bv_size(e1);
++	else if (ty0 == BCF_LIST)
++		return e0->vlen == e1->vlen && e0->params == e1->params;
++	return true;
++}
++
+ /*
+  * Rather than using:
+  *	if (!correct_condition0 or !correct_condition1)
+@@ -166,9 +364,173 @@ static bool valid_arg_id(struct bcf_checker_state *st, u32 id)
+ 			return -EINVAL; \
+ 	} while (0)
+ 
++static int type_check_bv(struct bcf_checker_state *st, struct bcf_expr *expr)
++{
++	struct bcf_expr *arg = NULL;
++	u8 op = BCF_OP(expr->code);
++	u32 bv_sz, i;
++
++	bv_sz = bv_size(expr);
++	ENSURE(bv_sz); /* must not be bv(0) */
++
++	if (op == BCF_ITE) {
++		ENSURE(!BCF_PARAM_HIGH(expr->params));
++		bcf_for_each_arg_expr(i, arg, expr, st) {
++			if (i == 0)
++				ENSURE(is_bool(arg->code) ||
++				       (is_bv(arg->code) && bv_size(arg) == 1));
++			else
++				ENSURE(same_type(expr, arg));
++		}
++		return 0;
++	} else if (op == BCF_FROM_BOOL) {
++		bcf_for_each_expr(arg, expr, st)
++			ENSURE(is_bool(arg->code));
++		ENSURE(!expr->params); /* reserved */
++		return 0;
++	}
++
++	if (expr->vlen && expr_arg_is_id(expr->code)) {
++		arg = id_to_expr(st, expr->args[0]);
++		ENSURE(is_bv(arg->code));
++	}
++
++	/* Check indexed operators */
++	if (op == BCF_EXTRACT) {
++		u32 start = BCF_EXTRACT_START(expr->params);
++		u32 end = BCF_EXTRACT_END(expr->params);
++		/* Must extract a bv expr with a valid range. */
++		ENSURE(start >= end && bv_size(arg) > start);
++		return 0;
++	} else if (op == BCF_ZERO_EXTEND || op == BCF_SIGN_EXTEND) {
++		u32 ext_sz = BCF_EXT_LEN(expr->params);
++
++		ENSURE(bv_size(arg) + ext_sz == bv_sz);
++		return 0;
++	} else if (op == BCF_REPEAT) {
++		u32 repeat_size = BCF_REPEAT_N(expr->params);
++
++		repeat_size *= bv_size(arg);
++		ENSURE(repeat_size == bv_sz);
++		return 0;
++	}
++
++	/* For the rest, param_high is reserved. */
++	ENSURE(!BCF_PARAM_HIGH(expr->params));
++
++	switch (op) {
++	case BCF_VAL: {
++		u32 vlen = bv_val_vlen(bv_sz);
++		u64 mask;
++
++		/* Restrict bv val to be smaller then 64 bits. */
++		ENSURE(expr->vlen <= 2 && vlen == expr->vlen);
++		mask = bv_max(bv_sz);
++		ENSURE((~mask & bv_val(expr)) == 0);
++		break;
++	}
++	case BCF_CONCAT: {
++		u64 arg_sz = 0;
++
++		bcf_for_each_expr(arg, expr, st) {
++			ENSURE(is_bv(arg->code));
++			arg_sz += bv_size(arg);
++		}
++		ENSURE(arg_sz == bv_sz);
++		break;
++	}
++	case BCF_BVSIZE:
++		ENSURE(bv_size(arg) <= bv_max(bv_sz));
++		break;
++	default:
++		/* For all other operators, ensure type matches. */
++		bcf_for_each_expr(arg, expr, st)
++			ENSURE(same_type(expr, arg));
++		break;
++	}
++
++	return 0;
++}
++
++static int type_check_bool(struct bcf_checker_state *st, struct bcf_expr *expr)
++{
++	struct bcf_expr *arg0 = NULL, *arg1 = NULL;
++	u8 op = BCF_OP(expr->code);
++
++	if (op == BCF_BITOF) {
++		u8 bit = BCF_BITOF_BIT(expr->params);
++
++		ENSURE(!BCF_PARAM_HIGH(expr->params));
++		arg0 = id_to_expr(st, expr->args[0]);
++		ENSURE(is_bv(arg0->code) && bit < bv_size(arg0));
++		return 0;
++	} else if (op == BCF_VAL) {
++		ENSURE((expr->params & ~1) == 0);
++		return 0;
++	}
++
++	ENSURE(!expr->params); /* reserved */
++
++	if (expr->vlen == 2) {
++		arg0 = id_to_expr(st, expr->args[0]);
++		arg1 = id_to_expr(st, expr->args[1]);
++	}
++
++	switch (op) {
++	case BPF_JGT:
++	case BPF_JGE:
++	case BPF_JSGT:
++	case BPF_JSGE:
++	case BPF_JLT:
++	case BPF_JLE:
++	case BPF_JSLT:
++	case BPF_JSLE: /* BV predicate */
++		ENSURE(is_bv(arg0->code) && same_type(arg0, arg1));
++		break;
++	case BPF_JEQ:
++	case BPF_JNE: /* bool or bv */
++		ENSURE(!is_list(arg0->code) && same_type(arg0, arg1));
++		break;
++	default:
++		/* For all other operators, ensure all args are bool. */
++		bcf_for_each_expr(arg0, expr, st)
++			ENSURE(is_bool(arg0->code));
++		break;
++	}
++
++	return 0;
++}
++
++static int type_check_list(struct bcf_checker_state *st, struct bcf_expr *expr)
++{
++	struct bcf_expr *arg;
++	u8 elem_ty;
++
++	ENSURE(!BCF_PARAM_HIGH(expr->params));
++	elem_ty = BCF_PARAM_LOW(expr->params);
++	ENSURE(elem_ty < __MAX_BCF_TYPE && elem_ty != BCF_LIST);
++	bcf_for_each_expr(arg, expr, st)
++		ENSURE(BCF_TYPE(arg->code) == elem_ty);
++
++	return 0;
++}
++
+ static int type_check(struct bcf_checker_state *st, struct bcf_expr *expr)
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(in_codetable(expr->code));
++	ENSURE(valid_arity(expr->code, expr->vlen));
++
++	switch (BCF_TYPE(expr->code)) {
++	case BCF_BV:
++		return type_check_bv(st, expr);
++	case BCF_BOOL:
++		return type_check_bool(st, expr);
++	case BCF_LIST:
++		return type_check_list(st, expr);
++	default:
++		WARN_ONCE(1, "Unknown type: %u", BCF_TYPE(expr->code));
++		return -EFAULT;
++	}
+ }
+ 
+ static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
+-- 
+2.34.1
+

@@ -1,0 +1,200 @@
+From 59bb1daa43486088a12e114648c6326189ff279a Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 18:52:32 +0200
+Subject: [PATCH RFC 2/4] bpf: Add boolean rule: factoring and reordering
+
+Add two clause-level manipulations:
+- FACTORING: remove duplicates from a disjunction. The step supplies compressed
+  pairs (unique-index, dup-indices...). Verify equivalence of listed
+  duplicates to the unique literal and drop duplicates in the result.
+
+- REORDERING: apply a sequence of index swaps encoded in a compact u16 vector.
+  Clone the clause and perform validated in-bounds swaps.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 150 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 148 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 1f5acbe5d177..2a077fc2f77c 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -2902,6 +2902,140 @@ static int chain_resolution(struct bcf_checker_state *st,
+ 	return set_step_fact(st, fact);
+ }
+ 
++/*
++ * dup_pair_list: packed byte array for factoring duplicate pairs.
++ * Each entry: [pair_len, uniq_idx, dup_idx0, dup_idx1, ...]
++ *   - pair_len: total indices in entry (uniq + dups)
++ *   - uniq_idx: index of unique literal
++ *   - dup_idx*: indices of literals equivalent to uniq_idx
++ *
++ * Entries are sequential. Example:
++ *   [pair_len, uniq0, dup0, dup1, ..., pair_len, uniq1, dup0, ...]
++ *
++ * Rules:
++ *   - Unused bytes must be zero.
++ *   - uniq_idx values strictly increasing.
++ *   - Within entry: uniq_idx < dup_idx0 < dup_idx1 < ...
++ *   - premise->args[uniq_idx] and premise->args[dup_idx*] must be equivalent.
++ *   - Set dups_bitmap bit for each dup_idx.
++ */
++static int parse_dup_pairs(struct bcf_checker_state *st,
++			   struct bcf_expr *clause, u32 *params, u32 cnt,
++			   unsigned long *dups_bitmap)
++{
++	u8 *dup_pair_list = (void *)params;
++	u32 vlen = cnt * 4, pre_uniq;
++	u32 *args = clause->args;
++	u32 idx = 0, dup_cnt = 0;
++	bool first = true;
++
++	while (idx < vlen) {
++		u32 pair_len = dup_pair_list[idx++], i;
++		u8 uniq, *dups;
++
++		if (!pair_len)
++			break;
++
++		ENSURE(pair_len >= 2 && idx + pair_len <= vlen);
++
++		uniq = dup_pair_list[idx];
++		ENSURE(uniq < clause->vlen);
++		if (first)
++			first = false;
++		else
++			ENSURE(uniq > pre_uniq);
++		pre_uniq = uniq;
++
++		dups = &dup_pair_list[idx + 1];
++		for (i = 0; i < pair_len - 1; i++) {
++			ENSURE(dups[i] < clause->vlen && dups[i] > uniq);
++			ENSURE(expr_id_equiv(st, args[uniq], args[dups[i]]) ==
++			       1);
++			set_bit(dups[i], dups_bitmap);
++			dup_cnt++;
++		}
++
++		idx += pair_len;
++	}
++
++	ENSURE(dup_cnt);
++	if (idx < vlen)
++		ENSURE(!memchr_inv(&dup_pair_list[idx], 0, vlen - idx));
++
++	return 0;
++}
++
++static int factoring(struct bcf_checker_state *st, struct bcf_expr *clause,
++		     u32 *dup_pairs, u8 vlen)
++{
++	unsigned long dups[bitmap_size(U8_MAX)] = { 0 };
++	struct bcf_expr *dedupped;
++	struct bcf_expr_ref *fact;
++	int err;
++	u32 i;
++
++	err = parse_dup_pairs(st, clause, dup_pairs, vlen, dups);
++	if (err)
++		return err;
++
++	dedupped = get_expr_buf(st);
++	dedupped->code = BCF_BOOL | BCF_DISJ;
++	for (i = 0; i < clause->vlen; i++) {
++		if (test_bit(i, dups))
++			continue;
++		dedupped->args[dedupped->vlen++] = clause->args[i];
++	}
++
++	if (dedupped->vlen == 1)
++		return set_step_fact_id(st, dedupped->args[0]);
++
++	fact = clone_expr(st, dedupped);
++	return set_step_fact(st, fact);
++}
++
++/*
++ * Apply a sequence of swaps to reorder the arguments of a clause.
++ *
++ * The swap instructions are encoded as a vector of u16 pairs in step->args,
++ * starting after the premise ids. The first u16 is the number of swaps,
++ * followed by that u16 values, each encoding a swap between two indices:
++ *   - lower 8 bits: index j
++ *   - upper 8 bits: index k
++ * The function clones the input clause, applies the swaps in order, and
++ * returns the reordered clause.
++ */
++static struct bcf_expr_ref *apply_reordering(struct bcf_checker_state *st,
++					     struct bcf_expr *pm,
++					     struct bcf_proof_step *step)
++{
++	u16 *swaps_vec = (u16 *)&step->args[step->premise_cnt];
++	u16 swap_cnt = *swaps_vec;
++	u16 *swaps = swaps_vec + 1;
++	struct bcf_expr_ref *roc;
++	u32 param_cnt, swap_vec_sz, i;
++
++	if (swap_cnt > pm->vlen)
++		return ERR_PTR(-EINVAL);
++
++	swap_vec_sz = ((u32)swap_cnt + 1) * sizeof(u16);
++	param_cnt = DIV_ROUND_UP_POW2(swap_vec_sz, 4);
++	if (param_cnt != step->param_cnt)
++		return ERR_PTR(-EINVAL);
++	if (swap_vec_sz % 4 && swaps[swap_cnt] != 0)
++		return ERR_PTR(-EINVAL);
++
++	roc = clone_expr(st, pm);
++	for (i = 0; i < swap_cnt; i++) {
++		u8 j = swaps[i];
++		u8 k = swaps[i] >> 8;
++
++		if (j >= roc->vlen || k >= roc->vlen)
++			return ERR_PTR(-EINVAL);
++		swap(roc->args[j], roc->args[k]);
++	}
++	return roc;
++}
++
+ static int apply_bool_rule(struct bcf_checker_state *st,
+ 			   struct bcf_proof_step *step)
+ {
+@@ -2909,6 +3043,8 @@ static int apply_bool_rule(struct bcf_checker_state *st,
+ 	u16 rule = BCF_STEP_RULE(step->rule);
+ 	u16 pm_cnt = step->premise_cnt;
+ 	u16 param_cnt = step->param_cnt;
++	struct bcf_expr *premise;
++	struct bcf_expr_ref *fact;
+ 
+ 	goto *checkers[rule];
+ 
+@@ -2920,12 +3056,22 @@ static int apply_bool_rule(struct bcf_checker_state *st,
+ 
+ FACTORING: /* (A ∨ l ∨ l) ⊢ (A ∨ l) */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt == 1 && param_cnt >= 1);
++	premise = get_premise(st, step, 0);
++	ENSURE(is_bool_disj(premise->code));
++	return factoring(st, premise, &step->args[1], param_cnt);
+ }
+ 
+ REORDERING: /* (l₁ ∨ ... ∨ lₙ) ⊢ (l_{π(1)} ∨ ... ∨ l_{π(n)}) */
+ {
+-	return -EOPNOTSUPP;
++	ENSURE(pm_cnt == 1);
++	premise = get_premise(st, step, 0);
++	if (!is_bool_disj(premise->code) || !param_cnt)
++		return set_step_fact_id(st, get_premise_id(st, step, 0));
++
++	/* Compute the reordered cluase. */
++	fact = apply_reordering(st, premise, step);
++	return set_step_fact(st, fact);
+ }
+ 
+ SPLIT: /* ⊢ A ∨ ¬A */
+-- 
+2.34.1
+

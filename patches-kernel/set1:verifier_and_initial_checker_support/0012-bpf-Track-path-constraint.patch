@@ -1,0 +1,182 @@
+From 248c9f718cf12e7ef1f1ae1b5f9eea2b51606954 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 29 Oct 2025 19:12:58 +0100
+Subject: [PATCH RFC 12/17] bpf: Track path constraint
+
+Record per-branch conditions during `bcf_track()` and build a single
+conjunction to represent the path suffix constraint.
+
+- Add `record_path_cond()`: after processing each instruction under tracking,
+  examine the previous instruction; if it is a conditional jump over scalars,
+  construct a boolean condition that matches the taken/not-taken edge, and then
+  append the condition id to `env->bcf.br_conds`.
+
+- When tracking completes, if there are recorded conditions, build
+  `env->bcf.path_cond` as either the single condition or a BCF_BOOL|BCF_CONJ
+  of all collected conditions.
+
+- In `bcf_refine()`, if both `path_cond` and a refinement-specific
+  `refine_cond` exist, combine them via a 2-ary conjunction so userspace proves
+  exactly the path-specific condition.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 113 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 107 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 3f2981db1d40..f1e8e70f9f61 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -20589,6 +20589,70 @@ static int bcf_match_path(struct bpf_verifier_env *env)
+ 	return PATH_MATCH;
+ }
+ 
++static int record_path_cond(struct bpf_verifier_env *env)
++{
++	int prev_insn_idx = env->prev_insn_idx;
++	struct bpf_reg_state *regs = cur_regs(env);
++	struct bpf_reg_state *dst, *src;
++	int dst_expr, src_expr;
++	struct bpf_insn *insn;
++	u8 class, op, bits;
++	bool jmp32, non_taken;
++	int cond_expr;
++
++	if (prev_insn_idx < 0)
++		return 0;
++
++	insn = &env->prog->insnsi[prev_insn_idx];
++	class = BPF_CLASS(insn->code);
++	op = BPF_OP(insn->code);
++	if (class != BPF_JMP && class != BPF_JMP32)
++		return 0;
++	if (op == BPF_CALL || op == BPF_EXIT || op == BPF_JA || op == BPF_JCOND)
++		return 0;
++	if (insn->off == 0)
++		return 0;
++
++	dst = regs + insn->dst_reg;
++	src = regs + insn->src_reg;
++	if (BPF_SRC(insn->code) == BPF_K) {
++		src = &env->fake_reg[0];
++		memset(src, 0, sizeof(*src));
++		src->type = SCALAR_VALUE;
++		__mark_reg_known(src, insn->imm);
++	}
++	if (dst->type != SCALAR_VALUE || src->type != SCALAR_VALUE)
++		return 0;
++
++	jmp32 = (class == BPF_JMP32);
++	bits = jmp32 ? 32 : 64;
++	dst_expr = bcf_reg_expr(env, dst, jmp32);
++	src_expr = bcf_reg_expr(env, src, jmp32);
++	if (dst_expr < 0 || src_expr < 0)
++		return -ENOMEM;
++
++	non_taken = (prev_insn_idx + 1 == env->insn_idx);
++	if (op == BPF_JSET) {
++		int and_expr, zero_expr;
++
++		and_expr = bcf_build_expr(env, BCF_BV | BPF_AND, bits, 2,
++					  dst_expr, src_expr);
++		zero_expr = bcf_val(env, 0, jmp32);
++		op = BPF_JNE;
++		if (non_taken)
++			op = BPF_JEQ;
++		cond_expr = bcf_build_expr(env, BCF_BOOL | op, 0, 2,
++					   and_expr, zero_expr);
++	} else {
++		if (non_taken)
++			op = rev_opcode(op);
++		cond_expr = bcf_build_expr(env, BCF_BOOL | op, 0, 2, dst_expr,
++					   src_expr);
++	}
++
++	return bcf_add_cond(env, cond_expr);
++}
++
+ static int do_check(struct bpf_verifier_env *env)
+ {
+ 	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
+@@ -20656,8 +20720,9 @@ static int do_check(struct bpf_verifier_env *env)
+ 
+ 			if (path == PATH_MISMATCH)
+ 				goto process_bpf_exit;
+-			else if (path == PATH_DONE)
+-				return 0;
++			err = record_path_cond(env);
++			if (err || path == PATH_DONE)
++				return err;
+ 		}
+ 
+ 		if (signal_pending(current))
+@@ -24023,11 +24088,37 @@ static int bcf_track(struct bpf_verifier_env *env,
+ 	if (!err && !same_callsites(env->cur_state, st))
+ 		err = -EFAULT;
+ 
+-	if (!err) {
+-		tracked_regs = cur_regs(env);
+-		for (i = 0; i < BPF_REG_FP; i++)
+-			regs[i].bcf_expr = tracked_regs[i].bcf_expr;
++	if (err)
++		goto out;
++
++	tracked_regs = cur_regs(env);
++	for (i = 0; i < BPF_REG_FP; i++)
++		regs[i].bcf_expr = tracked_regs[i].bcf_expr;
++
++	/* Build the path constraint. */
++	if (bcf->br_cond_cnt == 1) {
++		bcf->path_cond = *bcf->br_conds;
++	} else if (bcf->br_cond_cnt > 1) {
++		struct bcf_expr *cond_expr;
++		int cond;
++
++		cond = bcf_alloc_expr(env, bcf->br_cond_cnt + 1);
++		if (cond < 0) {
++			err = cond;
++			goto out;
++		}
++		cond_expr = bcf->exprs + cond;
++		cond_expr->code = BCF_BOOL | BCF_CONJ;
++		cond_expr->params = 0;
++		cond_expr->vlen = bcf->br_cond_cnt;
++		memcpy(cond_expr->args, bcf->br_conds,
++		       sizeof(u32) * bcf->br_cond_cnt);
++		bcf->path_cond = cond;
+ 	}
++out:
++	kfree(bcf->br_conds);
++	bcf->br_conds = NULL;
++	bcf->br_cond_cnt = 0;
+ 
+ 	free_verifier_state(env->cur_state, true);
+ 	env->cur_state = NULL;
+@@ -24134,6 +24225,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+ 			     refine_state_fn refine_cb, void *ctx)
+ {
+ 	struct bpf_reg_state *regs = st->frame[st->curframe]->regs;
++	struct bcf_refine_state *bcf = &env->bcf;
+ 	struct bpf_verifier_state *base;
+ 	int i, err;
+ 
+@@ -24168,6 +24260,15 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+ 	if (!err && refine_cb)
+ 		err = refine_cb(env, st, ctx);
+ 
++	/* The final condition is the conj of path_cond and refine_cond. */
++	if (!err && bcf->refine_cond >= 0 && bcf->path_cond >= 0) {
++		bcf->refine_cond = bcf_build_expr(env, BCF_BOOL | BCF_CONJ, 0,
++						  2, bcf->path_cond,
++						  bcf->refine_cond);
++		if (bcf->refine_cond < 0)
++			err = bcf->refine_cond;
++	}
++
+ 	if (!err && (env->bcf.refine_cond >= 0 || env->bcf.path_cond >= 0))
+ 		mark_bcf_requested(env);
+ 
+-- 
+2.34.1
+

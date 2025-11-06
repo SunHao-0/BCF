@@ -1,0 +1,251 @@
+From a9e0c557f60b498fd729bc8b5ede85cc58afb55e Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 27 Oct 2025 15:58:22 +0100
+Subject: [PATCH RFC 04/17] bpf: Add top-level workflow of bcf_refine()
+
+Add the top-level refinement hook `bcf_refine()`:
+
+- Add `struct bcf_refine_state` to `struct bpf_verifier_env`: stores the list
+  of parent states forming the relevant path suffix (`parents`, `vstate_cnt`),
+  and traversal cursors (`cur_vstate`, `cur_jmp_entry`). A boolean `available`
+  marks whether BCF can be used in this verification.
+
+- Implement `backtrack_states()`: walking parents with `backtrack_insn()` and
+  recorded jump history and find a base state to start the symbolic
+  tracking.
+
+- Add a stub `bcf_track()` () and `bcf_refine()` routine that: (a) derives
+  default `reg_masks` when not provided by selecting interesting regs,
+  (b) backtracks parents, (c) runs `bcf_track()` and a refinement callback,
+  and (d) marks the aux flag to request a proof when a condition is produced.
+
+The actual symbolic tracking, condition build and concrete refinements
+appear in subsequent patches.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf.h          |   1 +
+ include/linux/bpf_verifier.h |  13 +++
+ kernel/bpf/verifier.c        | 156 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 170 insertions(+)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a47d67db3be5..690b0b2b84ba 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1656,6 +1656,7 @@ struct bpf_prog_aux {
+ 	bool changes_pkt_data;
+ 	bool might_sleep;
+ 	bool kprobe_write_ctx;
++	bool bcf_requested;
+ 	u64 prog_array_member_cnt; /* counts how many times as member of prog_array */
+ 	struct mutex ext_mutex; /* mutex for is_extended and prog_array_member_cnt */
+ 	struct bpf_arena *arena;
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index c6eb68b6389c..090430168523 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -732,6 +732,18 @@ struct bpf_scc_info {
+ 
+ struct bpf_liveness;
+ 
++struct bcf_refine_state {
++	/* The state list that decides the path suffix, on which bcf_track()
++	 * collects symbolic information for target registers.
++	 */
++	struct bpf_verifier_state **parents;
++	u32 vstate_cnt;
++	u32 cur_vstate;
++	u32 cur_jmp_entry;
++
++	bool available; /* if bcf_buf is provided. */
++};
++
+ /* single container for all structs
+  * one verifier_env per bpf_check() call
+  */
+@@ -838,6 +850,7 @@ struct bpf_verifier_env {
+ 	struct bpf_scc_info **scc_info;
+ 	u32 scc_cnt;
+ 	struct bpf_iarray *succ;
++	struct bcf_refine_state bcf;
+ };
+ 
+ static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index e4928846e763..7125f7434e6f 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -608,6 +608,23 @@ static bool is_atomic_load_insn(const struct bpf_insn *insn)
+ 	       insn->imm == BPF_LOAD_ACQ;
+ }
+ 
++typedef int (*refine_state_fn)(struct bpf_verifier_env *env,
++			       struct bpf_verifier_state *st, void *ctx);
++
++static int bcf_refine(struct bpf_verifier_env *env,
++		      struct bpf_verifier_state *st, u32 reg_masks,
++		      refine_state_fn refine_cb, void *ctx);
++
++static bool bcf_requested(const struct bpf_verifier_env *env)
++{
++	return env->prog->aux->bcf_requested;
++}
++
++static void mark_bcf_requested(struct bpf_verifier_env *env)
++{
++	env->prog->aux->bcf_requested = true;
++}
++
+ static int __get_spi(s32 off)
+ {
+ 	return (-off - 1) / BPF_REG_SIZE;
+@@ -23378,6 +23395,145 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+ 	return ret;
+ }
+ 
++static int bcf_track(struct bpf_verifier_env *env,
++		     struct bpf_verifier_state *st,
++		     struct bpf_verifier_state *base)
++{
++	return -EOPNOTSUPP;
++}
++
++/*
++ * Backtracks through parent verifier states to identify the suffix of the path
++ * that is relevant for register refinement in bcf_track(). Using backtrack_insn(),
++ * this routine locates the instructions that define the target registers and any
++ * registers that are transitively related. All states visited during this process
++ * collectively define the path suffix.
++ *
++ * Returns the parent state of the last visited state, which serves as the base
++ * state from which bcf_track() begins its analysis.
++ * The jump history from the collected states determines the suffix to follow.
++ */
++static struct bpf_verifier_state *
++backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
++		 u32 reg_masks)
++{
++	struct bpf_verifier_state *base = NULL, *st = cur;
++	struct backtrack_state *bt = &env->bt;
++	struct bcf_refine_state *bcf = &env->bcf;
++	int first_idx = cur->first_insn_idx;
++	int last_idx = cur->insn_idx;
++	int subseq_idx = -1;
++	bool skip_first = true;
++	int i, err, log_level = 0;
++	u32 vstate_cnt;
++
++	if (!reg_masks)
++		return ERR_PTR(-EFAULT);
++
++	bt_init(bt, st->curframe);
++	bt->reg_masks[bt->frame] = reg_masks;
++	swap(env->log.level, log_level); /* Disable backtrack_insn() log. */
++
++	for (;;) {
++		u32 history = st->jmp_history_cnt;
++		struct bpf_jmp_history_entry *hist;
++
++		if (last_idx < 0 || !st->parent)
++			break;
++
++		for (i = last_idx;;) {
++			if (skip_first) {
++				err = 0;
++				skip_first = false;
++			} else {
++				hist = get_jmp_hist_entry(st, history, i);
++				err = backtrack_insn(env, i, subseq_idx, hist, bt);
++			}
++			if (err) /* Track the entire path. */
++				goto out;
++			if (bt_empty(bt)) { /* Base state found. */
++				base = st->parent;
++				goto out;
++			}
++			subseq_idx = i;
++			i = get_prev_insn_idx(st, i, &history);
++			if (i == -ENOENT)
++				break;
++			if (i >= env->prog->len)
++				goto out;
++		}
++
++		st = st->parent;
++		subseq_idx = first_idx;
++		last_idx = st->last_insn_idx;
++		first_idx = st->first_insn_idx;
++	}
++
++out:
++	bt_reset(bt);
++	swap(env->log.level, log_level);
++
++	/* Collect parents and follow their jmp history. */
++	vstate_cnt = 1;
++	st = cur->parent;
++	while (st != base) {
++		vstate_cnt++;
++		st = st->parent;
++	}
++	bcf->parents = kmalloc_array(vstate_cnt, sizeof(st), GFP_KERNEL_ACCOUNT);
++	if (!bcf->parents)
++		return ERR_PTR(-ENOMEM);
++	bcf->vstate_cnt = vstate_cnt;
++	st = cur;
++	while (vstate_cnt) {
++		bcf->parents[--vstate_cnt] = st;
++		st = st->parent;
++	}
++	bcf->cur_vstate = 0;
++	bcf->cur_jmp_entry = 0;
++	return base;
++}
++
++static int __used bcf_refine(struct bpf_verifier_env *env,
++			     struct bpf_verifier_state *st, u32 reg_masks,
++			     refine_state_fn refine_cb, void *ctx)
++{
++	struct bpf_reg_state *regs = st->frame[st->curframe]->regs;
++	struct bpf_verifier_state *base;
++	int i, err;
++
++	if (!env->bcf.available || st->speculative)
++		return 0;
++	/* BCF requested multiple times in an error path. */
++	if (bcf_requested(env))
++		return -EFAULT;
++
++	if (!reg_masks) {
++		for (i = 0; i < BPF_REG_FP; i++) {
++			if (regs[i].type == NOT_INIT)
++				continue;
++			if (regs[i].type != SCALAR_VALUE &&
++			    tnum_is_const(regs[i].var_off))
++				continue;
++			reg_masks |= (1 << i);
++		}
++	}
++
++	base = backtrack_states(env, st, reg_masks);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	err = bcf_track(env, st, base);
++	if (!err && refine_cb)
++		err = refine_cb(env, st, ctx);
++
++	if (!err)
++		mark_bcf_requested(env);
++
++	kfree(env->bcf.parents);
++	return err ?: 1;
++}
++
+ /* Lazily verify all global functions based on their BTF, if they are called
+  * from main BPF program or any of subprograms transitively.
+  * BPF global subprogs called from dead code are not validated.
+-- 
+2.34.1
+

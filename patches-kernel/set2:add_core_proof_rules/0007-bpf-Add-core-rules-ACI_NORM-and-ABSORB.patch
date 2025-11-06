@@ -1,0 +1,405 @@
+From 42fb5667e26d973b50ff4956afa9ef25e693ffed Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 17:37:14 +0200
+Subject: [PATCH RFC 07/11] bpf: Add core rules: ACI_NORM and ABSORB
+
+Implement two algebraic checks on associative/commutative/idempotent ops:
+
+- ACI_NORM: normalizes both sides of an equality under A, C, I and optional
+  flattening (and/or/xor, bvand/bvor, concat as A-only). Drops nil elements
+  (true for conj, false for disj, all-ones for bvand, zero for bvor/xor/add) and
+  duplicates (for I). For A/C ops, compares sorted argument ids.
+
+- ABSORB: checks that an equality encodes absorption w.r.t. a zero element
+  (e.g., (x or true) = true, (x and false) = false, (x & 0) = 0, (x | all1) = all1)
+  by searching a path in the lhs composed of the same operator to a zero.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 346 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 344 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 58c91726db12..89f157b9096e 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -5,6 +5,7 @@
+ #include <linux/export.h>
+ #include <linux/cleanup.h>
+ #include <linux/slab.h>
++#include <linux/sort.h>
+ #include <linux/xarray.h>
+ #include <linux/refcount.h>
+ #include <linux/bitmap.h>
+@@ -487,6 +488,21 @@ static bool in_codetable(u8 code)
+ 	return codetable[code];
+ }
+ 
++/*
++ * Variadic operators that reduce to their single argument when given only one operand.
++ * For example, (xor bv0) is equivalent to bv0. This property is used in rule applications.
++ */
++static bool reducible_variadic(u8 code)
++{
++#define CODE_TBL(ty, _ty_name, op, _op_name, _arity) [ty | op] = true,
++	static const bool reducible[256] = {
++		[0 ... 255] = false,
++		BCF_BV_OP_VARIADIC(CODE_TBL) BCF_BOOL_OP_VARIADIC(CODE_TBL)
++	};
++#undef CODE_TBL
++	return reducible[code];
++}
++
+ static bool valid_arity(u8 code, u8 vlen)
+ {
+ #define ARITY_TBL(ty, _t, op, _o, arity) [ty | op] = arity,
+@@ -1673,6 +1689,320 @@ static int eval_const_expr(struct bcf_checker_state *st, u32 expr_id,
+ 	return 0;
+ }
+ 
++static void set_bv_sz(struct bcf_expr *e, u8 sz)
++{
++	if (WARN_ON_ONCE(is_bv_extract(e->code) || is_bv_from_bool(e->code)))
++		return;
++	e->params &= 0xff00;
++	e->params |= sz;
++}
++
++static void set_bv_val(struct bcf_expr *bv, u64 val)
++{
++	u8 vlen = bv_val_vlen(bv_size(bv));
++
++	bv->code = BCF_BV | BCF_VAL;
++	bv->vlen = vlen;
++	bv->args[0] = val;
++	if (vlen > 1) {
++		WARN_ON_ONCE(vlen != 2);
++		bv->args[1] = val >> 32;
++	}
++}
++
++static bool is_aci(u8 code)
++{
++	/* associative & commutative & idempotency */
++	switch (code) {
++	case (BCF_BOOL | BCF_CONJ):
++	case (BCF_BOOL | BCF_DISJ):
++	case (BCF_BV | BPF_AND):
++	case (BCF_BV | BPF_OR):
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool is_ac(u8 code)
++{
++	/* associative & commutative */
++	return is_aci(code) || is_bv_xor(code);
++}
++
++static bool is_assoc(u8 code)
++{
++	/* associative */
++	return is_ac(code) || code == (BCF_BV | BCF_CONCAT);
++}
++
++/*
++ * A nil element is an argument that does not affect the result of an operation.
++ * For example, zero is the nil element for addition, since adding zero leaves
++ * the value unchanged.
++ */
++static bool __nil_elem(struct bcf_expr *root, struct bcf_expr *arg, bool set)
++{
++	u8 ty = BCF_TYPE(root->code);
++	u8 op = BCF_OP(root->code);
++	bool is_nil = false;
++
++	if (ty == BCF_BOOL) {
++		switch (op) {
++		case BCF_DISJ:
++			is_nil = is_false(arg);
++			if (set)
++				*arg = bcf_bool_false;
++			break;
++		case BCF_CONJ:
++			is_nil = is_true(arg);
++			if (set)
++				*arg = bcf_bool_true;
++			break;
++		default:
++			return false;
++		}
++	} else if (ty == BCF_BV) {
++		u64 nil_val;
++
++		if (bv_size(root) > 64)
++			return false;
++
++		switch (op) {
++		case BPF_AND:
++			nil_val = bv_max(bv_size(root));
++			break;
++		case BPF_OR:
++		case BPF_XOR:
++		case BPF_ADD:
++			nil_val = 0;
++			break;
++		case BPF_MUL:
++			nil_val = 1;
++			break;
++		default:
++			return false;
++		}
++
++		is_nil = is_bv_val(arg->code) && bv_val(arg) == nil_val;
++		if (set) {
++			if (!WARN_ON_ONCE(arg->vlen <
++					  bv_val_vlen(bv_size(root)))) {
++				arg->code = (BCF_BV | BCF_VAL);
++				set_bv_sz(arg, bv_size(root));
++				set_bv_val(arg, nil_val);
++			}
++		}
++	}
++
++	return is_nil;
++}
++
++static bool is_nil_elem(struct bcf_expr *root, struct bcf_expr *arg)
++{
++	return __nil_elem(root, arg, false);
++}
++
++static bool set_nil_elem(struct bcf_expr *root, struct bcf_expr *arg)
++{
++	return __nil_elem(root, arg, true);
++}
++
++struct bcf_expr_stack_elem {
++	struct bcf_expr *expr;
++	u32 cur_arg;
++};
++#define BCF_MAX_ITER_STACK 64
++
++static int aci_normalize(struct bcf_checker_state *st, struct bcf_expr *root,
++			 struct bcf_expr *res)
++{
++	struct bcf_expr_stack_elem stack[BCF_MAX_ITER_STACK];
++	u32 sp = 0;
++
++	if (!is_assoc(root->code)) {
++		memcpy(res, root, EXPR_SZ(root) * sizeof(u32));
++		return 0;
++	}
++
++	res->vlen = 0;
++	stack[sp++] =
++		(struct bcf_expr_stack_elem){ .expr = root, .cur_arg = 0 };
++
++	while (sp) {
++		struct bcf_expr_stack_elem *frame = &stack[sp - 1];
++		struct bcf_expr *cur, *arg;
++		bool dup = false;
++		u32 arg_id;
++
++		cur = frame->expr;
++		if (frame->cur_arg >= cur->vlen) {
++			sp--;
++			continue;
++		}
++
++		arg_id = cur->args[frame->cur_arg++];
++		arg = id_to_expr(st, arg_id);
++		/* Eliminate nil elements */
++		if (is_nil_elem(root, arg))
++			continue;
++
++		/* Flatten nested same-operator */
++		if (arg->code == root->code) {
++			if (sp >= BCF_MAX_ITER_STACK)
++				return -E2BIG;
++			stack[sp++] =
++				(struct bcf_expr_stack_elem){ .expr = arg,
++							      .cur_arg = 0 };
++			continue;
++		}
++
++		/* Drop duplicates for idempotent operators */
++		if (is_aci(root->code)) {
++			u32 i;
++
++			for (i = 0; i < res->vlen; i++) {
++				int ret =
++					expr_id_equiv(st, res->args[i], arg_id);
++				if (ret < 0)
++					return ret;
++				if (ret == 1) {
++					dup = true;
++					break;
++				}
++			}
++			if (dup)
++				continue;
++		}
++
++		if (res->vlen >= U8_MAX)
++			return -E2BIG;
++
++		res->args[res->vlen++] = arg_id;
++	}
++
++	if (!res->vlen) {
++		set_nil_elem(root, res);
++	} else {
++		res->code = root->code;
++		res->params = root->params;
++	}
++
++	return 0;
++}
++
++static int __cmp_u32(const void *a, const void *b)
++{
++	return *(u32 *)a - *(u32 *)b;
++}
++
++/* For a = b, check if norm(a) = norm(b) */
++static int check_aci_norm(struct bcf_checker_state *st, struct bcf_expr *eq)
++{
++	DEFINE_RAW_FLEX(struct bcf_expr, bn, args, U8_MAX);
++	struct bcf_expr *a, *b; /* original */
++	struct bcf_expr *an; /* normalized */
++	int err;
++
++	a = id_to_expr(st, eq->args[0]);
++	b = id_to_expr(st, eq->args[1]);
++
++	an = get_expr_buf(st);
++	err = aci_normalize(st, a, an);
++	err = err ?: aci_normalize(st, b, bn);
++	if (err)
++		return err;
++
++	if (an->vlen == 1 && reducible_variadic(an->code))
++		an = id_to_expr(st, an->args[0]);
++	if (bn->vlen == 1 && reducible_variadic(bn->code))
++		bn = id_to_expr(st, bn->args[0]);
++
++	if (a->code == b->code) {
++		if (expr_equiv(st, an, bn) == 1)
++			return 0;
++
++		if (is_assoc(a->code)) {
++			sort(an->args, an->vlen, sizeof(u32), __cmp_u32, NULL);
++			sort(bn->args, bn->vlen, sizeof(u32), __cmp_u32, NULL);
++			ENSURE(expr_equiv(st, an, bn) == 1);
++		} else {
++			return -EINVAL;
++		}
++	} else {
++		ENSURE(expr_equiv(st, a, bn) == 1 ||
++		       expr_equiv(st, an, b) == 1);
++	}
++	return 0;
++}
++
++static bool is_zero_elem(struct bcf_expr *root, struct bcf_expr *arg)
++{
++	switch (root->code) {
++	case (BCF_BOOL | BCF_DISJ):
++		return is_true(arg);
++	case (BCF_BOOL | BCF_CONJ):
++		return is_false(arg);
++	case (BCF_BV | BPF_AND): {
++		if (!is_bv_val(arg->code))
++			return false;
++		return bv_val(arg) == 0;
++	}
++	case (BCF_BV | BPF_OR): {
++		u64 mask = bv_max(bv_size(root));
++
++		if (!is_bv_val(arg->code))
++			return false;
++		return bv_val(arg) == mask;
++	}
++	default:
++		return false;
++	}
++}
++
++/*
++ * Depth-first search to determine whether `arg` evaluates to the zero
++ * element because at least one child is that zero and the operators along
++ * the path is the same as the root.
++ */
++static int check_absorb(struct bcf_checker_state *st, struct bcf_expr *eq)
++{
++	struct bcf_expr_stack_elem stack[BCF_MAX_ITER_STACK];
++	struct bcf_expr *root, *zero;
++	u32 sp = 0;
++
++	root = id_to_expr(st, eq->args[0]);
++	zero = id_to_expr(st, eq->args[1]);
++	ENSURE(is_zero_elem(root, zero));
++
++	stack[sp++] =
++		(struct bcf_expr_stack_elem){ .expr = root, .cur_arg = 0 };
++
++	while (sp) {
++		struct bcf_expr_stack_elem *frame = &stack[sp - 1];
++		struct bcf_expr *cur = frame->expr;
++		u32 child_id;
++
++		if (is_zero_elem(root, cur))
++			return 0;
++
++		if (frame->cur_arg >= cur->vlen || cur->code != root->code) {
++			sp--;
++			continue;
++		}
++
++		if (sp >= BCF_MAX_CMP_STACK)
++			return -E2BIG;
++
++		child_id = cur->args[frame->cur_arg++];
++		stack[sp++] = (struct bcf_expr_stack_elem){
++			.expr = id_to_expr(st, child_id), .cur_arg = 0
++		};
++	}
++
++	return -EINVAL;
++}
++
+ #define RULE_TBL(rule) [BCF_RULE_NAME(rule)] = &&rule,
+ #define DEFINE_JUMP_TABLE(rule_set)                                         \
+ 	static const void                                                   \
+@@ -1757,11 +2087,23 @@ DISTINCT_VALUES: { /* Inequality of distinct values */
+ }
+ 
+ ACI_NORM: { /* Equality of ACI normal form */
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 1);
++	param = id_to_expr(st, step->args[0]);
++	ENSURE(is_bool_eq(param->code));
++	err = check_aci_norm(st, param);
++	if (err)
++		return err;
++	return set_step_fact_id(st, step->args[0]);
+ }
+ 
+ ABSORB: { /* Absorption of conjunctions */
+-	return -EOPNOTSUPP;
++	ENSURE(!pm_cnt && param_cnt == 1);
++	param = id_to_expr(st, step->args[0]);
++	ENSURE(is_bool_eq(param->code));
++	err = check_absorb(st, param);
++	if (err)
++		return err;
++	return set_step_fact_id(st, step->args[0]);
+ }
+ 
+ REWRITE: { /* Rewrite equality to equivalent expression */
+-- 
+2.34.1
+

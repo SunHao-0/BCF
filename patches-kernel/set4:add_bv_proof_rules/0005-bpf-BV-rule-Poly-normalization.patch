@@ -1,0 +1,85 @@
+From f7a95f1fff7acd5ff9de12d8082db97de5c500e6 Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Tue, 30 Sep 2025 19:35:37 +0200
+Subject: [PATCH RFC 5/7] bpf: BV rule: Poly normalization
+
+Add polynomial normalization checks for BV equalities and relations:
+- POLY_NORM: (stubbed, to be added) — equality to its normalized
+  polynomial form
+- POLY_NORM_EQ: from c0*(x0 - x1) = c1*(y0 - y1) with odd c0,c1 derive
+  (x0 = x1) = (y0 = y1)
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/bcf_checker.c | 45 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index 02af716e3fcb..0de051ca36c6 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -4569,6 +4569,8 @@ static int apply_bv_rule(struct bcf_checker_state *st,
+ 	DEFINE_JUMP_TABLE(BCF_BV_RULES);
+ 	u16 premise_cnt = step->premise_cnt;
+ 	u16 param_cnt = step->param_cnt;
++	struct bcf_expr *premise;
++	struct bcf_expr_ref *fact;
+ 	int err;
+ 
+ 	goto *checkers[BCF_STEP_RULE(step->rule)];
+@@ -4605,10 +4607,51 @@ BITBLAST: { /* Lowering bv term to bitblasted term (boolean circuit) */
+ }
+ 
+ POLY_NORM: { /* Equality of polynomial normal form */
++	struct bcf_expr *bv_eq;
++
++	ENSURE(!premise_cnt && param_cnt == 1);
++	bv_eq = get_bool_arg(st, step->args[0]);
++	if (IS_ERR(bv_eq))
++		return PTR_ERR(bv_eq);
++	ENSURE(is_bool_eq(bv_eq->code));
+ 	return -EOPNOTSUPP;
+ }
++
+ POLY_NORM_EQ: { /* Polynomial normalization for relations */
+-	return -EOPNOTSUPP;
++	struct bcf_expr *mul0, *mul1;
++	struct bcf_expr *sub0, *sub1;
++	struct bcf_expr_ref *eq0, *eq1;
++
++	ENSURE(premise_cnt == 1 && !param_cnt);
++
++	premise = get_premise(st, step, 0);
++	ENSURE(is_bool_eq(premise->code));
++
++	/* Premise c0*(x0 - x1) = c1* (y0 == y1) */
++	mul0 = id_to_expr(st, premise->args[0]);
++	mul1 = id_to_expr(st, premise->args[1]);
++	ENSURE(is_bv_mul(mul0->code) && mul0->vlen == 2);
++	ENSURE(is_bv_mul(mul1->code) && mul1->vlen == 2);
++
++	/* Lhs of the multiplication (c0 and c1) must be an odd number. */
++	sub0 = id_to_expr(st, mul0->args[0]);
++	sub1 = id_to_expr(st, mul1->args[0]);
++	ENSURE(is_bv_val(sub0->code) && bv_val(sub0) & 1);
++	ENSURE(is_bv_val(sub1->code) && bv_val(sub1) & 1);
++
++	sub0 = id_to_expr(st, mul0->args[1]);
++	sub1 = id_to_expr(st, mul1->args[1]);
++	ENSURE(is_bv_sub(sub0->code) && is_bv_sub(sub1->code));
++
++	/* Concludes (x0 == x1) = (y0 == y1) */
++	eq0 = build_bool_eq(st, sub0->args[0], sub0->args[1]);
++	if (IS_ERR(eq0))
++		return PTR_ERR(eq0);
++	eq1 = build_bool_eq(st, sub1->args[0], sub1->args[1]);
++	if (IS_ERR(eq1))
++		return PTR_ERR(eq1);
++	fact = build_bool_eq_move(st, eq0->id, eq1->id);
++	return set_step_fact(st, fact);
+ }
+ 
+ bad_rule:
+-- 
+2.34.1
+

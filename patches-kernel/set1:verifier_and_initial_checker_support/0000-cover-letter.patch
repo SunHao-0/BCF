@@ -1,0 +1,340 @@
+From d8f7abdd2dd701d2b886c3b738389887e772eb9c Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Wed, 5 Nov 2025 12:22:11 +0100
+Subject: [PATCH RFC 00/17] bpf: Introduce proof-based verifier enhancement
+
+This patch set (and three follow-up sets) introduces a proof-based, on-demand
+refinement mechanism that increases verifier precision while keeping kernel
+complexity bounded. The kernel performs lightweight symbolic tracking and state
+updates; userspace does the heavy reasoning and returns a proof, which the
+kernel checks.
+
+The design is named as BCF: eBPF Certificate Framework.
+
+Motivation
+----------
+
+The eBPF verifier can reject safe programs due to imprecise techniques used,
+e.g., intervals, that do not track registers relations and over-approximate
+on each step. This leads to rejections from loose bounds and infeasible paths.
+The dataset[1] shows various concrete false rejections. In practice, they
+require non-trivial refactoring and trial-and-error to mitigate, due to the
+gap between bytecode errors and high-level code. Cases inside deep loops and
+long paths are particularly challenging.
+
+With the increasing adoption of eBPF in various subsystems, a more powerful
+verifier is beneficial, to allow more complex extensions to be verified as
+well as being transparent to the user.
+
+The goal is to accept more safe programs without turning the verifier into
+an SMT solver or significantly increasing kernel complexity: leverage
+solver-grade reasoning (500k+ LOC solvers) without trusting it, by
+checking compact proofs in a ~5k LOC in-kernel proof checker.
+
+Key design
+----------
+
+The patch sets introduce proof-based, on-demand verifier state refinement.
+On a blocking check (e.g., potential OOB), the verifier performs on-demand
+refinement:
+
+1. Backtrack the target register to identify the relevant path suffix.
+2. Symbolically track the suffix to collect precise bitvector/boolean
+   expressions for involved registers and the path condition.
+3. Derive a refinement condition (SMT) that, if valid, permits the verifier to
+   continue (e.g., tighten pointer offset or size bounds, or conclude the path
+   is unreachable).
+4. Send the condition to userspace. Userspace proves it and returns a proof.
+5. The kernel checks the proof and resumes analysis with the refined state.
+
+Only lightweight work is in-kernel: suffix tracking and proof checking. The
+NP-hard reasoning remains in userspace. More details can be found in our
+research paper[5] (also received the best paper award :).
+
+Here is a running example:
+
+A simplified load log that hits an infeasible branch; refinement proves the path
+unreachable and pops it (another example is also available in our paper).
+
+The verifier starts:
+```
+0: (85) call bpf_get_prandom_u32#7    ; R0=scalar()
+1: (bc) w1 = w0                       ; R0=scalar() R1=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2: (c4) w1 s>>= 31                    ; R1=scalar(smin=0,smax=umax=0xffffffff,smin32=-1,smax32=0,var_off=(0x0; 0xffffffff))
+3: (54) w1 &= -134                    ; R1=scalar(smin=0,smax=umax=umax32=0xffffff7a,smax32=0x7fffff7a,var_off=(0x0; 0xffffff7a))
+4: (66) if w1 s> 0xffffffff goto pc+2 ; R1=scalar(smin=umin=umin32=0x80000000,smax=umax=umax32=0xffffff7a,smax32=-134,var_off=(0x80000000; 0x7fffff7a))
+5: (56) if w1 != 0xffffff78 goto pc+1 ; R1=0xffffff78
+6: (bf) r1 = r2
+R2 !read_ok            ; ---> start refinement: prove the path unreachable
+```
+
+Symbolic tracking (on the suffix):
+```
+...
+1: (bc) w1 = w0                 ; w1 = sym
+2: (c4) w1 s>>= 31              ; w1 = (sym s>> 31)
+3: (54) w1 &= -134              ; w1 = (sym s>> 31) & -134
+4: (66) if w1 s> -1 goto pc+2   ; fallthrough c1: w1 s<= -1
+5: (56) if w1 != -136 goto pc+1 ; fallthrough c2: w1 = -136
+6: (bf) r1 = r2
+```
+
+Here, `sym` refers to a 32-bit bitvector, which represents a vector of
+unknown bits (in the same spirit as tnum); however, unlike the verifier,
+the symbolic tracking does not perform any "reasoning": it simply
+records all the computation as is:
+	{src=sym0, dst=sym1} dst op= src {dst = (sym1 op sym0)},
+each calculation is captured as a symbolic expression (in comparison,
+tnum needs to approximate at every step).
+
+For the suffix, the symbolic track just captures the symbolic expression
+for each reg, and for branch conditions, it remembers the condition as
+path constraints (the AND of each taken condition).
+
+For the example above, let t = (sym s>> 31) & -134, which is the associated
+expr to w1. The condition to refute is:
+	 t <= -1 && t == -136
+It does not hold (if t s<= -1, then t must be -134), hence the path is
+unreachable. This condition is sent to user space for a proof.
+
+In user space, the condition is translated into the following SMT formula:
+```
+(set-logic QF_BV)
+(declare-fun v0 () (_ BitVec 64))
+(assert (let ((t20 (bvand (bvashr ((_ extract 31 0) v0) (_ bv31 32)) (_ bv4294967162 32))))
+        (and (bvsle t20 (_ bv4294967295 32)) (= t20 (_ bv4294967160 32)))))
+(check-sat)
+(exit)
+```
+
+cvc5 returns `unsat` and a proof:
+```
+unsat
+(
+; Proof produced: 715 steps, 17244 bytes
+)
+```
+
+Now back to the kernel space, the proof checker checks the proof:
+```
+checking 715 proof steps	; ---> proved received, starting checking:
+(#0 POLY_NORM () ...)
+(#1 POLY_NORM_EQ (@p0) ...)
+(#2 REFL () ...)
+(#3 ACI_NORM () ...)
+(#4 ABSORB () ...)
+(#5 EVALUATE () ...)
+...
+proof accepted            ; Path proved to be unreachable
+```
+
+The verifier pops the path and continues:
+```
+from 5 to 7: R0=scalar() R1=scalar(...)
+; return 0; @ unreachable_arsh.bpf.c:29
+7: (b7) r0 = 0                        ; R0=0
+8: (95) exit
+
+from 4 to 7: safe
+processed 10 insns (limit 1000000) max_states_per_insn 0 total_states 1 peak_states 1 mark_read 0
+```
+
+The proof check is a linear scan and is highly efficient, e.g., for a 8M
+proof, the checker can validate it within 3s.
+
+In summary, the linear time proof check essentially allows the verifier
+to achieve various non-trivial refinements, by using the user space SMT
+solvers but not trust them.
+
+Kernel/userspace interface and workflow
+---------------------------------------
+
+UAPI carries refinement conditions, proofs, and an anon-fd to preserve the
+verifier env across proof requests:
+
+- union bpf_attr: `bcf_buf`, `bcf_buf_size`, `bcf_buf_true_size`, `bcf_fd`,
+  `bcf_flags` (`BCF_F_PROOF_REQUESTED`, `BCF_F_PROOF_PROVIDED`,
+  `BCF_F_PROOF_PATH_UNREACHABLE`).
+- Conditions and proofs are represented as `struct bcf_expr` and `struct
+  bcf_proof_step`.
+
+The condition and proof are DAG, the associated algorithms walk them.
+
+Workflow:
+- Initial verification may request a proof and return `bcf_fd` plus the
+  expression arena and condition.
+- Userspace (bpftool + cvc5) proves the condition and resubmits with
+  `BCF_F_PROOF_PROVIDED` and the proof in `bcf_buf`.
+- Resume: the kernel validates the proof and continues from the saved state.
+
+More on the proof checker
+-------------------------
+
+A proof checker validates that a sequence of proof rule applications
+proves a required goal. Given a goal and a proof (a list of rule
+applications), the checker verifies each rule is applied exactly in its
+permitted form and that the final conclusion matches the requested goal;
+any violation leads to proof rejection. For example, from premises
+`A and B`, the AND_ELIM rule may conclude `A` (or `B`) only; otherwise
+the checker rejects it.
+
+The checker enforces rule validity and goal consistency, enabling
+trustless validation: user space may reason a formula, but the kernel
+only accepts results backed by a proof that checks.
+
+The proof checker introduced in this patch set can also be executed in
+*user space*, with all dependent kernel routines stubbed with their
+user-space counterparts. One can compile and try it with the proofs
+in our repo[6], and see the proof checking process.
+
+Proof checker complexity
+------------------------
+
+The cost/complexity is mostly the checker itself. The proof checker
+as introduced in the previous section is essentially a linear scan of
+the given proof. While our patch sets are a bit huge and the checker
+contains about 5k lines of code, its complexity is much lower than
+the verifier.
+
+Comparisons to the verifier:
+
+The complexity of the verifier is non-linear in the sense that every
+time when one wants to extend the verifier, e.g., adding a field to
+the verifier_state struct, a lot of factors need to be considered:
+(1) the effects of every instruction on this field, (2) its semantics
+for state pruning, (3) liveness/precision potentially kick in, etc.
+
+In comparison, the proof checker is a **linear** combination of a fixed
+set of proof rules:
+    - They are independent of each other:
+    - Adding a new rule does not break other rules;
+    - Understanding one rule does not require understanding other rules.
+The complexity is essentially the sum of the complexity of each rule.
+
+Most rules are relatively straightforward (see boolean rules), while
+only a few require a bit more thinking; these essentially include
+two classes of rules: rewrite and bitblast.
+
+The overall workflow of the checker is just a while loop that scans
+each rule (see apply_rules()), while in comparison, the verifier is
+a DFS over the program's CFG.
+
+The proof checker is quite stable: (1) in theory, it only needs
+to support two rules, resolution and bitblast, to be complete to
+represent any proof; (2) in practice, the checker supports tens
+of other rules to reduce proof size; (3) the supported rules are
+stable and do not require frequent changes, except for some rewrites.
+
+This makes the checker easier to maintain then the verifier.
+Currently supporte 50 rules in total:
+	core   : 14
+	boolean: 33
+	bitvec : 3
+
+Additional benefits
+-------------------
+
+Beyond refinement, the checker can validate other non-trivial facts,
+one potential use is to validate the precomputed loop fixpoints
+(state sets) to simplify the verifier (outlined here; future work).
+
+Current cost of loop analysis: kernel must compute fixpoints at
+loop/join points, causing state explosion and complexity when
+combined with liveness/precision tracking.
+
+Proof-enabled design: User space provides fixpoint in-states for
+loop entries and join points; the kernel validates the provided
+fixpoint instead of compute by itself.
+
+Refined verifier algorithm (single pass):
+- Userspace input:
+  - For each basic block bb, a finite set S_in[bb] describing a fixpoint
+    in-state at bb, i.e., the set of states that can be reached from bb.
+
+1. For each bb, take S_in[bb] as incoming states.
+2. Analayze the bb once per incoming state to compute S_out for
+   each successor (validation phase).
+3. For each edge bb->succ, check inclusion S_out[bb->succ] \in S_in[succ].
+   If non-trivial, i.e., the verifier cannot verify, emit a containment
+   formula G and request a proof; the check then validates the proof.
+4. Accept if all inclusions are validated. This witnesses a state
+   fixpoint; no kernel-side iteration is needed.
+
+This potentially enables smaller state sets computed offline, reducing
+the number of states required to analyze. The wholse analysis is a linear
+scan, no liveness/precision track, and the proof is only basic block-wise.
+
+Correctness and evaluation
+--------------------------
+
+We validated the checker and enhanced verifier on benchmarks: programs[1] and
+formulas[2] with cvc5 proofs. Proof sizes range from 168 bytes to 8.4 MB; the
+largest validate in under ~3 seconds. Sanitizers report no memory errors. With
+this enhancement, 403 of 512 previously rejected programs can be verified. The
+precision is comparable to symbolic-execution-based approaches, while keeping
+kernel complexity low.
+
+Patch set contents (this set)
+-----------------------------
+
+This set adds the initial proof checker and the verifier refinement workflow:
+  - Patches 1–2: UAPI expression/proof definitions and checker skeleton.
+  - Patch 3: UAPI for condition/proof interaction (`bcf_*` fields and flags).
+  - Patch 4: High-level `bcf_refine()` and backtracking logic.
+  - Patches 5–13: Symbolic tracking (suffix matching, expr arena, MOV/SEXT,
+    scalar/pointer ALU with 32-bit lowering, spill/fill, path constraints) and
+    pruning controls for parent states.
+  - Patch 14: Refinements: path-unreachable and memory-access bound refinement
+    (ptr offset and size tightening, var/var safe-access marking).
+  - Patches 15–16: Preserve env, request proof, resume and check proof.
+  - Patch 17: Enable BCF for privileged users (`bcf.available`).
+
+References
+----------
+
+[1] Benchmark programs: https://github.com/SunHao-0/BCF/tree/main/bcf-progs
+[2] Benchmark proofs: https://github.com/SunHao-0/BCF/tree/main/bcf-proofs
+[3] Early prototype: https://github.com/SunHao-0/BCF/tree/artifact-evaluation
+[4] Current full implementation: https://github.com/SunHao-0/BCF
+[5] SOSP paper: https://dl.acm.org/doi/10.1145/3731569.3764796
+[6] Proof checker: https://github.com/SunHao-0/BCF/tree/main/bcf-checker
+
+Hao Sun (17):
+  bpf: Add BCF expr and proof rule definitions
+  bpf: Add bcf_checker top-level workflow
+  bpf: Add UAPI fields for BCF proof interaction
+  bpf: Add top-level workflow of bcf_refine()
+  bpf: Add top-level workflow of bcf_track()
+  bpf: Add bcf_match_path() to follow the path suffix
+  bpf: Add bcf_expr management and binding
+  bpf: Track mov and signed extension
+  bpf: Track alu operations in bcf_track()
+  bpf: Add bcf_alu() 32bits optimization
+  bpf: Track stack spill/fill in bcf_track()
+  bpf: Track path constraint
+  bpf: Skip state pruning for the parent states
+  bpf: Add mem access bound refinement
+  bpf: Preserve verifier_env and request BCF
+  bpf: Resume verifier env and check proof
+  bpf: Enable bcf for priv users
+
+ .clang-format                  |    2 +
+ include/linux/bcf_checker.h    |   18 +
+ include/linux/bpf.h            |    1 +
+ include/linux/bpf_verifier.h   |   34 +
+ include/uapi/linux/bcf.h       |  197 +++++
+ include/uapi/linux/bpf.h       |   21 +
+ kernel/bpf/Makefile            |    2 +-
+ kernel/bpf/bcf_checker.c       |  440 ++++++++++
+ kernel/bpf/liveness.c          |   15 +
+ kernel/bpf/syscall.c           |   27 +-
+ kernel/bpf/verifier.c          | 1397 +++++++++++++++++++++++++++++++-
+ tools/include/uapi/linux/bpf.h |   21 +
+ 12 files changed, 2143 insertions(+), 32 deletions(-)
+ create mode 100644 include/linux/bcf_checker.h
+ create mode 100644 include/uapi/linux/bcf.h
+ create mode 100644 kernel/bpf/bcf_checker.c
+
+--
+2.34.1
+
