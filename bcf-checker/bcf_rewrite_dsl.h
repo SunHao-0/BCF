@@ -13,7 +13,8 @@ struct bcf_expr_nullary {
 	u16 params;
 };
 
-/* A macro-based DSL for defining rewrite rules
+/*
+ * A macro-based DSL for defining rewrite rules
  *
  * Every rewrite is essentially a lemma, which asserts the eqaulity between
  * lhs and rhs, i.e., lhs can be replaced with rhs (aka rewrite).

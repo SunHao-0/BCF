@@ -18,27 +18,29 @@ struct bcf_step_state {
 	/* The conclusion of the current step. */
 	struct bcf_expr *fact;
 	u32 fact_id;
-	/* The last step referring to the current step. After `last_ref`, the
+	/*
+	 * The last step referring to the current step. After `last_ref`, the
 	 * `fact` is no longer used by any other steps and can be freed.
 	 */
 	u32 last_ref;
 };
 
-/* The expr buffer `exprs` below as well as `steps` rely on the fact that the
+/*
+ * The expr buffer `exprs` below as well as `steps` rely on the fact that the
  * size of each arg is the same as the size of the struct bcf_expr, and no
  * padings in between and after.
  */
-static_assert(sizeof(struct bcf_expr) ==
-	      sizeof_field(struct bcf_expr, args[0]));
-static_assert(sizeof(struct bcf_proof_step) ==
-	      sizeof_field(struct bcf_proof_step, args[0]));
+static_assert(struct_size_t(struct bcf_expr, args, 1) ==
+	      sizeof_field(struct bcf_expr, args[0]) * 2);
+static_assert(struct_size_t(struct bcf_proof_step, args, 1) ==
+	      sizeof_field(struct bcf_proof_step, args[0]) * 2);
 
 /* Size of expr/step in u32 plus the node itself */
 #define EXPR_SZ(expr) ((expr)->vlen + 1)
 #define STEP_SZ(step) ((step)->premise_cnt + (step)->param_cnt + 1)
 
 #define bcf_for_each_arg(arg_id, expr)                                   \
-	for (u32 ___i = 0, arg_id;                                       \
+	for (u32 ___i = 0;                                               \
 	     ___i < (expr)->vlen && (arg_id = (expr)->args[___i], true); \
 	     ___i++)
 
@@ -49,15 +51,15 @@ static_assert(sizeof(struct bcf_proof_step) ==
 	     ___i++)
 
 /* Note: the defined iter variable is arg_i, not arg_id. */
-#define bcf_for_each_arg_expr(arg_i, arg_expr, expr, st)                      \
-	for (u32 arg_i = 0, ___id; arg_i < (expr)->vlen &&                    \
-				   (___id = (expr)->args[arg_i],              \
-				   arg_expr = id_to_expr((st), ___id), true); \
+#define bcf_for_each_arg_expr(arg_i, arg_expr, expr, st)               \
+	for (arg_i = 0;                                                \
+	     arg_i < (expr)->vlen &&                                   \
+	     (arg_expr = id_to_expr((st), (expr)->args[arg_i]), true); \
 	     arg_i++)
 
-#define bcf_for_each_pm_step(step_id, step)                               \
-	for (u32 ___i = 0, step_id; ___i < (step)->premise_cnt &&         \
-				    (step_id = (step)->args[___i], true); \
+#define bcf_for_each_pm_step(step_id, step)                      \
+	for (u32 ___i = 0; ___i < (step)->premise_cnt &&         \
+			   (step_id = (step)->args[___i], true); \
 	     ___i++)
 
 #define bcf_for_each_pm_expr(pm, step, st)                  \
@@ -68,7 +70,7 @@ static_assert(sizeof(struct bcf_proof_step) ==
 	     ___i++)
 
 #define bcf_for_each_pm_id(pm_id, step, st)                       \
-	for (u32 ___i = 0, ___step_id, pm_id;                     \
+	for (u32 ___i = 0, ___step_id;                            \
 	     ___i < (step)->premise_cnt &&                        \
 	     (___step_id = (step)->args[___i],                    \
 	     pm_id = (st)->step_state[___step_id].fact_id, true); \
@@ -115,17 +117,20 @@ static_assert(sizeof(struct bcf_expr_buf) ==
 	      struct_size_t(struct bcf_expr, args, U8_MAX));
 
 struct bcf_checker_state {
-	/* Exprs from the proof, referred to as `static expr`. They exist
+	/*
+	 * Exprs from the proof, referred to as `static expr`. They exist
 	 * during the entire checking phase.
 	 */
 	struct bcf_expr *exprs;
-	/* Each expr of `exprs` is followed by their arguments. The `valid_idx`
+	/*
+	 * Each expr of `exprs` is followed by their arguments. The `valid_idx`
 	 * bitmap records the valid indices of exprs.
 	 */
 	unsigned long *valid_idx;
 	/* Size of exprs array. */
 	u32 expr_size;
-	/* For exprs that are allocated dynamically during proof checking, e.g.,
+	/*
+	 * For exprs that are allocated dynamically during proof checking, e.g.,
 	 * conclusions from proof steps, they are refcounted, and each allocated
 	 * expr has an id (increased after `expr_size`) and is stored in xarray.
 	 *
@@ -144,7 +149,7 @@ struct bcf_checker_state {
 	u32 cur_step;
 	u32 cur_step_idx;
 
-	bcf_logger_t logger;
+	bcf_logger_cb logger;
 	void *logger_private;
 	u32 level;
 
@@ -159,7 +164,8 @@ struct bcf_checker_state {
 	struct bcf_expr_buf expr_buf;
 	struct bcf_expr_unary not_expr; /* Used by resolution. */
 
-	/* Shared stack space: used either by equivalence comparison or by
+	/*
+	 * Shared stack space: used either by equivalence comparison or by
 	 * constant evaluation, *exclusively*.
 	 */
 	union {
@@ -206,7 +212,8 @@ struct bcf_expr_ref {
 			refcount_t refcnt;
 			u32 id;
 		};
-		/* When the refcnt is zero, its id and the counter are not used
+		/*
+		 * When the refcnt is zero, its id and the counter are not used
 		 * anymore, so reuse the space for free list, see expr_put()
 		 */
 		struct bcf_expr_ref *free_next;
@@ -225,7 +232,8 @@ struct bcf_expr_ref {
 static_assert(offsetof(struct bcf_expr_ref, code) ==
 	      offsetof(struct bcf_expr_ref, expr.code));
 
-/* Every expr has an id: (1) for static exprs, the idx to `exprs` is its id;
+/*
+ * Every expr has an id: (1) for static exprs, the idx to `exprs` is its id;
  * (2) dynamically-allocated ones get one from st->id_gen++.
  */
 static bool is_static_expr_id(struct bcf_checker_state *st, u32 id)
@@ -233,11 +241,12 @@ static bool is_static_expr_id(struct bcf_checker_state *st, u32 id)
 	return id < st->expr_size;
 }
 
+/*
+ * Each arg of a bcf_expr must be an id, except for bv_val, which is a
+ * sequence of u32 values.
+ */
 static bool expr_arg_is_id(u8 code)
 {
-	/* Each arg of a bcf_expr must be an id, except for bv_val, which is a
-	 * sequence of u32 values.
-	 */
 	return code != (BCF_BV | BCF_VAL);
 }
 
@@ -270,6 +279,7 @@ static void expr_put(struct bcf_checker_state *st, struct bcf_expr *expr)
 {
 	struct bcf_expr_ref *free_head = NULL;
 	struct bcf_expr_ref *eref;
+	u32 arg_id;
 
 	if (expr >= st->exprs && expr < st->exprs + st->expr_size)
 		return;
@@ -295,7 +305,8 @@ static void expr_put(struct bcf_checker_state *st, struct bcf_expr *expr)
 	}
 }
 
-/* REQUIRES: id must be valid, i.e., either a static id or from id_gen.
+/*
+ * REQUIRES: id must be valid, i.e., either a static id or from id_gen.
  * ENSURES: returned ptr is non-null.
  */
 static struct bcf_expr *id_to_expr(struct bcf_checker_state *st, u32 id)
@@ -319,7 +330,7 @@ static struct bcf_expr_ref *alloc_expr(struct bcf_checker_state *st, u8 vlen)
 	struct bcf_expr_ref *eref;
 	void *entry;
 
-	eref = kmalloc(struct_size(eref, expr.args, vlen), GFP_KERNEL);
+	eref = kmalloc(struct_size(eref, args, vlen), GFP_KERNEL);
 	if (!eref)
 		return ERR_PTR(-ENOMEM);
 	eref->id = st->id_gen++;
@@ -339,6 +350,7 @@ static struct bcf_expr_ref *new_expr(struct bcf_checker_state *st, bool move,
 {
 	struct bcf_expr_ref *eref;
 	va_list args;
+	u32 i;
 
 	if (WARN_ON_ONCE(vlen > U8_MAX))
 		return ERR_PTR(-EFAULT);
@@ -351,7 +363,7 @@ static struct bcf_expr_ref *new_expr(struct bcf_checker_state *st, bool move,
 	eref->params = params;
 
 	va_start(args, vlen);
-	for (u32 i = 0; i < vlen; i++) {
+	for (i = 0; i < vlen; i++) {
 		u32 arg = va_arg(args, u32);
 
 		if (!move && expr_arg_is_id(code))
@@ -366,7 +378,8 @@ static struct bcf_expr_ref *new_expr(struct bcf_checker_state *st, bool move,
 /* Create a new expr with args ref increased. */
 #define build_expr(st, code, params, ...) \
 	new_expr(st, false, code, params, COUNT_ARGS(__VA_ARGS__), __VA_ARGS__)
-/* Create a new expr *without* increasing arg ref, i.e., move the ownership of
+/*
+ * Create a new expr *without* increasing arg ref, i.e., move the ownership of
  * the args to the current expr.
  */
 #define build_expr_move(st, code, params, ...) \
@@ -376,13 +389,14 @@ static struct bcf_expr_ref *clone_expr(struct bcf_checker_state *st,
 				       struct bcf_expr *expr)
 {
 	struct bcf_expr_ref *eref;
+	u32 i;
 
 	eref = alloc_expr(st, expr->vlen);
 	if (IS_ERR(eref))
 		return eref;
 	eref->expr = *expr;
 
-	for (u32 i = 0; i < expr->vlen; i++) {
+	for (i = 0; i < expr->vlen; i++) {
 		if (expr_arg_is_id(expr->code))
 			expr_id_get(st, expr->args[i]);
 		eref->args[i] = expr->args[i];
@@ -397,13 +411,12 @@ static struct bcf_expr *realloc_expr(struct bcf_checker_state *st, u32 expr_id,
 	struct bcf_expr_ref *eref;
 
 	eref = xa_load(&st->expr_id_map, expr_id);
-	if (WARN_ON_ONCE(!eref))
+	if (eref->vlen > new_vlen)
 		return ERR_PTR(-EFAULT);
 
-	eref = krealloc(eref, struct_size(eref, expr.args, new_vlen),
-			GFP_KERNEL);
+	eref = krealloc(eref, struct_size(eref, args, new_vlen), GFP_KERNEL);
 	if (!eref)
-		/* eref freed during free_checker_state() */
+		/* old eref freed during free_checker_state() */
 		return ERR_PTR(-ENOMEM);
 
 	BUG_ON(xa_is_err(
@@ -565,7 +578,8 @@ static const char *code_str(u8 code)
 	return strtable[code];
 }
 
-/* Variadic operators that reduce to their single argument when given only one operand.
+/*
+ * Variadic operators that reduce to their single argument when given only one operand.
  * For example, (xor bv0) is equivalent to bv0. This property is used in rule applications.
  */
 static bool reducible_variadic(u8 code)
@@ -694,35 +708,32 @@ static bool is_false(const struct bcf_expr *expr)
 
 static bool is_ite_bool_cond(struct bcf_checker_state *st, struct bcf_expr *e)
 {
-	if (is_ite(e->code)) {
-		if (is_bv_ite(e->code))
-			return is_bool(id_to_expr(st, e->args[0])->code);
-		return true;
-	}
-	return false;
+	if (!is_ite(e->code))
+		return false;
+	return !is_bv_ite(e->code) || is_bool(id_to_expr(st, e->args[0])->code);
 }
 
 static bool is_bool_xor_of(struct bcf_checker_state *st, u32 id, u32 a, u32 b)
 {
 	struct bcf_expr *e = id_to_expr(st, id);
 
-	return e->code == (BCF_BOOL | BCF_XOR) && e->vlen == 2 &&
-	       e->args[0] == a && e->args[1] == b;
+	return is_bool_xor(e->code) && e->vlen == 2 && e->args[0] == a &&
+	       e->args[1] == b;
 }
 
 static bool is_bool_disj_of(struct bcf_checker_state *st, u32 id, u32 a, u32 b)
 {
 	struct bcf_expr *e = id_to_expr(st, id);
 
-	return e->code == (BCF_BOOL | BCF_DISJ) && e->vlen == 2 &&
-	       e->args[0] == a && e->args[1] == b;
+	return is_bool_disj(e->code) && e->vlen == 2 && e->args[0] == a &&
+	       e->args[1] == b;
 }
 
 static bool is_bitof(struct bcf_checker_state *st, u32 id, u32 bit, u32 bv_id)
 {
 	struct bcf_expr *e = id_to_expr(st, id);
 
-	return e->code == (BCF_BOOL | BCF_BITOF) && e->args[0] == bv_id &&
+	return is_bool_bitof(e->code) && e->args[0] == bv_id &&
 	       BCF_BITOF_BIT(e->params) == bit;
 }
 
@@ -759,7 +770,8 @@ static const struct bcf_expr bcf_bool_true = {
 	.params = BCF_TRUE,
 };
 
-/* Exprs referred to by the proof steps are static exprs from the proof.
+/*
+ * Exprs referred to by the proof steps are static exprs from the proof.
  * Hence, must be valid id in st->exprs.
  */
 static bool valid_arg_id(struct bcf_checker_state *st, u32 id)
@@ -828,7 +840,8 @@ static bool same_type(struct bcf_expr *e0, struct bcf_expr *e1)
 	return true;
 }
 
-/* Rather than using:
+/*
+ * Rather than using:
  *	if (!correct_condition0 or !correct_condition1)
  *		return err;
  * the `ENSURE` macro make this more readable:
@@ -840,21 +853,11 @@ static bool same_type(struct bcf_expr *e0, struct bcf_expr *e1)
 			return -EINVAL; \
 	} while (0)
 
-/* Use ERR_PTR for pointer errors, never NULL, so IS_ERR checks work reliably.
- * CHECK_PTR macro simplifies error handling by propagating errors immediately,
- * e.g., for -ENOMEM.
- */
-#define CHECK_PTR(ptr)                         \
-	do {                                   \
-		if (IS_ERR((ptr)))             \
-			return PTR_ERR((ptr)); \
-	} while (0)
-
 static int type_check_bv(struct bcf_checker_state *st, struct bcf_expr *expr)
 {
 	struct bcf_expr *arg = NULL;
 	u8 op = BCF_OP(expr->code);
-	u32 bv_sz;
+	u32 bv_sz, i;
 
 	bv_sz = bv_size(expr);
 	ENSURE(bv_sz); /* must not be bv(0) */
@@ -901,7 +904,7 @@ static int type_check_bv(struct bcf_checker_state *st, struct bcf_expr *expr)
 		return 0;
 	}
 
-	/* For the rest, param_high is preserved */
+	/* For the rest, param_high is reserved. */
 	ENSURE(!BCF_PARAM_HIGH(expr->params));
 
 	switch (op) {
@@ -909,7 +912,7 @@ static int type_check_bv(struct bcf_checker_state *st, struct bcf_expr *expr)
 		u32 vlen = bv_val_vlen(bv_sz);
 		u64 mask;
 
-		/* restrict bv val to be smaller then 64 bits */
+		/* Restrict bv val to be smaller then 64 bits. */
 		ENSURE(expr->vlen <= 2 && vlen == expr->vlen);
 		mask = bv_max(bv_sz);
 		ENSURE((~mask & bv_val(expr)) == 0);
@@ -929,7 +932,7 @@ static int type_check_bv(struct bcf_checker_state *st, struct bcf_expr *expr)
 		ENSURE(bv_size(arg) <= bv_max(bv_sz));
 		break;
 	default:
-		/* For all other operators, ensure type matches */
+		/* For all other operators, ensure type matches. */
 		bcf_for_each_expr(arg, expr, st)
 			ENSURE(same_type(expr, arg));
 		break;
@@ -978,7 +981,7 @@ static int type_check_bool(struct bcf_checker_state *st, struct bcf_expr *expr)
 		ENSURE(!is_list(arg0->code) && same_type(arg0, arg1));
 		break;
 	default:
-		/* For all other operators, ensure all args are bool */
+		/* For all other operators, ensure all args are bool. */
 		bcf_for_each_expr(arg0, expr, st)
 			ENSURE(is_bool(arg0->code));
 		break;
@@ -1034,13 +1037,15 @@ static int alloc_builtins(struct bcf_checker_state *st)
 
 	if (st->true_expr == U32_MAX) {
 		eref = build_bool_val(st);
-		CHECK_PTR(eref);
+		if (IS_ERR(eref))
+			return PTR_ERR(eref);
 		eref->params = BCF_TRUE;
 		st->true_expr = eref->id;
 	}
 	if (st->false_expr == U32_MAX) {
 		eref = build_bool_val(st);
-		CHECK_PTR(eref);
+		if (IS_ERR(eref))
+			return PTR_ERR(eref);
 		eref->params = BCF_FALSE;
 		st->false_expr = eref->id;
 	}
@@ -1075,14 +1080,15 @@ static int check_exprs(struct bcf_checker_state *st, bpfptr_t bcf_buf,
 
 	while (idx < expr_size) {
 		struct bcf_expr *expr = st->exprs + idx;
-		u32 expr_sz = EXPR_SZ(expr);
+		u32 expr_sz = EXPR_SZ(expr), arg_id;
 
 		ENSURE(idx + expr_sz <= expr_size);
 
 		bcf_for_each_arg(arg_id, expr) {
 			if (!expr_arg_is_id(expr->code))
 				break;
-			/* The bitmap enforces that each expr can refer only to
+			/*
+			 * The bitmap enforces that each expr can refer only to
 			 * valid, previous exprs.
 			 */
 			ENSURE(valid_arg_id(st, arg_id));
@@ -1117,11 +1123,13 @@ struct bcf_var_map {
 
 static int var_equiv(struct bcf_var_map *map, u32 v0, u32 v1, bool from_checker)
 {
+	u32 i;
+
 	/* Variables from the checker must have the same id. */
 	if (from_checker)
 		return v0 == v1 ? 1 : 0;
 
-	for (u32 i = 0; i < map->cnt; i++) {
+	for (i = 0; i < map->cnt; i++) {
 		if (map->pair[i].idx0 == v0)
 			return map->pair[i].idx1 == v1 ? 1 : 0;
 		if (map->pair[i].idx1 == v1)
@@ -1140,19 +1148,22 @@ static int var_equiv(struct bcf_var_map *map, u32 v0, u32 v1, bool from_checker)
 
 static bool expr_node_equiv(struct bcf_expr *e0, struct bcf_expr *e1)
 {
+	u32 i;
+
 	if (e0->code != e1->code || e0->vlen != e1->vlen ||
 	    e0->params != e1->params)
 		return false;
 
 	if (is_leaf_node(e0))
-		for (u32 i = 0; i < e1->vlen; i++)
+		for (i = 0; i < e1->vlen; i++)
 			if (e0->args[i] != e1->args[i])
 				return false;
 
 	return true;
 }
 
-/* Once the equivalence of e0 and e1 are established, we can merge their args.
+/*
+ * Once the equivalence of e0 and e1 are established, we can merge their args.
  * For each arg a0 arg a1 of them, we know the arg must also be equiv; hence,
  * use min(a0, a1) for both e0 and e1, release the other arg.
  *
@@ -1162,10 +1173,12 @@ static bool expr_node_equiv(struct bcf_expr *e0, struct bcf_expr *e1)
 static void make_arg_sharing(struct bcf_checker_state *st, struct bcf_expr *e0,
 			     struct bcf_expr *e1)
 {
+	u32 i;
+
 	if (WARN_ON_ONCE(e1->vlen != e0->vlen))
 		return;
 
-	for (u32 i = 0; i < e0->vlen; i++) {
+	for (i = 0; i < e0->vlen; i++) {
 		if (e0->args[i] == e1->args[i])
 			continue;
 		/* Share the smaller id so that we converge to the static exprs. */
@@ -1192,7 +1205,8 @@ static int __expr_equiv(struct bcf_checker_state *st, struct bcf_expr *e0,
 
 	if (!expr_node_equiv(e0, e1))
 		return 0;
-	/* Vars from the checker must be the same node;
+	/*
+	 * Vars from the checker must be the same node;
 	 * For other cases, use the var_map.
 	 */
 	if (is_var(e0->code) && from_checker && e0 != e1)
@@ -1273,7 +1287,8 @@ static int check_assume(struct bcf_checker_state *st,
 
 	ENSURE(!step->premise_cnt && step->param_cnt == 1);
 	proof_goal = get_bool_arg(st, step->args[0]);
-	CHECK_PTR(proof_goal);
+	if (IS_ERR(proof_goal))
+		return PTR_ERR(proof_goal);
 
 	if (!st->goal_exprs)
 		return 0; /* Proof check only without goal. */
@@ -1304,7 +1319,7 @@ static u16 rule_class_max(u16 rule)
 static int check_steps(struct bcf_checker_state *st, bpfptr_t bcf_buf,
 		       u32 step_size)
 {
-	u32 pos = 0, cur_step = 0, rule;
+	u32 pos = 0, cur_step = 0, rule, step_id;
 	struct bcf_proof_step *step;
 	bool goal_found = false;
 	int err;
@@ -1318,7 +1333,8 @@ static int check_steps(struct bcf_checker_state *st, bpfptr_t bcf_buf,
 	}
 	st->step_size = step_size;
 
-	/* First pass: validate each step and count how many there are.  While
+	/*
+	 * First pass: validate each step and count how many there are.  While
 	 * iterating we also ensure that premises only reference *earlier* steps.
 	 */
 	while (pos < step_size) {
@@ -1367,7 +1383,8 @@ static int check_steps(struct bcf_checker_state *st, bpfptr_t bcf_buf,
 		pos += STEP_SZ(step);
 	}
 
-	/* Every step (except the last one) must be referenced by at
+	/*
+	 * Every step (except the last one) must be referenced by at
 	 * least one later step.
 	 */
 	for (cur_step = 0; cur_step < st->step_cnt - 1; cur_step++)
@@ -1376,7 +1393,8 @@ static int check_steps(struct bcf_checker_state *st, bpfptr_t bcf_buf,
 	return 0;
 }
 
-/* Set the conclusion/fact for the current proof step.
+/*
+ * Set the conclusion/fact for the current proof step.
  *
  * If expr_ref 'fact' is provided, takes ownership of the expr_ref and
  * stores its ID and expression pointer in the current step state.
@@ -1392,6 +1410,7 @@ static void __set_step_fact(struct bcf_checker_state *st,
 {
 	struct bcf_step_state *step_st = &st->step_state[st->cur_step];
 	struct bcf_proof_step *step = &st->steps[st->cur_step_idx];
+	u32 step_id;
 
 	if (fact) {
 		/* Take ownership */
@@ -1406,7 +1425,8 @@ static void __set_step_fact(struct bcf_checker_state *st,
 	bcf_for_each_pm_step(step_id, step) {
 		struct bcf_step_state *pm_st = &st->step_state[step_id];
 
-		/* NULL check is necessary because the current step may refer
+		/*
+		 * NULL check is necessary because the current step may refer
 		 * the same premise multiple times, the check ensures its fact
 		 * is only put once.
 		 */
@@ -1420,7 +1440,8 @@ static void __set_step_fact(struct bcf_checker_state *st,
 static int set_step_fact(struct bcf_checker_state *st,
 			 struct bcf_expr_ref *fact)
 {
-	CHECK_PTR(fact);
+	if (IS_ERR(fact))
+		return PTR_ERR(fact);
 	__set_step_fact(st, fact, 0);
 	return 0;
 }
@@ -1434,7 +1455,7 @@ static int set_step_fact_id(struct bcf_checker_state *st, u32 fact_id)
 static int apply_trusted_step(struct bcf_checker_state *st, char *rule_name,
 			      u32 fact_id)
 {
-	pr_warn("; WARNING: applying trusted step %s\n", rule_name);
+	verbose(st, "; WARNING: applying trusted step %s\n", rule_name);
 	return set_step_fact_id(st, fact_id);
 }
 
@@ -1472,6 +1493,7 @@ static int eval_bool_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 			  bool *res, struct bcf_eval_stack_elem *sub_vals)
 {
 	s64 s = 0, d = 0;
+	u32 i;
 	u8 op;
 
 	op = BCF_OP(expr->code);
@@ -1493,17 +1515,17 @@ static int eval_bool_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 		break;
 	case BCF_CONJ:
 		*res = sub_vals[0].bool_res;
-		for (u8 i = 1; i < expr->vlen; i++)
+		for (i = 1; i < expr->vlen; i++)
 			*res &= sub_vals[i].bool_res;
 		break;
 	case BCF_DISJ:
 		*res = sub_vals[0].bool_res;
-		for (u8 i = 1; i < expr->vlen; i++)
+		for (i = 1; i < expr->vlen; i++)
 			*res |= sub_vals[i].bool_res;
 		break;
 	case BCF_XOR:
 		*res = sub_vals[0].bool_res;
-		for (u8 i = 1; i < expr->vlen; i++)
+		for (i = 1; i < expr->vlen; i++)
 			*res ^= sub_vals[i].bool_res;
 		break;
 	case BCF_IMPLIES:
@@ -1571,6 +1593,7 @@ static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 {
 	bool overflow = false;
 	u64 mask;
+	u32 i;
 	u8 op;
 
 	op = BCF_OP(expr->code);
@@ -1592,7 +1615,7 @@ static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 	}
 	case BPF_ADD:
 		*res = 0;
-		for (u8 i = 0; i < expr->vlen; i++)
+		for (i = 0; i < expr->vlen; i++)
 			overflow |= check_add_overflow(*res, sub_vals[i].bv_res,
 						       res);
 		break;
@@ -1602,7 +1625,7 @@ static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 		break;
 	case BPF_MUL:
 		*res = 1;
-		for (u8 i = 0; i < expr->vlen; i++)
+		for (i = 0; i < expr->vlen; i++)
 			overflow |= check_mul_overflow(*res, sub_vals[i].bv_res,
 						       res);
 		break;
@@ -1616,17 +1639,17 @@ static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 		break;
 	case BPF_OR:
 		*res = 0;
-		for (u8 i = 0; i < expr->vlen; i++)
+		for (i = 0; i < expr->vlen; i++)
 			*res |= sub_vals[i].bv_res;
 		break;
 	case BPF_AND:
 		*res = sub_vals[0].bv_res;
-		for (u8 i = 1; i < expr->vlen; i++)
+		for (i = 1; i < expr->vlen; i++)
 			*res &= sub_vals[i].bv_res;
 		break;
 	case BPF_XOR:
 		*res = 0;
-		for (u8 i = 0; i < expr->vlen; i++)
+		for (i = 0; i < expr->vlen; i++)
 			*res ^= sub_vals[i].bv_res;
 		break;
 	case BPF_NEG: {
@@ -1660,7 +1683,7 @@ static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 		struct bcf_expr *arg;
 
 		*res = 0;
-		for (u8 i = 0; i < expr->vlen; i++) {
+		for (i = 0; i < expr->vlen; i++) {
 			arg = id_to_expr(st, expr->args[i]);
 			*res <<= bv_size(arg);
 			*res |= sub_vals[i].bv_res;
@@ -1682,13 +1705,13 @@ static int eval_bv_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 		break;
 	case BCF_FROM_BOOL: {
 		*res = 0;
-		for (u8 i = 0; i < expr->vlen; i++)
+		for (i = 0; i < expr->vlen; i++)
 			*res |= ((u64)sub_vals[i].bool_res) << i;
 		break;
 	}
 	case BCF_SDIV:
 	case BCF_SMOD:
-		return -ENOTSUPP;
+		return -EOPNOTSUPP;
 	default:
 		return -EINVAL;
 	}
@@ -1732,7 +1755,8 @@ struct bcf_eval_result {
 	bool overflow;
 };
 
-/* Evaluate a constant expression rooted at `expr_id`.
+/*
+ * Evaluate a constant expression rooted at `expr_id`.
  * On success returns 0 and sets *res to a boolean/bv literal.
  */
 static int eval_const_expr(struct bcf_checker_state *st, u32 expr_id,
@@ -1798,7 +1822,8 @@ static int eval_const_expr(struct bcf_checker_state *st, u32 expr_id,
 			continue;
 		}
 
-		/* All children processed – evaluate this node.
+		/*
+		 * All children processed – evaluate this node.
 		 * Child values are the next vlen frames.
 		 */
 		if (top_idx + vlen + 1 != sp)
@@ -1867,7 +1892,8 @@ static bool is_assoc(u8 code)
 	return is_ac(code) || code == (BCF_BV | BCF_CONCAT);
 }
 
-/* A nil element is an argument that does not affect the result of an operation.
+/*
+ * A nil element is an argument that does not affect the result of an operation.
  * For example, zero is the nil element for addition, since adding zero leaves
  * the value unchanged.
  */
@@ -1989,7 +2015,9 @@ static int aci_normalize(struct bcf_checker_state *st, struct bcf_expr *root,
 
 		/* Drop duplicates for idempotent operators */
 		if (is_aci(root->code)) {
-			for (u32 i = 0; i < res->vlen; i++) {
+			u32 i;
+
+			for (i = 0; i < res->vlen; i++) {
 				int ret =
 					expr_id_equiv(st, res->args[i], arg_id);
 				if (ret < 0)
@@ -2088,7 +2116,8 @@ static bool is_zero_elem(struct bcf_expr *root, struct bcf_expr *arg)
 	}
 }
 
-/* Depth-first search to determine whether `arg` evaluates to the zero
+/*
+ * Depth-first search to determine whether `arg` evaluates to the zero
  * element because at least one child is that zero and the operators along
  * the path is the same as the root.
  */
@@ -2260,7 +2289,8 @@ static int convert_rw_expr(struct bcf_checker_state *st,
 		vlen = bv_val_vlen(bv_size(expr));
 		if (vlen > expr->vlen) {
 			expr = realloc_expr(st, cur->expr_id, vlen);
-			CHECK_PTR(expr);
+			if (IS_ERR(expr))
+				return PTR_ERR(expr);
 		}
 		set_bv_val(expr, bv_max(bv_size(expr)));
 	} else if (is_bool_ite(cur->rw_expr->code)) {
@@ -2274,12 +2304,15 @@ static int convert_rw_expr(struct bcf_checker_state *st,
 		expr->code |= BCF_TYPE(ite_branch->code);
 	}
 
-	/* Flatten list operands:
+	/*
+	 * Flatten list operands:
 	 * If an operator with id-args receives list-typed children, splice their
 	 * elements into the argument list. This keeps variadic ops flat. Invalid
 	 * arities/types are caught by subsequent type_check().
 	 */
 	if (expr->vlen && expr_arg_is_id(expr->code)) {
+		u32 arg_i;
+
 		expr_buf = get_expr_buf(st);
 		bcf_for_each_arg_expr(arg_i, arg, expr, st) {
 			if (is_list(arg->code)) {
@@ -2294,7 +2327,7 @@ static int convert_rw_expr(struct bcf_checker_state *st,
 			}
 		}
 		if (WARN_ON_ONCE(!expr_buf->vlen)) {
-			return -ENOTSUPP;
+			return -EOPNOTSUPP;
 		} else if (expr_buf->vlen == 1 &&
 			   reducible_variadic(expr->code)) {
 			u32 elem = expr_buf->args[0];
@@ -2306,7 +2339,8 @@ static int convert_rw_expr(struct bcf_checker_state *st,
 			if (expr_buf->vlen > expr->vlen) {
 				expr = realloc_expr(st, cur->expr_id,
 						    expr_buf->vlen);
-				CHECK_PTR(expr);
+				if (IS_ERR(expr))
+					return PTR_ERR(expr);
 			}
 			copy_expr_args(expr, expr_buf);
 		}
@@ -2400,12 +2434,14 @@ static int push_rw_expr(struct bcf_checker_state *st,
 		cur->expr_id = st->false_expr;
 	} else if (is_rw_bv_val(rw_expr)) {
 		struct bcf_expr_ref *val = alloc_expr(st, rw_expr->vlen);
+		u32 i;
 
-		CHECK_PTR(val);
+		if (IS_ERR(val))
+			return PTR_ERR(val);
 		val->code = BCF_BV | BCF_VAL;
 		val->vlen = rw_expr->vlen;
 		val->params = rw_expr->params;
-		for (u32 i = 0; i < rw_expr->vlen; i++)
+		for (i = 0; i < rw_expr->vlen; i++)
 			val->args[i] = rw_bv_val(rw_expr + i + 1);
 		cur->size += rw_expr->vlen; /* skip value nodes */
 		cur->cur_arg += rw_expr->vlen;
@@ -2413,7 +2449,8 @@ static int push_rw_expr(struct bcf_checker_state *st,
 	} else {
 		struct bcf_expr_ref *eref = alloc_expr(st, rw_expr->vlen);
 
-		CHECK_PTR(eref);
+		if (IS_ERR(eref))
+			return PTR_ERR(eref);
 		if (WARN_ON_ONCE(!rw_expr->vlen))
 			return -EFAULT;
 		eref->code = rw_expr->code;
@@ -2424,7 +2461,6 @@ static int push_rw_expr(struct bcf_checker_state *st,
 
 	return 0;
 }
-
 static int parse_rw_expr(struct bcf_checker_state *st,
 			 const struct bcf_expr_nullary *rw_exprs, u32 len,
 			 u32 *args, u32 arg_n, u32 *expr_id)
@@ -2493,7 +2529,7 @@ static int apply_rewrite(struct bcf_checker_state *st,
 {
 	struct bcf_expr_ref *conclusion;
 	const struct bcf_rewrite *rw;
-	u32 match, target;
+	u32 match, target, i;
 	int err;
 
 	ENSURE(rid > BCF_REWRITE_UNSPEC && rid < __MAX_BCF_REWRITES);
@@ -2501,7 +2537,7 @@ static int apply_rewrite(struct bcf_checker_state *st,
 
 	/* Param type must match. */
 	ENSURE(arg_n == rw->param_cnt);
-	for (u32 i = 0; i < arg_n; i++) {
+	for (i = 0; i < arg_n; i++) {
 		struct bcf_expr *arg_expr = id_to_expr(st, args[i]);
 
 		err = rw_type_check(st, &rw->params[i], arg_expr);
@@ -2545,7 +2581,8 @@ static int apply_rewrite(struct bcf_checker_state *st,
 	if (err)
 		return err;
 	conclusion = build_bool_eq_move(st, match, target);
-	CHECK_PTR(conclusion);
+	if (IS_ERR(conclusion))
+		return PTR_ERR(conclusion);
 	err = type_check(st, &conclusion->expr);
 	if (err)
 		return err;
@@ -2555,11 +2592,11 @@ static int apply_rewrite(struct bcf_checker_state *st,
 }
 
 #define RULE_TBL(rule) [BCF_RULE_NAME(rule)] = &&rule,
-#define DEFINE_JUMP_TABLE(rule_set)                                  \
-	static const void *const                                     \
-		checkers[__MAX_##rule_set] __annotate_jump_table = { \
-			[0 ... __MAX_##rule_set - 1] = &&bad_rule,   \
-			rule_set(RULE_TBL)                           \
+#define DEFINE_JUMP_TABLE(rule_set)                                         \
+	static const void                                                   \
+		*const checkers[__MAX_##rule_set] __annotate_jump_table = { \
+			[0 ... __MAX_##rule_set - 1] = &&bad_rule,          \
+			rule_set(RULE_TBL)                                  \
 		};
 
 static int apply_core_rule(struct bcf_checker_state *st,
@@ -2571,16 +2608,18 @@ static int apply_core_rule(struct bcf_checker_state *st,
 	u8 pm_cnt = step->premise_cnt;
 	struct bcf_expr_ref *fact = NULL;
 	struct bcf_expr *premise, *param;
-	u32 premise_id;
+	u32 premise_id, arg_i;
 	int err;
 
 	/* Must refer to valid exprs in the proof. */
-	for (u32 arg_i = 0; arg_i < param_cnt; arg_i++) {
+	for (arg_i = 0; arg_i < param_cnt; arg_i++) {
 		u32 arg_id = step->args[pm_cnt + arg_i];
 
 		if (rule == BCF_RULE_REWRITE || rule == BCF_RULE_CONG)
 			break;
-		CHECK_PTR(get_arg_expr(st, arg_id));
+		param = get_arg_expr(st, arg_id);
+		if (IS_ERR(param))
+			return PTR_ERR(param);
 	}
 	goto *checkers[rule];
 
@@ -2594,21 +2633,22 @@ EVALUATE: { /* Evaluate constant boolean/bitvector expression */
 	u32 res_id;
 
 	ENSURE(!pm_cnt && param_cnt == 1);
-	CHECK_PTR(get_arg_expr(st, step->args[0]));
+	const_expr = get_arg_expr(st, step->args[0]);
+	if (IS_ERR(const_expr))
+		return PTR_ERR(const_expr);
 
 	err = eval_const_expr(st, step->args[0], &res);
 	if (err)
 		return err;
-	ENSURE(!res.overflow);
 
-	const_expr = id_to_expr(st, step->args[0]);
 	if (is_bool(const_expr->code)) {
 		res_id = res.bool_res ? st->true_expr : st->false_expr;
 	} else {
 		struct bcf_expr_ref *eref;
 
 		eref = build_bv_val(st, bv_size(const_expr), res.bv_res);
-		CHECK_PTR(eref);
+		if (IS_ERR(eref))
+			return PTR_ERR(eref);
 		res_id = eref->id;
 	}
 
@@ -2628,7 +2668,8 @@ DISTINCT_VALUES: { /* Inequality of distinct values */
 	ENSURE(expr_equiv(st, v0, v1) == 0);
 
 	fact = build_bool_eq(st, step->args[0], step->args[1]);
-	CHECK_PTR(fact);
+	if (IS_ERR(fact))
+		return PTR_ERR(fact);
 	fact = build_bool_not_move(st, fact->id);
 	return set_step_fact(st, fact);
 }
@@ -2681,7 +2722,9 @@ REWRITE: { /* Rewrite equality to equivalent expression */
 REFL: /* A ⊢ A = A */
 {
 	ENSURE(!pm_cnt && param_cnt == 1);
-	CHECK_PTR(get_arg_expr(st, step->args[0]));
+	param = get_arg_expr(st, step->args[0]);
+	if (IS_ERR(param))
+		return PTR_ERR(param);
 	fact = build_bool_eq(st, step->args[0], step->args[0]);
 	return set_step_fact(st, fact);
 }
@@ -2698,7 +2741,8 @@ SYMM: /* A = B ⊢ B = A */
 	ENSURE(is_bool_eq(eq->code));
 
 	fact = build_bool_eq(st, eq->args[1], eq->args[0]);
-	CHECK_PTR(fact);
+	if (IS_ERR(fact))
+		return PTR_ERR(fact);
 	if (is_bool_not(premise->code))
 		fact = build_bool_not_move(st, fact->id);
 
@@ -2752,17 +2796,17 @@ CONG: /* A = B ⊢ f(A) = f(B) */
 	if (err)
 		return err;
 	lhs = clone_expr(st, expr_buf);
-	CHECK_PTR(lhs);
+	if (IS_ERR(lhs))
+		return PTR_ERR(lhs);
 
-	/* Build expression with RHS arguments.
-	 * LHS is type-checked, so safe to clone.
-	 */
+	/* Build expression with RHS. LHS is type-checked, safe to clone. */
 	args = expr_buf->args;
 	bcf_for_each_pm_expr(premise, step, st) {
 		*args++ = premise->args[1];
 	}
 	rhs = clone_expr(st, expr_buf);
-	CHECK_PTR(rhs);
+	if (IS_ERR(rhs))
+		return PTR_ERR(rhs);
 
 	fact = build_bool_eq_move(st, lhs->id, rhs->id);
 	return set_step_fact(st, fact);
@@ -2817,7 +2861,7 @@ static int parse_resolution_params(struct bcf_checker_state *st,
 {
 	u32 pm_cnt = step->premise_cnt;
 	u32 lit_cnt = pm_cnt - 1, mask;
-	u32 pol_vlen, tail_bits;
+	u32 pol_vlen, tail_bits, i;
 	u32 *pol_bitmap, *lits;
 
 	pol_vlen = DIV_ROUND_UP_POW2(lit_cnt, 32);
@@ -2831,8 +2875,11 @@ static int parse_resolution_params(struct bcf_checker_state *st,
 	}
 
 	lits = &step->args[pm_cnt + pol_vlen];
-	for (u32 i = 0; i < lit_cnt; i++)
-		CHECK_PTR(get_bool_arg(st, lits[i]));
+	for (i = 0; i < lit_cnt; i++) {
+		struct bcf_expr *expr = get_bool_arg(st, lits[i]);
+		if (IS_ERR(expr))
+			return PTR_ERR(expr);
+	}
 
 	*pol_bitmap_out = pol_bitmap;
 	*lits_out = lits;
@@ -2865,6 +2912,7 @@ static int elim_pivot(struct bcf_checker_state *st, struct bcf_expr *lits,
 {
 	struct bcf_expr *lit;
 	int ret;
+	u32 i;
 
 	bcf_for_each_arg_expr(i, lit, lits, st) {
 		ret = expr_equiv(st, lit, pivot);
@@ -2902,7 +2950,7 @@ static int chain_resolution(struct bcf_checker_state *st,
 	DEFINE_RAW_FLEX(struct bcf_expr, lhs_lits, args, U8_MAX);
 	struct bcf_expr *pivots[2], *rhs_lits;
 	u32 *lits = NULL, *pols = NULL;
-	u32 pm_cnt = step->premise_cnt;
+	u32 pm_cnt = step->premise_cnt, i, rhs;
 	u32 lit_cnt = pm_cnt - 1, lhs_pm;
 	struct bcf_expr_ref *fact;
 	int err;
@@ -2922,7 +2970,7 @@ static int chain_resolution(struct bcf_checker_state *st,
 		return err;
 
 	rhs_lits = get_expr_buf(st);
-	for (u32 i = 0, rhs = 1; i < lit_cnt; i++, rhs++) {
+	for (i = 0, rhs = 1; i < lit_cnt; i++, rhs++) {
 		u32 rhs_pm = get_premise_id(st, step, rhs);
 
 		get_pivots(st, pivots, lits[i], bcf_test_pol(i, pols));
@@ -2944,7 +2992,8 @@ static int chain_resolution(struct bcf_checker_state *st,
 	return set_step_fact(st, fact);
 }
 
-/* dup_pair_list: packed byte array for factoring duplicate pairs.
+/*
+ * dup_pair_list: packed byte array for factoring duplicate pairs.
  * Each entry: [pair_len, uniq_idx, dup_idx0, dup_idx1, ...]
  *   - pair_len: total indices in entry (uniq + dups)
  *   - uniq_idx: index of unique literal
@@ -2971,7 +3020,7 @@ static int parse_dup_pairs(struct bcf_checker_state *st,
 	bool first = true;
 
 	while (idx < vlen) {
-		u32 pair_len = dup_pair_list[idx++];
+		u32 pair_len = dup_pair_list[idx++], i;
 		u8 uniq, *dups;
 
 		if (!pair_len)
@@ -2988,7 +3037,7 @@ static int parse_dup_pairs(struct bcf_checker_state *st,
 		pre_uniq = uniq;
 
 		dups = &dup_pair_list[idx + 1];
-		for (u32 i = 0; i < pair_len - 1; i++) {
+		for (i = 0; i < pair_len - 1; i++) {
 			ENSURE(dups[i] < clause->vlen && dups[i] > uniq);
 			ENSURE(expr_id_equiv(st, args[uniq], args[dups[i]]) ==
 			       1);
@@ -3013,6 +3062,7 @@ static int factoring(struct bcf_checker_state *st, struct bcf_expr *clause,
 	struct bcf_expr *dedupped;
 	struct bcf_expr_ref *fact;
 	int err;
+	u32 i;
 
 	err = parse_dup_pairs(st, clause, dup_pairs, vlen, dups);
 	if (err)
@@ -3020,7 +3070,7 @@ static int factoring(struct bcf_checker_state *st, struct bcf_expr *clause,
 
 	dedupped = get_expr_buf(st);
 	dedupped->code = BCF_BOOL | BCF_DISJ;
-	for (u32 i = 0; i < clause->vlen; i++) {
+	for (i = 0; i < clause->vlen; i++) {
 		if (test_bit(i, dups))
 			continue;
 		dedupped->args[dedupped->vlen++] = clause->args[i];
@@ -3033,7 +3083,8 @@ static int factoring(struct bcf_checker_state *st, struct bcf_expr *clause,
 	return set_step_fact(st, fact);
 }
 
-/* Apply a sequence of swaps to reorder the arguments of a clause.
+/*
+ * Apply a sequence of swaps to reorder the arguments of a clause.
  *
  * The swap instructions are encoded as a vector of u16 pairs in step->args,
  * starting after the premise ids. The first u16 is the number of swaps,
@@ -3051,7 +3102,7 @@ static struct bcf_expr_ref *apply_reordering(struct bcf_checker_state *st,
 	u16 swap_cnt = *swaps_vec;
 	u16 *swaps = swaps_vec + 1;
 	struct bcf_expr_ref *roc;
-	u32 param_cnt, swap_vec_sz;
+	u32 param_cnt, swap_vec_sz, i;
 
 	if (swap_cnt > pm->vlen)
 		return ERR_PTR(-EINVAL);
@@ -3064,7 +3115,7 @@ static struct bcf_expr_ref *apply_reordering(struct bcf_checker_state *st,
 		return ERR_PTR(-EINVAL);
 
 	roc = clone_expr(st, pm);
-	for (u32 i = 0; i < swap_cnt; i++) {
+	for (i = 0; i < swap_cnt; i++) {
 		u8 j = swaps[i];
 		u8 k = swaps[i] >> 8;
 
@@ -3087,12 +3138,14 @@ static int equiv_elim(struct bcf_checker_state *st, struct bcf_expr *premise,
 	e1 = premise->args[1];
 	if (form) {
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 		expr_id_get(st, e0);
 	} else {
 		not_expr = build_bool_not(st, e0);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e0 = not_expr->id;
 		expr_id_get(st, e1);
 	}
@@ -3113,11 +3166,13 @@ static int not_equiv_elim(struct bcf_checker_state *st,
 	e1 = premise->args[1];
 	if (form) {
 		not_expr = build_bool_not(st, e0);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e0 = not_expr->id;
 
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 	} else {
 		expr_id_get(st, e0);
@@ -3139,13 +3194,15 @@ static int __cnf_equiv_pos(struct bcf_checker_state *st, u32 arg, u32 form,
 	ENSURE(form == 0 || form == 1);
 
 	arg_expr = get_arg_expr(st, arg);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(arg_expr->code == code);
 
 	e0 = arg;
 	if (!xor) {
 		not_expr = build_bool_not(st, arg);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e0 = not_expr->id;
 	}
 
@@ -3153,11 +3210,13 @@ static int __cnf_equiv_pos(struct bcf_checker_state *st, u32 arg, u32 form,
 	e2 = arg_expr->args[1];
 	if (form) {
 		not_expr = build_bool_not(st, e2);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e2 = not_expr->id;
 	} else {
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 	}
 
@@ -3186,13 +3245,15 @@ static int __cnf_equiv_neg(struct bcf_checker_state *st, u32 arg, u32 lit,
 	ENSURE(lit == 0 || lit == 1);
 
 	arg_expr = get_arg_expr(st, arg);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(arg_expr->code == code);
 
 	e0 = arg;
 	if (xor) { /* equiv_neg == xor_pos */
 		not_expr = build_bool_not(st, arg);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e0 = not_expr->id;
 	}
 
@@ -3200,10 +3261,12 @@ static int __cnf_equiv_neg(struct bcf_checker_state *st, u32 arg, u32 lit,
 	e2 = arg_expr->args[1];
 	if (lit) {
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 		not_expr = build_bool_not(st, e2);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e2 = not_expr->id;
 	}
 	fact = build_disj_move(st, e0, e1, e2);
@@ -3268,10 +3331,12 @@ SPLIT: /* ⊢ A ∨ ¬A */
 
 	arg = step->args[0];
 	arg_expr = get_bool_arg(st, arg);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 
 	not = build_bool_not_move(st, arg);
-	CHECK_PTR(not);
+	if (IS_ERR(not))
+		return PTR_ERR(not);
 	fact = build_disj_move(st, arg, not->id);
 	return set_step_fact(st, fact);
 }
@@ -3334,7 +3399,7 @@ AND_ELIM: /* (A ∧ B) ⊢ A */
 
 AND_INTRO: /* A, B ⊢ (A ∧ B) */
 {
-	u32 *clauses;
+	u32 *clauses, clause;
 
 	ENSURE(pm_cnt && !param_cnt);
 
@@ -3382,7 +3447,8 @@ IMPLIES_ELIM: /* (A ⇒ B) ⊢ ¬A ∨ B */
 	ENSURE(is_bool_implies(premise->code));
 	premise_id = premise->args[1];
 	not = build_bool_not(st, premise->args[0]);
-	CHECK_PTR(not);
+	if (IS_ERR(not))
+		return PTR_ERR(not);
 	expr_id_get(st, premise_id);
 	fact = build_disj_move(st, not->id, premise_id);
 	return set_step_fact(st, fact);
@@ -3477,7 +3543,8 @@ ITE_ELIM: /* (C ? A : B) ⊢ (¬C ∨ A) ∧ (C ∨ B) */
 	} else {
 		/* ¬C ∨ A */
 		not_expr = build_bool_not(st, premise->args[0]);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e0 = not_expr->id;
 		e1 = premise->args[1];
 		expr_id_get(st, e1);
@@ -3506,15 +3573,18 @@ NOT_ITE_ELIM: /* ¬(C ? A : B) ⊢ (¬C ∨ ¬A) ∧ (C ∨ ¬B) */
 		e0 = premise->args[0];
 		expr_id_get(st, e0);
 		not_b = build_bool_not(st, premise->args[2]);
-		CHECK_PTR(not_b);
+		if (IS_ERR(not_b))
+			return PTR_ERR(not_b);
 		e1 = not_b->id;
 	} else {
 		/* ¬C ∨ ¬A */
 		not_c = build_bool_not(st, premise->args[0]);
-		CHECK_PTR(not_c);
+		if (IS_ERR(not_c))
+			return PTR_ERR(not_c);
 		e0 = not_c->id;
 		not_a = build_bool_not(st, premise->args[1]);
-		CHECK_PTR(not_a);
+		if (IS_ERR(not_a))
+			return PTR_ERR(not_a);
 		e1 = not_a->id;
 	}
 
@@ -3524,7 +3594,7 @@ NOT_ITE_ELIM: /* ¬(C ? A : B) ⊢ (¬C ∨ ¬A) ∧ (C ∨ ¬B) */
 
 NOT_AND: /* ¬(A ∧ B) ⊢ (¬A ∨ ¬B) */
 {
-	u32 *args;
+	u32 *args, arg;
 
 	ENSURE(pm_cnt == 1 && param_cnt);
 
@@ -3534,14 +3604,16 @@ NOT_AND: /* ¬(A ∧ B) ⊢ (¬A ∨ ¬B) */
 	ENSURE(is_bool_conj(premise->code));
 
 	fact = alloc_expr(st, premise->vlen);
-	CHECK_PTR(fact);
+	if (IS_ERR(fact))
+		return PTR_ERR(fact);
 	fact->code = BCF_BOOL | BCF_DISJ;
 	fact->vlen = premise->vlen;
 	fact->params = 0;
 	args = fact->args;
 	bcf_for_each_arg(arg, premise) {
 		not_expr = build_bool_not(st, arg);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		*args++ = not_expr->id;
 	}
 	return set_step_fact(st, fact);
@@ -3554,14 +3626,16 @@ CNF_AND_POS: /* ¬(A ∧ B) ∨ A */
 	ENSURE(!pm_cnt && param_cnt == 2);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_bool_conj(arg_expr->code));
 
 	lit = step->args[1];
 	ENSURE(lit < arg_expr->vlen);
 
 	not_expr = build_bool_not(st, step->args[0]);
-	CHECK_PTR(not_expr);
+	if (IS_ERR(not_expr))
+		return PTR_ERR(not_expr);
 	expr_id_get(st, arg_expr->args[lit]);
 
 	fact = build_disj_move(st, not_expr->id, arg_expr->args[lit]);
@@ -3570,16 +3644,18 @@ CNF_AND_POS: /* ¬(A ∧ B) ∨ A */
 
 CNF_AND_NEG: /* (A ∧ B) ∨ ¬A ∨ ¬B */
 {
-	u32 *args;
+	u32 *args, arg;
 
 	ENSURE(!pm_cnt && param_cnt == 1);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_bool_conj(arg_expr->code) && arg_expr->vlen < U8_MAX);
 
 	fact = alloc_expr(st, arg_expr->vlen + 1);
-	CHECK_PTR(fact);
+	if (IS_ERR(fact))
+		return PTR_ERR(fact);
 	fact->code = BCF_BOOL | BCF_DISJ;
 	fact->vlen = arg_expr->vlen + 1;
 	fact->params = 0;
@@ -3587,7 +3663,8 @@ CNF_AND_NEG: /* (A ∧ B) ∨ ¬A ∨ ¬B */
 	*args++ = step->args[0];
 	bcf_for_each_arg(arg, arg_expr) {
 		not_expr = build_bool_not(st, arg);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		*args++ = not_expr->id;
 	}
 	return set_step_fact(st, fact);
@@ -3595,19 +3672,22 @@ CNF_AND_NEG: /* (A ∧ B) ∨ ¬A ∨ ¬B */
 
 CNF_OR_POS: /* ¬(A ∨ B) ∨ A ∨ B */
 {
-	u32 *args;
+	u32 *args, arg;
 
 	ENSURE(!pm_cnt && param_cnt == 1);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_bool_disj(arg_expr->code) && arg_expr->vlen < U8_MAX);
 
 	not_expr = build_bool_not(st, step->args[0]);
-	CHECK_PTR(not_expr);
+	if (IS_ERR(not_expr))
+		return PTR_ERR(not_expr);
 
 	fact = alloc_expr(st, arg_expr->vlen + 1);
-	CHECK_PTR(fact);
+	if (IS_ERR(fact))
+		return PTR_ERR(fact);
 	fact->code = BCF_BOOL | BCF_DISJ;
 	fact->vlen = arg_expr->vlen + 1;
 	fact->params = 0;
@@ -3627,13 +3707,15 @@ CNF_OR_NEG: /* (A ∨ B) ∨ ¬A */
 	ENSURE(!pm_cnt && param_cnt == 2);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_bool_disj(arg_expr->code));
 	lit = step->args[1];
 	ENSURE(lit < arg_expr->vlen);
 
 	not_expr = build_bool_not(st, arg_expr->args[lit]);
-	CHECK_PTR(not_expr);
+	if (IS_ERR(not_expr))
+		return PTR_ERR(not_expr);
 	fact = build_disj_move(st, step->args[0], not_expr->id);
 	return set_step_fact(st, fact);
 }
@@ -3645,13 +3727,16 @@ CNF_IMPLIES_POS: /* (A ⇒ B) ∨ ¬A ∨ B */
 	ENSURE(!pm_cnt && param_cnt == 1);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_bool_implies(arg_expr->code));
 
 	not_expr = build_bool_not(st, step->args[0]);
-	CHECK_PTR(not_expr);
+	if (IS_ERR(not_expr))
+		return PTR_ERR(not_expr);
 	not_term = build_bool_not(st, arg_expr->args[0]);
-	CHECK_PTR(not_term);
+	if (IS_ERR(not_term))
+		return PTR_ERR(not_term);
 
 	fact = build_disj_move(st, not_expr->id, not_term->id,
 			       arg_expr->args[1]);
@@ -3665,7 +3750,8 @@ CNF_IMPLIES_NEG: /* (A ⇒ B) ∨ (A ∧ ¬B) */
 	ENSURE(!pm_cnt && param_cnt == 2);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_bool_implies(arg_expr->code));
 	lit = step->args[1];
 	ENSURE(lit == 0 || lit == 1);
@@ -3674,7 +3760,8 @@ CNF_IMPLIES_NEG: /* (A ⇒ B) ∨ (A ∧ ¬B) */
 	e1 = arg_expr->args[0];
 	if (lit) {
 		not_expr = build_bool_not(st, arg_expr->args[1]);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 	}
 	fact = build_disj_move(st, e0, e1);
@@ -3707,7 +3794,8 @@ CNF_XOR_NEG: /* (A ⊕ B) ∨ A ∨ B */
 
 CNF_ITE_POS: /* ¬(C ? A : B) ∨ ¬C ∨ A*/
 {
-	/* Produces a disjunction of three terms based on the value of 'lit':
+	/*
+	 * Produces a disjunction of three terms based on the value of 'lit':
 	 * - lit == 0: ¬(C ? A : B) ∨ ¬C ∨ A
 	 * - lit == 1: ¬(C ? A : B) ∨ C ∨ B
 	 * - lit == 2: ¬(C ? A : B) ∨ A ∨ B
@@ -3718,13 +3806,15 @@ CNF_ITE_POS: /* ¬(C ? A : B) ∨ ¬C ∨ A*/
 	ENSURE(!pm_cnt && param_cnt == 2);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_ite_bool_cond(st, arg_expr));
 	lit = step->args[1];
 
 	e0 = step->args[0];
 	not_expr = build_bool_not(st, e0);
-	CHECK_PTR(not_expr);
+	if (IS_ERR(not_expr))
+		return PTR_ERR(not_expr);
 	e0 = not_expr->id;
 
 	switch (lit) {
@@ -3732,7 +3822,8 @@ CNF_ITE_POS: /* ¬(C ? A : B) ∨ ¬C ∨ A*/
 		e1 = arg_expr->args[0];
 		e2 = arg_expr->args[1];
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 		break;
 	case 1:
@@ -3753,7 +3844,8 @@ CNF_ITE_POS: /* ¬(C ? A : B) ∨ ¬C ∨ A*/
 
 CNF_ITE_NEG: /* (C ? A : B) ∨ ¬C ∨ ¬A */
 {
-	/* Produces a disjunction of three terms based on the value of 'lit':
+	/*
+	 * Produces a disjunction of three terms based on the value of 'lit':
 	 * - lit == 0: (C ? A : B) ∨ ¬C ∨ ¬A
 	 * - lit == 1: (C ? A : B) ∨ C ∨ ¬B
 	 * - lit == 2: (C ? A : B) ∨ ¬A ∨ ¬B
@@ -3764,7 +3856,8 @@ CNF_ITE_NEG: /* (C ? A : B) ∨ ¬C ∨ ¬A */
 	ENSURE(!pm_cnt && param_cnt == 2);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_ite_bool_cond(st, arg_expr));
 	lit = step->args[1];
 
@@ -3774,29 +3867,34 @@ CNF_ITE_NEG: /* (C ? A : B) ∨ ¬C ∨ ¬A */
 	case 0:
 		e1 = arg_expr->args[0];
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 
 		e2 = arg_expr->args[1];
 		not_expr = build_bool_not(st, e2);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e2 = not_expr->id;
 		break;
 	case 1:
 		e1 = arg_expr->args[0];
 		e2 = arg_expr->args[2];
 		not_expr = build_bool_not(st, e2);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e2 = not_expr->id;
 		break;
 	case 2:
 		e1 = arg_expr->args[1];
 		e2 = arg_expr->args[2];
 		not_expr = build_bool_not(st, e1);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e1 = not_expr->id;
 		not_expr = build_bool_not(st, e2);
-		CHECK_PTR(not_expr);
+		if (IS_ERR(not_expr))
+			return PTR_ERR(not_expr);
 		e2 = not_expr->id;
 		break;
 	default:
@@ -3815,7 +3913,8 @@ ITE_EQ: /* (C ? (C ? A : B) = A : (C ? A : B) = B) */
 	ENSURE(!pm_cnt && param_cnt == 1);
 
 	arg_expr = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(arg_expr);
+	if (IS_ERR(arg_expr))
+		return PTR_ERR(arg_expr);
 	ENSURE(is_ite_bool_cond(st, arg_expr));
 
 	c = step->args[0];
@@ -3823,11 +3922,13 @@ ITE_EQ: /* (C ? (C ? A : B) = A : (C ? A : B) = B) */
 	t1 = arg_expr->args[2];
 
 	eq_expr = build_bool_eq_move(st, c, t0);
-	CHECK_PTR(eq_expr);
+	if (IS_ERR(eq_expr))
+		return PTR_ERR(eq_expr);
 	e1 = eq_expr->id;
 
 	eq_expr = build_bool_eq_move(st, c, t1);
-	CHECK_PTR(eq_expr);
+	if (IS_ERR(eq_expr))
+		return PTR_ERR(eq_expr);
 	e2 = eq_expr->id;
 
 	fact = build_bool_ite_move(st, arg_expr->args[0], e1, e2);
@@ -3846,7 +3947,8 @@ static bool is_bool_conj2(struct bcf_checker_state *st, u32 e_id)
 	return is_bool_conj(expr->code) && expr->vlen == 2;
 }
 
-/* Check bitblast bv_ult
+/*
+ * Check bitblast bv_ult
  * bb_ult: Validate canonical bit-blast for unsigned less-than/less-equal.
  * Structure enforced for bits i = vlen-1..1:
  *   res = ((lhs[i] == rhs[i]) ∧ rest) ∨ ((¬lhs[i]) ∧ rhs[i]),
@@ -3859,12 +3961,13 @@ static int bb_ult(struct bcf_checker_state *st, struct bcf_expr *res, u32 *lhs,
 		  u32 *rhs, u8 vlen, bool eq)
 {
 	struct bcf_expr *l, *r;
+	u32 i;
 
 	if (WARN_ON_ONCE(!vlen))
 		return -EFAULT;
 
 	/* a < b iff ( a[i] <-> b[i] AND a[i-1:0] < b[i-1:0]) OR (~a[i] AND b[i]) */
-	for (u32 i = vlen - 1; i > 0; i--) {
+	for (i = vlen - 1; i > 0; i--) {
 		ENSURE(is_bool_disj(res->code) && res->vlen == 2);
 		ENSURE(is_bool_conj2(st, res->args[0]));
 		ENSURE(is_bool_conj2(st, res->args[1]));
@@ -3890,7 +3993,8 @@ static int bb_ult(struct bcf_checker_state *st, struct bcf_expr *res, u32 *lhs,
 	return 0;
 }
 
-/* Check bitblast bv_slt
+/*
+ * Check bitblast bv_slt
  * bb_slt: Validate canonical bit-blast for signed less-than/less-equal.
  * MSB index s = vlen-1. Enforce:
  *   res = ((lhs[s] == rhs[s]) ∧ rest) ∨ (lhs[s] ∧ ¬rhs[s]),
@@ -3921,7 +4025,8 @@ static int bb_slt(struct bcf_checker_state *st, struct bcf_expr *res, u32 *lhs,
 	return bb_ult(st, res, lhs, rhs, vlen - 1, eq);
 }
 
-/* check_bb_atom: Validate bit-blasted boolean atoms (comparisons).
+/*
+ * check_bb_atom: Validate bit-blasted boolean atoms (comparisons).
  * Inputs (lhs, rhs) must already be bit-blasted vectors (FROM_BOOL) of equal
  * width. Supported ops:
  *   - JEQ: conjunction over all bits of (lhs[i] == rhs[i])
@@ -3958,7 +4063,8 @@ static int check_bb_atom(struct bcf_checker_state *st, struct bcf_expr *atom,
 		break;
 	}
 	default:
-		/* Other ops are converted, e.g., `a ugt b` => `b ult a`,
+		/*
+		 * Other ops are converted, e.g., `a ugt b` => `b ult a`,
 		 * or the expr is not a bv predicate.
 		 */
 		return -EINVAL;
@@ -3984,12 +4090,12 @@ static int bb_bitwise_op(struct bcf_checker_state *st, struct bcf_expr *term,
 			 struct bcf_expr *bbt, u8 op)
 {
 	struct bcf_expr *sub, *bit;
-	u32 bit_id;
+	u32 bit_id, i, j;
 
-	for (u32 i = 0; i < bbt->vlen; i++) {
+	for (i = 0; i < bbt->vlen; i++) {
 		bit_id = bbt->args[i];
 		bit = id_to_expr(st, bit_id);
-		for (u32 j = term->vlen - 1; j > 0; j--) {
+		for (j = term->vlen - 1; j > 0; j--) {
 			ENSURE(BCF_OP(bit->code) == op && bit->vlen == 2);
 			sub = id_to_expr(st, term->args[j]);
 			ENSURE(bit->args[1] == sub->args[i]);
@@ -4008,9 +4114,9 @@ static int check_ripple_carry_adder(struct bcf_checker_state *st, u32 vlen,
 				    u32 *a, u32 *b, u32 *res, bool init_carry)
 {
 	struct bcf_expr *sum, *carry, *sub;
-	u32 pre_carry;
+	u32 pre_carry, i;
 
-	for (u32 i = 0; i < vlen; i++) {
+	for (i = 0; i < vlen; i++) {
 		sum = id_to_expr(st, res[i]);
 		ENSURE(is_bool_xor(sum->code) && sum->vlen == 2);
 
@@ -4044,8 +4150,9 @@ static int extract_pre_sum(struct bcf_checker_state *st, u32 vlen, u32 *sum,
 			   u32 *pre_sum)
 {
 	struct bcf_expr *sub;
+	u32 i;
 
-	for (u32 i = 0; i < vlen; i++) {
+	for (i = 0; i < vlen; i++) {
 		sub = id_to_expr(st, sum[i]);
 		ENSURE(sub->vlen);
 		sub = id_to_expr(st, sub->args[0]);
@@ -4059,8 +4166,9 @@ static int extract_pre_adder(struct bcf_checker_state *st, u32 vlen, u32 *sum,
 			     u32 *pre_adder)
 {
 	struct bcf_expr *sub;
+	u32 i;
 
-	for (u32 i = 0; i < vlen; i++) {
+	for (i = 0; i < vlen; i++) {
 		sub = id_to_expr(st, sum[i]);
 		ENSURE(sub->vlen);
 		sub = id_to_expr(st, sub->args[0]);
@@ -4070,7 +4178,8 @@ static int extract_pre_adder(struct bcf_checker_state *st, u32 vlen, u32 *sum,
 	return 0;
 }
 
-/* Validate the outer guard and fill semantics for bit-blasted shifts.
+/*
+ * Validate the outer guard and fill semantics for bit-blasted shifts.
  * RHS bits must be ITE(cond, stage_out[i], fill), where:
  *   - cond = (b < bit_sz) encoded as a bit-blasted unsigned compare,
  *   - stage_out[i] is the per-stage barrel-shift network output (collected into
@@ -4083,7 +4192,7 @@ static int bb_shift_limit(struct bcf_checker_state *st, struct bcf_expr *term,
 			  struct bcf_expr *bbt, bool logic_shift, u32 *res)
 {
 	struct bcf_expr *ite, *cond, *b, *bit, *a;
-	u32 *bb_size, checked_cond;
+	u32 *bb_size, checked_cond, i;
 	u64 bit_sz = bv_size(term);
 	int err;
 
@@ -4092,14 +4201,15 @@ static int bb_shift_limit(struct bcf_checker_state *st, struct bcf_expr *term,
 	ite = id_to_expr(st, bbt->args[0]);
 	ENSURE(is_bool_ite(ite->code));
 
-	/* The top level of bbt must assert that each bit is either a result
+	/*
+	 * The top level of bbt must assert that each bit is either a result
 	 * of shift, or a zero if b is bigger then the bit sz:
 	 * 	b < bit_sz ? res : 0
 	 */
 	cond = id_to_expr(st, ite->args[0]);
 	/* Bitblasted representation of bit_sz. */
 	bb_size = get_expr_buf(st)->args;
-	for (u32 i = 0; i < b->vlen; i++) {
+	for (i = 0; i < b->vlen; i++) {
 		if (i < 64 && bit_sz & (1ULL << i))
 			bb_size[i] = st->true_expr;
 		else
@@ -4123,7 +4233,8 @@ static int bb_shift_limit(struct bcf_checker_state *st, struct bcf_expr *term,
 	return 0;
 }
 
-/* Validate right shifts (logical if logic_shift=true, arithmetic otherwise)
+/*
+ * Validate right shifts (logical if logic_shift=true, arithmetic otherwise)
  * using a staged barrel shifter peeled from the guarded RHS.
  * For stages i = floor(log2(bit_sz)) .. 0 with threshold = 1 << i:
  *   - For in-range positions (j + threshold < width):
@@ -4144,7 +4255,7 @@ static int bb_rsh(struct bcf_checker_state *st, struct bcf_expr *term,
 	struct bcf_expr *a, *b, *bit;
 	u32 *res, *pre_res;
 	u32 arg_buf[U8_MAX];
-	int err;
+	int err, i, j;
 
 	res = arg_buf;
 	err = bb_shift_limit(st, term, bbt, logic_shift, res);
@@ -4154,10 +4265,10 @@ static int bb_rsh(struct bcf_checker_state *st, struct bcf_expr *term,
 	a = id_to_expr(st, term->args[0]);
 	b = id_to_expr(st, term->args[1]);
 	pre_res = get_expr_buf(st)->args;
-	for (int i = bit_limit - 1; i >= 0; i++) {
+	for (i = bit_limit - 1; i >= 0; i--) {
 		u64 threshold = 1 << i;
 
-		for (int j = a->vlen - 1; j >= 0; j--) {
+		for (j = a->vlen - 1; j >= 0; j--) {
 			u32 shift_bit = b->args[i];
 
 			bit = id_to_expr(st, res[j]);
@@ -4199,7 +4310,7 @@ static int check_bb_term(struct bcf_checker_state *st, u32 term_id, u32 bbt_id)
 	struct bcf_expr *term = id_to_expr(st, term_id);
 	struct bcf_expr *bbt = id_to_expr(st, bbt_id);
 	struct bcf_expr *sub, *bit;
-	u32 arg_buf[U8_MAX];
+	u32 arg_buf[U8_MAX], i, j;
 	int err;
 
 	ENSURE(is_bv_from_bool(bbt->code));
@@ -4217,7 +4328,7 @@ static int check_bb_term(struct bcf_checker_state *st, u32 term_id, u32 bbt_id)
 	goto *bb_term_table[BCF_OP(term->code) >> 3];
 
 bb_bv_var: {
-	for (u32 i = 0; i < bbt->vlen; i++)
+	for (i = 0; i < bbt->vlen; i++)
 		ENSURE(is_bitof(st, bbt->args[i], i, term_id));
 	return 0;
 }
@@ -4231,14 +4342,15 @@ bb_bv_val: {
 }
 
 bb_bv_not: {
-	for (u32 i = 0; i < bbt->vlen; i++)
+	for (i = 0; i < bbt->vlen; i++)
 		ENSURE(is_bool_not_of(st, bbt->args[i], term->args[i]));
 	return 0;
 }
 
 /* Arith ops */
 bb_bv_neg: {
-	/* Validate negation as two's-complement addition: add(~a, 0, carry_in=true).
+	/*
+	 * Validate negation as two's-complement addition: add(~a, 0, carry_in=true).
 	 * From the output sum bits (bbt->args):
 	 *   - pre_sum := first XOR-input vector extracted per bit (extract_pre_sum),
 	 *               must equal bitwise-NOT of a’s bits.
@@ -4256,7 +4368,7 @@ bb_bv_neg: {
 	err = err ?: extract_pre_adder(st, vlen, bbt->args, adder);
 	if (err)
 		return err;
-	for (u32 i = 0; i < vlen; i++) {
+	for (i = 0; i < vlen; i++) {
 		ENSURE(is_bool_not_of(st, pre_sum[i], sub->args[i]));
 		ENSURE(is_false(id_to_expr(st, adder[i])));
 	}
@@ -4267,7 +4379,8 @@ bb_bv_neg: {
 }
 
 bb_bv_add: {
-	/* Validate multi-operand addition via staged ripple-carry “peeling”.
+	/*
+	 * Validate multi-operand addition via staged ripple-carry “peeling”.
 	 * Let result R = a0 + a1 + ... + an. Start with sum := R’s bits.
 	 * For k = n..1:
 	 *   - pre_sum := first XOR-input vector extracted from sum[i]
@@ -4285,7 +4398,7 @@ bb_bv_add: {
 	sum = st->expr_buf.args;
 	memcpy(sum, bbt->args, sizeof(u32) * bbt->vlen);
 
-	for (u32 i = term->vlen - 1; i > 0; i--) {
+	for (i = term->vlen - 1; i > 0; i--) {
 		adder = id_to_expr(st, term->args[i]);
 		err = extract_pre_sum(st, vlen, sum, pre_sum);
 		if (err)
@@ -4303,7 +4416,8 @@ bb_bv_add: {
 }
 
 bb_bv_sub: {
-	/* Validate subtraction as two's-complement transform: a - b == add(a, ~b, 1).
+	/*
+	 * Validate subtraction as two's-complement transform: a - b == add(a, ~b, 1).
 	 * From the output sum bits:
 	 *   - pre_adder := second XOR-input vector per bit (extract_pre_adder),
 	 *                 must equal bitwise-NOT of b’s bits.
@@ -4319,7 +4433,7 @@ bb_bv_sub: {
 	if (err)
 		return err;
 	sub = id_to_expr(st, term->args[1]);
-	for (u32 i = 0; i < vlen; i++)
+	for (i = 0; i < vlen; i++)
 		ENSURE(is_bool_not_of(st, pre_adder[i], sub->args[i]));
 
 	sub = id_to_expr(st, term->args[0]);
@@ -4339,7 +4453,8 @@ bb_bv_xor:
 	return bb_bitwise_op(st, term, bbt, BPF_XOR);
 
 bb_bv_lsh: {
-	/* Validate left shift via staged barrel shifter peeled from the guarded RHS.
+	/*
+	 * Validate left shift via staged barrel shifter peeled from the guarded RHS.
 	 * For stages i = floor(log2(bit_sz)) .. 0 with threshold = 1 << i:
 	 *   Each bit must be ITE(b[i], inject, keep), with
 	 *     inject = False if j < threshold, else previous_stage[j - threshold],
@@ -4350,6 +4465,7 @@ bb_bv_lsh: {
 	u32 bit_limit = order_base_2(bit_sz);
 	struct bcf_expr *a, *b;
 	u32 *res, *pre_res;
+	int bit_i;
 
 	ENSURE(bit_limit <= 64);
 
@@ -4362,13 +4478,13 @@ bb_bv_lsh: {
 	a = id_to_expr(st, term->args[0]);
 	b = id_to_expr(st, term->args[1]);
 	pre_res = get_expr_buf(st)->args;
-	for (int i = bit_limit - 1; i >= 0; i++) {
-		u64 threshold = 1 << i;
+	for (bit_i = bit_limit - 1; bit_i >= 0; bit_i--) {
+		u64 threshold = 1 << bit_i;
 
-		for (u32 j = 0; j < a->vlen; j++) {
+		for (j = 0; j < a->vlen; j++) {
 			bit = id_to_expr(st, res[j]);
 			ENSURE(is_bool_ite(bit->code));
-			ENSURE(bit->args[0] == b->args[i]);
+			ENSURE(bit->args[0] == b->args[bit_i]);
 
 			if (j < threshold)
 				ENSURE(is_false(id_to_expr(st, bit->args[1])));
@@ -4395,10 +4511,11 @@ bb_bv_arsh: {
 /* BV ops */
 bb_bv_concat: {
 	u32 base = 0;
+	int arg_i;
 
-	for (int i = term->vlen - 1; i >= 0; i--) {
-		sub = id_to_expr(st, term->args[i]);
-		for (int j = 0; j < sub->vlen; j++)
+	for (arg_i = term->vlen - 1; arg_i >= 0; arg_i--) {
+		sub = id_to_expr(st, term->args[arg_i]);
+		for (j = 0; j < sub->vlen; j++)
 			ENSURE(bbt->args[base + j] == sub->args[j]);
 		base += sub->vlen;
 	}
@@ -4410,7 +4527,7 @@ bb_bv_extract: {
 	u32 low = BCF_EXTRACT_END(term->params);
 
 	sub = id_to_expr(st, term->args[0]);
-	for (u32 i = low, j = 0; i <= high; i++, j++)
+	for (i = low, j = 0; i <= high; i++, j++)
 		ENSURE(bbt->args[j] == sub->args[i]);
 	return 0;
 }
@@ -4420,11 +4537,11 @@ bb_bv_sign_extend: {
 	u32 sign_bit;
 
 	sub = id_to_expr(st, term->args[0]);
-	for (u32 i = 0; i < sub->vlen; i++)
+	for (i = 0; i < sub->vlen; i++)
 		ENSURE(sub->args[i] == bbt->args[i]);
 
 	sign_bit = sub->args[sub->vlen - 1];
-	for (u32 i = sub->vlen, j = 0; j < ext_sz; j++, i++)
+	for (i = sub->vlen, j = 0; j < ext_sz; j++, i++)
 		ENSURE(bbt->args[i] == sign_bit);
 	return 0;
 }
@@ -4436,8 +4553,8 @@ bb_bv_ite: {
 	cond = term->args[0];
 	then = id_to_expr(st, term->args[1]);
 	el = id_to_expr(st, term->args[2]);
-	for (u32 i = 0; i < bbt->vlen; i++) {
-		/* Each bit must be: (!cond or then[i]) and (cond or el[i])*/
+	for (i = 0; i < bbt->vlen; i++) {
+		/* Each bit must be: (!cond or then[i]) and (cond or el[i]) */
 		sub = id_to_expr(st, bbt->args[i]);
 		ENSURE(is_bool_conj2(st, bbt->args[i]));
 
@@ -4451,13 +4568,13 @@ bb_bv_ite: {
 	return 0;
 }
 
-/* Skip non-linear arith */
+/* Skip non-linear arith, add mul when needed. */
 bb_bv_mul:
 bb_bv_div:
 bb_bv_sdiv:
 bb_bv_mod:
 bb_bv_smod:
-	return -ENOTSUPP;
+	return -EOPNOTSUPP;
 
 /* Should be rewritten */
 bb_bv_repeat:
@@ -4487,12 +4604,14 @@ BITBLAST: { /* Lowering bv term to bitblasted term (boolean circuit) */
 
 	ENSURE(!premise_cnt && param_cnt == 1);
 
-	/* bbt_eq: must be bv = bbt, where
+	/*
+	 * bbt_eq: must be bv = bbt, where
 	 * - bv: bitvector term or atom (e.g. (+ bv0 bv1), (> bv0 bv1))
 	 * - bbt: bitblasted form (bv_from_bool ...)
 	 */
 	bbt_eq = get_arg_expr(st, step->args[0]);
-	CHECK_PTR(bbt_eq);
+	if (IS_ERR(bbt_eq))
+		return PTR_ERR(bbt_eq);
 	ENSURE(is_bool_eq(bbt_eq->code));
 
 	bv = id_to_expr(st, bbt_eq->args[0]);
@@ -4510,15 +4629,18 @@ BITBLAST: { /* Lowering bv term to bitblasted term (boolean circuit) */
 		return err;
 	return set_step_fact_id(st, step->args[0]);
 }
+
 POLY_NORM: { /* Equality of polynomial normal form */
 	struct bcf_expr *bv_eq;
 
 	ENSURE(!premise_cnt && param_cnt == 1);
 	bv_eq = get_bool_arg(st, step->args[0]);
-	CHECK_PTR(bv_eq);
+	if (IS_ERR(bv_eq))
+		return PTR_ERR(bv_eq);
 	ENSURE(is_bool_eq(bv_eq->code));
 	return apply_trusted_step(st, "POLY_NORM", step->args[0]);
 }
+
 POLY_NORM_EQ: { /* Polynomial normalization for relations */
 	struct bcf_expr *mul0, *mul1;
 	struct bcf_expr *sub0, *sub1;
@@ -4529,7 +4651,7 @@ POLY_NORM_EQ: { /* Polynomial normalization for relations */
 	premise = get_premise(st, step, 0);
 	ENSURE(is_bool_eq(premise->code));
 
-	/* Premise c0*(x0 - x1) = c1* (y0 == y1)*/
+	/* Premise c0*(x0 - x1) = c1* (y0 == y1) */
 	mul0 = id_to_expr(st, premise->args[0]);
 	mul1 = id_to_expr(st, premise->args[1]);
 	ENSURE(is_bv_mul(mul0->code) && mul0->vlen == 2);
@@ -4545,11 +4667,13 @@ POLY_NORM_EQ: { /* Polynomial normalization for relations */
 	sub1 = id_to_expr(st, mul1->args[1]);
 	ENSURE(is_bv_sub(sub0->code) && is_bv_sub(sub1->code));
 
-	/* Concludes (x0 == x1) = (y0 == y1)*/
+	/* Concludes (x0 == x1) = (y0 == y1) */
 	eq0 = build_bool_eq(st, sub0->args[0], sub0->args[1]);
-	CHECK_PTR(eq0);
+	if (IS_ERR(eq0))
+		return PTR_ERR(eq0);
 	eq1 = build_bool_eq(st, sub1->args[0], sub1->args[1]);
-	CHECK_PTR(eq1);
+	if (IS_ERR(eq1))
+		return PTR_ERR(eq1);
 	fact = build_bool_eq_move(st, eq0->id, eq1->id);
 	return set_step_fact(st, fact);
 }
@@ -4561,7 +4685,8 @@ bad_rule:
 #undef DEFINE_JUMP_TABLE
 #undef RULE_TBL
 
-/* Format a bcf_expr as an s-expression into buf. Returns number of bytes
+/*
+ * Format a bcf_expr as an s-expression into buf. Returns number of bytes
  * written (excluding the trailing NUL) or a negative errno on error.
  */
 static int format_sexpr(struct bcf_checker_state *st, struct bcf_expr *root,
@@ -4692,7 +4817,7 @@ static void verbose_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 
 	ret = format_sexpr(st, expr, buf, 1024, depth);
 	if (ret < 0)
-		buf[1023] = 0;
+		return;
 	verbose(st, "%s", buf);
 }
 
@@ -4737,21 +4862,18 @@ static void verbose_step(struct bcf_checker_state *st,
 {
 	const char *rule_name = rule_str(step->rule);
 	struct bcf_expr *fact;
-	char buf[1024];
-
-	if (!(st->level & BPF_LOG_LEVEL2))
-		return;
+	u32 i, j;
 
 	verbose(st, "(#%d %s (", step_id, rule_name);
 
 	/* Print premises */
-	for (u32 i = 0; i < step->premise_cnt; i++) {
-		verbose(st, "@p%d", step->args[i]);
-
+	for (i = 0; i < step->premise_cnt; i++) {
 		if (i >= 3) {
 			verbose(st, "...");
 			break;
 		}
+
+		verbose(st, "@p%d", step->args[i]);
 		if (i + 1 != step->premise_cnt)
 			verbose(st, " ");
 	}
@@ -4759,39 +4881,32 @@ static void verbose_step(struct bcf_checker_state *st,
 	verbose(st, ") (");
 
 	/* Print parameters */
-	for (u32 i = 0, j = step->premise_cnt; i < step->param_cnt; i++, j++) {
+	for (i = 0, j = step->premise_cnt; i < step->param_cnt; i++, j++) {
 		if (i >= 3) {
-			verbose(st, "@t...");
+			verbose(st, "...");
 			break;
 		}
 		if (i != 0) {
 			verbose(st, ", @t%d", step->args[j]);
 			continue;
 		}
-		if (step->rule == (BCF_RULE_CORE | BCF_RULE_REWRITE)) {
-			u32 rid = step->args[j];
-			const char *name = rid ? bcf_rewrites[rid]->name :
-						 "trusted";
-			verbose(st, "%s", name);
-		} else if (step->rule == (BCF_RULE_BV | BCF_RULE_BITBLAST)) {
+
+		/* Print the first arg expr. */
+		if (step->rule == (BCF_RULE_BV | BCF_RULE_BITBLAST))
 			verbose_expr_id(st, step->args[j], 2);
-		} else if (valid_arg_id(st, step->args[j])) {
+		else if (valid_arg_id(st, step->args[j]))
 			verbose_expr_id(st, step->args[j], 1);
-		} else {
+		else
 			verbose(st, "@t%d", step->args[j]);
-		}
 	}
 	verbose(st, ")");
 
 	fact = st->step_state[step_id].fact;
 	if (fact) {
-		int ret;
-
-		ret = format_sexpr(st, fact, buf, 1024, 2);
-		if (ret < 0)
-			buf[1023] = 0;
-		verbose(st, "\n\t\t(%s :conclusion)", buf);
+		verbose(st, " ");
+		verbose_expr(st, fact, 2);
 	}
+
 	verbose(st, ")\n");
 }
 
@@ -4800,7 +4915,7 @@ static int apply_rules(struct bcf_checker_state *st)
 	struct bcf_expr *fact;
 	int err;
 
-	verbose(st, "checking %u steps\n", st->step_cnt);
+	verbose(st, "checking %u proof steps\n", st->step_cnt);
 
 	while (st->cur_step_idx < st->step_size) {
 		struct bcf_proof_step *step = st->steps + st->cur_step_idx;
@@ -4822,9 +4937,14 @@ static int apply_rules(struct bcf_checker_state *st)
 			err = -EFAULT;
 		}
 
-		verbose_step(st, step, st->cur_step);
-		if (err)
+		if (err) {
+			verbose(st, "invalid step: ");
+			verbose_step(st, step, st->cur_step);
 			return err;
+		}
+
+		if (st->level & BPF_LOG_LEVEL2)
+			verbose_step(st, step, st->cur_step);
 
 		st->cur_step_idx += STEP_SZ(step);
 		st->cur_step++;
@@ -4863,7 +4983,7 @@ static int check_hdr(struct bcf_proof_header *hdr, bpfptr_t proof,
 }
 
 int bcf_check_proof(struct bcf_expr *goal_exprs, u32 goal, bpfptr_t proof,
-		    u32 proof_size, bcf_logger_t logger, u32 level,
+		    u32 proof_size, bcf_logger_cb logger, u32 level,
 		    void *private)
 {
 	struct bcf_checker_state *st __free(free_checker) = NULL;

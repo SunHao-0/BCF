@@ -898,7 +898,7 @@ struct bcf_checker_state {
 	u32 cur_step;
 	u32 cur_step_idx;
 
-	bcf_logger_t logger;
+	bcf_logger_cb logger;
 	void *logger_private;
 	u32 level;
 

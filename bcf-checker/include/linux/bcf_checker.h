@@ -9,10 +9,10 @@
 
 #define MAX_BCF_PROOF_SIZE (8 * 1024 * 1024)
 
-typedef void (*bcf_logger_t)(void *private, const char *fmt, va_list args);
+typedef void (*bcf_logger_cb)(void *private, const char *fmt, va_list args);
 
 int bcf_check_proof(struct bcf_expr *goal_exprs, u32 goal, bpfptr_t proof,
-		    u32 proof_size, bcf_logger_t logger, u32 level,
+		    u32 proof_size, bcf_logger_cb logger, u32 level,
 		    void *private);
 
 #endif /* __LINUX_BCF_CHECKER_H__ */

@@ -88,3 +88,5 @@ encoding_test
 compile_commands.json
 *.plist
 .cache
+
+*.profraw
