@@ -5,7 +5,7 @@ Subject: [PATCH RFC 01/17] bpf: Add BCF expr and proof rule definitions
 
 This patch adds include/uapi/linux/bcf.h with:
 
-- Expression arena node format:
+- Expression node format:
   struct bcf_expr { u8 code; u8 vlen; u16 params; u32 args[]; }
   * code encodes (operation(5 bits)| type (3 bits)). The op first reuses
     all the bpf encoding, e.g., BPF_ADD/BPF_SUB, and then, extends it

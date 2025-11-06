@@ -7,6 +7,7 @@ Add `bcf_match_path()` to constrain `bcf_track()` to the recorded path suffix
 from parent states. The function consumes the per-state jump history arrays in
 order and compares each (prev_idx, idx) pair against the verifier’s current
 (prev_insn_idx, insn_idx):
+
 - If the current pair matches the top entry, advance to the next history entry;
   when the last entry is consumed and the last state's last_insn matches, stop
   tracking (PATH_DONE).

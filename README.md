@@ -77,6 +77,8 @@ The following script will install most of the dependencies for the project autom
 ./scripts/install-deps.sh
 ```
 
+Try out with example programs, play with the system following the instruction [here](/examples/README.md).
+
 ## License
 
 This project is licensed under GPL-2.0.

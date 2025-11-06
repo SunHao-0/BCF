@@ -1,9 +1,9 @@
 ## Disk Image
 
-Please download the disk image from the following link which is permanently available:
+Please download the disk image from the following link which is permanently [available](https://zenodo.org/records/17542583):
 
 ```
-TODO
+wget https://zenodo.org/records/17542583/files/imgs.zip?download=1 -O imgs.zip
 ```
 
 The zip file `imgs.zip` contains the disk image (`bookworm.img`), the ssh key (`bookworm.id_rsa`), and the optional prebuilt kernel image (`bzImage`), which can be used to test if qemu boots the kernel correctly.

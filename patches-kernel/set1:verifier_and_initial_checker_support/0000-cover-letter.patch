@@ -49,7 +49,12 @@ refinement:
 
 Only lightweight work is in-kernel: suffix tracking and proof checking. The
 NP-hard reasoning remains in userspace. More details can be found in our
-research paper[5] (also received the best paper award :).
+research paper[5] (received the best paper award :).
+
+It's highly recomended to play with the system directly: (1) apply all
+the patches from our repo[4], (2) download the provided disk image,
+and (3) see how the verifier, proof checker, loader, and solver interact
+with each other via loading the example programs provided[6].
 
 Here is a running example:
 
@@ -277,7 +282,9 @@ kernel complexity low.
 Patch set contents (this set)
 -----------------------------
 
-This set adds the initial proof checker and the verifier refinement workflow:
+This set adds the initial proof checker and the verifier refinement workflow,
+and it targets `bpf-next`:
+
   - Patches 1–2: UAPI expression/proof definitions and checker skeleton.
   - Patch 3: UAPI for condition/proof interaction (`bcf_*` fields and flags).
   - Patch 4: High-level `bcf_refine()` and backtracking logic.

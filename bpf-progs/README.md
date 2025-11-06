@@ -11,3 +11,9 @@ Importanly, different variants from the same source bpf program are semantically
 This directory contains the resulting bpf programs from the above process.
 The `prog_index.json` presents a stuctured index of the programs.
 The `obj_prog_type.json` provides program type information.
+
+To automatically load all progs and test BCF, boot the VM and inside it, run the followling:
+
+```
+> ./scripts/load_prog.py -d bpf-progs
+```
