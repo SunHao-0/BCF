@@ -10,6 +10,8 @@ BCF is a framework that enhances the eBPF verifier's precision via proof-guided 
 - **Delegation**: Delegating refinement reasoning to user space (low kernel complexity)
 - **Proof**: Requiring formal proofs that are validated by an in-kernel proof checker
 
+*NOTE*: This branch is **deprecated**; please refer to the [main](https://github.com/SunHao-0/BCF) branch for the latest implementation.
+
 ## Project Structure
 
 ```
