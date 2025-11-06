@@ -4,11 +4,11 @@ Date: Tue, 30 Sep 2025 12:45:24 +0200
 Subject: [PATCH RFC 05/11] bpf: Add basic core rules
 
 Implement a subset of core rules:
-- DISTINCT_VALUES: v0≠v1 for distinct BV/BOOL literals; emits ¬(v0 = v1)
+- DISTINCT_VALUES: v0!=v1 for distinct BV/BOOL literals; emits not(v0 = v1)
 - REFL: A = A
 - SYMM: from A = B derive B = A (preserves negation context)
 - TRANS: from A = B, B = C, ... derive A = C (n-ary chain)
-- CONG: from (Aᵢ = Bᵢ) derive f(A₀..Aₙ) = f(B₀..Bₙ), with type-checked f
+- CONG: from (A_i = B_i) derive f(A_0..A_n) = f(B_0..B_n), with type-checked f
 - TRUE_INTRO/ELIM, FALSE_INTRO/ELIM: move between A and A = true/false
 
 Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
