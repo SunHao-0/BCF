@@ -363,7 +363,7 @@ index 2a077fc2f77c..aec277a741a3 100644
 +	/* reverse lit to reuse equiv_elim */
 +	lit = lit ? 0 : 1;
 +
-+	return equiv_elim(st, premise, step->args[1]);
++	return equiv_elim(st, premise, lit);
  }
  
  ITE_ELIM: /* (C ? A : B) ⊢ (¬C ∨ A) ∧ (C ∨ B) */

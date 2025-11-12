@@ -3520,7 +3520,7 @@ NOT_XOR_ELIM: /* ¬(A ⊕ B) ⊢ (A ∨ ¬B) ∧ (¬A ∨ B) */
 	/* reverse lit to reuse equiv_elim */
 	lit = lit ? 0 : 1;
 
-	return equiv_elim(st, premise, step->args[1]);
+	return equiv_elim(st, premise, lit);
 }
 
 ITE_ELIM: /* (C ? A : B) ⊢ (¬C ∨ A) ∧ (C ∨ B) */
