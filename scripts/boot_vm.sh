@@ -5,7 +5,7 @@ trap 'fatal "Error on line $LINENO"' ERR
 
 source "$(dirname "$0")/vars.sh"
 
-MEM="${VM_MEM:-256G}"
+MEM="${VM_MEM:-64G}"
 SHARED="$WORK_DIR"
 
 SOCK="$RESULT_DIR/bpf-test.sock"

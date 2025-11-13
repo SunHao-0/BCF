@@ -202,4 +202,5 @@ __marimo__/
 
 output/
 build/
+imgs/imgs.zip
 *.pdf

@@ -23,7 +23,7 @@ git am $(ls ./patches-kernel/set4:/add_bv_proof_rules/*.patch | grep -v '/0000-'
 git am $(ls ./patches-kernel/set5:/bpftool_libbpf_support/*.patch | grep -v '/0000-')
 ```
 
-Build the kernel and download the disk image we provided (which contains the prebuilt `bpftool` and `cvc5` with BCF support). Extract the images in `imgs`.
+Build the kernel and download the disk image we provided (which contains the prebuilt `bpftool` and `cvc5` with BCF support, see this [doc](../imgs/README.md)). Extract the images in `imgs`.
 
 Boot the system with `qemu`, with our script:
 
@@ -41,9 +41,10 @@ Inside the VM, enter the shared dir `bcf`; Try loading the programs from `exampl
 
 ```
 > cd bcf
-> ~/bpftool -P /usr/bin/cvc5 prog load ./examples/unreachable_arsh.bpf.o /sys/fs/bpf
+> # you may ignore the `-P` option, bpftool can automatically detect cvc5 with BCF support.
+> ~/bpftool -P /usr/bin/cvc5 prog load ./examples/unreachable_arsh.bpf.o /sys/fs/bpf/bcf-example
 > # optionally enable the debug option and see the proof checking process
-> ~/bpftool -d -P /usr/bin/cvc5 prog load ./examples/unreachable_arsh.bpf.o /sys/fs/bpf
+> ~/bpftool -d -P /usr/bin/cvc5 prog load ./examples/unreachable_arsh.bpf.o /sys/fs/bpf/bcf-example
 ```
 
 The example loading log is as follows:
