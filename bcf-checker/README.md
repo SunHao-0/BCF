@@ -49,6 +49,8 @@ The checker supports multiple rule categories (mostly compatible with cvc5):
 - **Equality Rules**: Reflexivity, symmetry, transitivity, congruence, etc.
 - **Bit-Vector Rules**: Bit-blasting and other bit-vector operations
 
+**NOTE**: The formal definitions of the supported rules are available [here](https://cvc5.github.io/docs/latest/api/cpp/enums/proofrule.html#_CPPv4N4cvc59ProofRule6ASSUMEE).
+
 The proof file in BCF binary format must contain:
 
 - **Header**: Magic number, expression count, and step count

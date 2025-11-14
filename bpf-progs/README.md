@@ -17,3 +17,11 @@ To automatically load all progs and test BCF, boot the VM and inside it, run the
 ```
 > ./scripts/load_prog.py -d bpf-progs
 ```
+
+It automatically loads all the progs listed in the index. Since our modified bpftool detects the supported cvc5, the load command used by the script is same as the normally used one. To use script for testing load without BCF support, please replace the bpftool pre-installed in the provided disked image, which are under:
+
+```
+/usr/bin/bpftool /use/local/sbin/bpftool
+```
+
+Because loading with modified `bpftool` on normal kernel can lead to `-E2BIG` due to our modification to uapi `union bpf_attr`.
