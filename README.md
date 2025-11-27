@@ -9,6 +9,10 @@
 - **Delegation**: Delegating refinement reasoning to user space (low kernel complexity)
 - **Proof**: Requiring formal proofs that are validated by an in-kernel proof checker
 
+### Upstream Status
+
+- Initial RFC patch [set](./patches-kernel/set1:verifier_and_initial_checker_support): https://lore.kernel.org/bpf/20251106125255.1969938-1-hao.sun@inf.ethz.ch/
+
 ## Project Structure
 
 ```
