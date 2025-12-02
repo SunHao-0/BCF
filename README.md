@@ -13,10 +13,7 @@
 
 - Initial RFC patch [set](./patches-kernel/set1:verifier_and_initial_checker_support): https://lore.kernel.org/bpf/20251106125255.1969938-1-hao.sun@inf.ethz.ch/
 
-<p align="center">
-<video src="scripts/demo.mov" controls width="1100"></video>
-</p>
-
+https://github.com/user-attachments/assets/7356e7ca-71e0-4e5c-b281-468ad7e39e1e
 
 ## Project Structure
 
