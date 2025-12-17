@@ -1,4 +1,4 @@
-From 248c9f718cf12e7ef1f1ae1b5f9eea2b51606954 Mon Sep 17 00:00:00 2001
+From e8d48f040e7a9e5642b371d26e69c13b256330cf Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 19:12:58 +0100
 Subject: [PATCH RFC 12/17] bpf: Track path constraint
@@ -25,10 +25,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 107 insertions(+), 6 deletions(-)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 3f2981db1d40..f1e8e70f9f61 100644
+index f81677789389..2b6c5bb64983 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -20589,6 +20589,70 @@ static int bcf_match_path(struct bpf_verifier_env *env)
+@@ -21003,6 +21003,70 @@ static int bcf_match_path(struct bpf_verifier_env *env)
  	return PATH_MATCH;
  }
  
@@ -99,7 +99,7 @@ index 3f2981db1d40..f1e8e70f9f61 100644
  static int do_check(struct bpf_verifier_env *env)
  {
  	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
-@@ -20656,8 +20720,9 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -21070,8 +21134,9 @@ static int do_check(struct bpf_verifier_env *env)
  
  			if (path == PATH_MISMATCH)
  				goto process_bpf_exit;
@@ -111,7 +111,7 @@ index 3f2981db1d40..f1e8e70f9f61 100644
  		}
  
  		if (signal_pending(current))
-@@ -24023,11 +24088,37 @@ static int bcf_track(struct bpf_verifier_env *env,
+@@ -24505,11 +24570,37 @@ static int bcf_track(struct bpf_verifier_env *env,
  	if (!err && !same_callsites(env->cur_state, st))
  		err = -EFAULT;
  
@@ -153,7 +153,7 @@ index 3f2981db1d40..f1e8e70f9f61 100644
  
  	free_verifier_state(env->cur_state, true);
  	env->cur_state = NULL;
-@@ -24134,6 +24225,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -24616,6 +24707,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  			     refine_state_fn refine_cb, void *ctx)
  {
  	struct bpf_reg_state *regs = st->frame[st->curframe]->regs;
@@ -161,7 +161,7 @@ index 3f2981db1d40..f1e8e70f9f61 100644
  	struct bpf_verifier_state *base;
  	int i, err;
  
-@@ -24168,6 +24260,15 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -24650,6 +24742,15 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	if (!err && refine_cb)
  		err = refine_cb(env, st, ctx);
  

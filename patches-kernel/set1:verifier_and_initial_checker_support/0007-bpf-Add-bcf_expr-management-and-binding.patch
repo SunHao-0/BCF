@@ -1,4 +1,4 @@
-From 8f588c84cdc708e0f60490f2c8f64068798f4de9 Mon Sep 17 00:00:00 2001
+From e15a1b6820479d47e1d036810941acad50777538 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 14:43:04 +0100
 Subject: [PATCH RFC 07/17] bpf: Add bcf_expr management and binding
@@ -30,7 +30,7 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 280 insertions(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 3ecee219605f..7b6d509c773a 100644
+index 81d36848eb34..c45ed8e24bf1 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -4,6 +4,7 @@
@@ -85,11 +85,11 @@ index 3ecee219605f..7b6d509c773a 100644
 +static int bcf_build_expr(struct bpf_verifier_env *env, u8 code, u16 params,
 +			  u32 vlen, ...)
 +{
-+	DEFINE_RAW_FLEX(struct bcf_expr, expr, args, U8_MAX);
++	DEFINE_RAW_FLEX(struct bcf_expr, expr, args, 32);
 +	va_list args;
 +	u32 i;
 +
-+	if (vlen > U8_MAX)
++	if (vlen > 32)
 +		return -EFAULT;
 +
 +	expr->code = code;
@@ -334,7 +334,7 @@ index 3ecee219605f..7b6d509c773a 100644
  	__mark_reg_unbounded(reg);
  }
  
-@@ -3790,6 +4063,12 @@ static int __check_reg_arg(struct bpf_verifier_env *env, struct bpf_reg_state *r
+@@ -3821,6 +4094,12 @@ static int __check_reg_arg(struct bpf_verifier_env *env, struct bpf_reg_state *r
  		if (rw64)
  			mark_insn_zext(env, reg);
  
@@ -347,10 +347,10 @@ index 3ecee219605f..7b6d509c773a 100644
  		return 0;
  	} else {
  		/* check whether register used as dest operand can be written to */
-@@ -25244,6 +25523,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
- 	kvfree(env->cfg.insn_postorder);
+@@ -25730,6 +26009,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	kvfree(env->scc_info);
  	kvfree(env->succ);
+ 	kvfree(env->gotox_tmp_buf);
 +	kvfree(env->bcf.exprs);
  	kvfree(env);
  	return ret;

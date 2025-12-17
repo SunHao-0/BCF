@@ -1,7 +1,10 @@
-From 918894bb56ee50553b2b317ca748bcb647c1e1db Mon Sep 17 00:00:00 2001
+From fd24c04dc619dfc8a6eabbb7fac167427b76f91e Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 10:06:13 +0100
 Subject: [PATCH RFC 06/17] bpf: Add bcf_match_path() to follow the path suffix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Add `bcf_match_path()` to constrain `bcf_track()` to the recorded path suffix
 from parent states. The function consumes the per-state jump history arrays in
@@ -25,10 +28,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 66 insertions(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 725ea503c1c7..3ecee219605f 100644
+index 77e0e2ee1321..81d36848eb34 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -20082,6 +20082,63 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
+@@ -20496,6 +20496,63 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
  	return 0;
  }
  
@@ -92,7 +95,7 @@ index 725ea503c1c7..3ecee219605f 100644
  static int do_check(struct bpf_verifier_env *env)
  {
  	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
-@@ -20144,6 +20201,15 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -20558,6 +20615,15 @@ static int do_check(struct bpf_verifier_env *env)
  				return err;
  		}
  

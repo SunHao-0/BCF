@@ -1,4 +1,4 @@
-From 0c3b395cfc797222868cd510f43e5df6866a079a Mon Sep 17 00:00:00 2001
+From 6f9f8eed24b1ee7c21fb0cd574f397eec4f99b5d Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 27 Oct 2025 11:06:44 +0100
 Subject: [PATCH RFC 03/17] bpf: Add UAPI fields for BCF proof interaction
@@ -25,10 +25,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  3 files changed, 64 insertions(+), 1 deletion(-)
 
 diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
-index 1d73f165394d..fbe99fbc39ab 100644
+index 84ced3ed2d21..296ccc10308c 100644
 --- a/include/uapi/linux/bpf.h
 +++ b/include/uapi/linux/bpf.h
-@@ -1484,6 +1484,15 @@ enum {
+@@ -1496,6 +1496,15 @@ enum {
  	BPF_STREAM_STDERR = 2,
  };
  
@@ -44,7 +44,7 @@ index 1d73f165394d..fbe99fbc39ab 100644
  union bpf_attr {
  	struct { /* anonymous struct used by BPF_MAP_CREATE command */
  		__u32	map_type;	/* one of enum bpf_map_type */
-@@ -1624,6 +1633,18 @@ union bpf_attr {
+@@ -1636,6 +1645,18 @@ union bpf_attr {
  		 * verification.
  		 */
  		__s32		keyring_id;
@@ -64,10 +64,10 @@ index 1d73f165394d..fbe99fbc39ab 100644
  
  	struct { /* anonymous struct used by BPF_OBJ_* commands */
 diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
-index 8a129746bd6c..5968b74ed7b2 100644
+index a4d38272d8bc..d9a14e2b5f2c 100644
 --- a/kernel/bpf/syscall.c
 +++ b/kernel/bpf/syscall.c
-@@ -2854,7 +2854,7 @@ static int bpf_prog_verify_signature(struct bpf_prog *prog, union bpf_attr *attr
+@@ -2865,7 +2865,7 @@ static int bpf_prog_mark_insn_arrays_ready(struct bpf_prog *prog)
  }
  
  /* last field in 'union bpf_attr' used by this command */
@@ -76,7 +76,7 @@ index 8a129746bd6c..5968b74ed7b2 100644
  
  static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
  {
-@@ -2869,6 +2869,24 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+@@ -2880,6 +2880,24 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
  	if (CHECK_ATTR(BPF_PROG_LOAD))
  		return -EINVAL;
  
@@ -101,7 +101,7 @@ index 8a129746bd6c..5968b74ed7b2 100644
  	if (attr->prog_flags & ~(BPF_F_STRICT_ALIGNMENT |
  				 BPF_F_ANY_ALIGNMENT |
  				 BPF_F_TEST_STATE_FREQ |
-@@ -2901,6 +2919,9 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+@@ -2912,6 +2930,9 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
  	bpf_cap = bpf_token_capable(token, CAP_BPF);
  	err = -EPERM;
  
@@ -112,10 +112,10 @@ index 8a129746bd6c..5968b74ed7b2 100644
  	    (attr->prog_flags & BPF_F_ANY_ALIGNMENT) &&
  	    !bpf_cap)
 diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
-index 1d73f165394d..fbe99fbc39ab 100644
+index 6b92b0847ec2..9046bbb87873 100644
 --- a/tools/include/uapi/linux/bpf.h
 +++ b/tools/include/uapi/linux/bpf.h
-@@ -1484,6 +1484,15 @@ enum {
+@@ -1496,6 +1496,15 @@ enum {
  	BPF_STREAM_STDERR = 2,
  };
  
@@ -131,7 +131,7 @@ index 1d73f165394d..fbe99fbc39ab 100644
  union bpf_attr {
  	struct { /* anonymous struct used by BPF_MAP_CREATE command */
  		__u32	map_type;	/* one of enum bpf_map_type */
-@@ -1624,6 +1633,18 @@ union bpf_attr {
+@@ -1636,6 +1645,18 @@ union bpf_attr {
  		 * verification.
  		 */
  		__s32		keyring_id;

@@ -1,7 +1,10 @@
-From a9065dec5447405885ffb520ca4d34fb51b602d3 Mon Sep 17 00:00:00 2001
+From c17138b8bab3b8a5fc72975e45446eeaa31f37b1 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 27 Oct 2025 18:15:03 +0100
 Subject: [PATCH RFC 05/17] bpf: Add top-level workflow of bcf_track()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Add the top-level `bcf_track()` that symbolically tracks the path suffix
 identified by `backtrack_states()` and records per-register expressions and
@@ -17,7 +20,7 @@ path conditions.
   jump history/push, speculative sanitization, visited-state pruning).
 
 - Implement an env save/restore (`env_backup` + `swap_env_states`) so the
-  tracker can reuse verifier execution without polluting global state. 
+  tracker can reuse verifier execution without polluting global state.
 
 - After tracking, copy collected `bcf_expr` bindings from the tracked state
   into the original state’s regs. The path condition is built later,
@@ -33,7 +36,7 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  3 files changed, 154 insertions(+), 5 deletions(-)
 
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
-index 090430168523..b430702784e2 100644
+index 4ff26923bacb..c0981ed055d5 100644
 --- a/include/linux/bpf_verifier.h
 +++ b/include/linux/bpf_verifier.h
 @@ -204,6 +204,7 @@ struct bpf_reg_state {
@@ -44,7 +47,7 @@ index 090430168523..b430702784e2 100644
  };
  
  enum bpf_stack_slot_type {
-@@ -742,6 +743,14 @@ struct bcf_refine_state {
+@@ -744,6 +745,14 @@ struct bcf_refine_state {
  	u32 cur_jmp_entry;
  
  	bool available; /* if bcf_buf is provided. */
@@ -60,7 +63,7 @@ index 090430168523..b430702784e2 100644
  
  /* single container for all structs
 diff --git a/kernel/bpf/liveness.c b/kernel/bpf/liveness.c
-index bffb495bc933..4e44c3f0404c 100644
+index 60db5d655495..fd0bf8113644 100644
 --- a/kernel/bpf/liveness.c
 +++ b/kernel/bpf/liveness.c
 @@ -276,6 +276,8 @@ static struct per_frame_masks *alloc_frame_masks(struct bpf_verifier_env *env,
@@ -110,7 +113,7 @@ index bffb495bc933..4e44c3f0404c 100644
  	return commit_stack_write_marks(env, env->liveness->cur_instance);
  }
  
-@@ -675,6 +687,9 @@ int bpf_update_live_stack(struct bpf_verifier_env *env)
+@@ -679,6 +691,9 @@ int bpf_update_live_stack(struct bpf_verifier_env *env)
  	struct func_instance *instance;
  	int err, frame;
  
@@ -121,10 +124,10 @@ index bffb495bc933..4e44c3f0404c 100644
  	for (frame = env->cur_state->curframe; frame >= 0; --frame) {
  		instance = lookup_instance(env, env->cur_state, frame);
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 7125f7434e6f..725ea503c1c7 100644
+index a52559833752..77e0e2ee1321 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -3924,6 +3924,9 @@ static int push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_st
+@@ -3955,6 +3955,9 @@ static int push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_st
  	struct bpf_jmp_history_entry *p;
  	size_t alloc_size;
  
@@ -134,7 +137,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  	/* combine instruction flags if we already recorded this instruction */
  	if (env->cur_hist_ent) {
  		/* atomic instructions push insn_flags twice, for READ and
-@@ -4735,7 +4738,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env,
+@@ -4771,7 +4774,7 @@ static int __mark_chain_precision(struct bpf_verifier_env *env,
  	struct bpf_reg_state *reg;
  	int i, fr, err;
  
@@ -143,7 +146,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  		return 0;
  
  	changed = changed ?: &tmp;
-@@ -8878,6 +8881,9 @@ static struct bpf_verifier_state *find_prev_entry(struct bpf_verifier_env *env,
+@@ -8940,6 +8943,9 @@ static struct bpf_verifier_state *find_prev_entry(struct bpf_verifier_env *env,
  	struct bpf_verifier_state *st;
  	struct list_head *pos, *head;
  
@@ -153,7 +156,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  	/* Explored states are pushed in stack order, most recent states come first */
  	head = explored_state(env, insn_idx);
  	list_for_each(pos, head) {
-@@ -14302,7 +14308,8 @@ static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
+@@ -14389,7 +14395,8 @@ static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
  {
  	return env->bypass_spec_v1 ||
  		BPF_SRC(insn->code) == BPF_K ||
@@ -163,7 +166,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  }
  
  static int update_alu_sanitation_state(struct bpf_insn_aux_data *aux,
-@@ -14350,6 +14357,9 @@ static int sanitize_speculative_path(struct bpf_verifier_env *env,
+@@ -14437,6 +14444,9 @@ static int sanitize_speculative_path(struct bpf_verifier_env *env,
  	struct bpf_verifier_state *branch;
  	struct bpf_reg_state *regs;
  
@@ -173,7 +176,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  	branch = push_stack(env, next_idx, curr_idx, true);
  	if (!IS_ERR(branch) && insn) {
  		regs = branch->frame[branch->curframe]->regs;
-@@ -19415,6 +19425,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+@@ -19730,6 +19740,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
  	int n, err, states_cnt = 0;
  	struct list_head *pos, *tmp, *head;
  
@@ -183,7 +186,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  	force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx) ||
  			  /* Avoid accumulating infinitely long jmp history */
  			  cur->jmp_history_cnt > 40;
-@@ -20076,7 +20089,7 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -20490,7 +20503,7 @@ static int do_check(struct bpf_verifier_env *env)
  	struct bpf_insn *insns = env->prog->insnsi;
  	int insn_cnt = env->prog->len;
  	bool do_print_state = false;
@@ -192,7 +195,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  
  	for (;;) {
  		struct bpf_insn *insn;
-@@ -20178,6 +20191,14 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -20592,6 +20605,14 @@ static int do_check(struct bpf_verifier_env *env)
  		if (err)
  			return err;
  		err = do_check_insn(env, &do_print_state);
@@ -207,7 +210,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  		if (err >= 0 || error_recoverable_with_nospec(err)) {
  			marks_err = bpf_commit_stack_write_marks(env);
  			if (marks_err)
-@@ -23275,6 +23296,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23756,6 +23777,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	struct bpf_reg_state *regs;
  	int ret, i;
  
@@ -215,7 +218,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  	env->prev_linfo = NULL;
  	env->pass_cnt++;
  
-@@ -23388,6 +23410,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23870,6 +23892,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	}
  
  	ret = do_check(env);
@@ -226,7 +229,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  out:
  	if (!ret && pop_log)
  		bpf_vlog_reset(&env->log, 0);
-@@ -23395,11 +23421,104 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23877,11 +23903,104 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	return ret;
  }
  
@@ -332,7 +335,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  }
  
  /*
-@@ -23507,6 +23626,12 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -23989,6 +24108,12 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	/* BCF requested multiple times in an error path. */
  	if (bcf_requested(env))
  		return -EFAULT;
@@ -345,7 +348,7 @@ index 7125f7434e6f..725ea503c1c7 100644
  
  	if (!reg_masks) {
  		for (i = 0; i < BPF_REG_FP; i++) {
-@@ -23527,7 +23652,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -24009,7 +24134,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	if (!err && refine_cb)
  		err = refine_cb(env, st, ctx);
  

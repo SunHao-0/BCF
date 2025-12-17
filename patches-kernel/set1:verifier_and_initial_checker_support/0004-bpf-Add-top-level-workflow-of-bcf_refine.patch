@@ -1,4 +1,4 @@
-From a9e0c557f60b498fd729bc8b5ede85cc58afb55e Mon Sep 17 00:00:00 2001
+From a720f29c7e37d93a55c1748ce2e67f5d93b1ffc7 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 27 Oct 2025 15:58:22 +0100
 Subject: [PATCH RFC 04/17] bpf: Add top-level workflow of bcf_refine()
@@ -30,10 +30,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  3 files changed, 170 insertions(+)
 
 diff --git a/include/linux/bpf.h b/include/linux/bpf.h
-index a47d67db3be5..690b0b2b84ba 100644
+index bb3847caeae1..b353207833d2 100644
 --- a/include/linux/bpf.h
 +++ b/include/linux/bpf.h
-@@ -1656,6 +1656,7 @@ struct bpf_prog_aux {
+@@ -1672,6 +1672,7 @@ struct bpf_prog_aux {
  	bool changes_pkt_data;
  	bool might_sleep;
  	bool kprobe_write_ctx;
@@ -42,10 +42,10 @@ index a47d67db3be5..690b0b2b84ba 100644
  	struct mutex ext_mutex; /* mutex for is_extended and prog_array_member_cnt */
  	struct bpf_arena *arena;
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
-index c6eb68b6389c..090430168523 100644
+index 130bcbd66f60..4ff26923bacb 100644
 --- a/include/linux/bpf_verifier.h
 +++ b/include/linux/bpf_verifier.h
-@@ -732,6 +732,18 @@ struct bpf_scc_info {
+@@ -734,6 +734,18 @@ struct bpf_scc_info {
  
  struct bpf_liveness;
  
@@ -64,16 +64,16 @@ index c6eb68b6389c..090430168523 100644
  /* single container for all structs
   * one verifier_env per bpf_check() call
   */
-@@ -838,6 +850,7 @@ struct bpf_verifier_env {
- 	struct bpf_scc_info **scc_info;
+@@ -843,6 +855,7 @@ struct bpf_verifier_env {
  	u32 scc_cnt;
  	struct bpf_iarray *succ;
+ 	struct bpf_iarray *gotox_tmp_buf;
 +	struct bcf_refine_state bcf;
  };
  
  static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index e4928846e763..7125f7434e6f 100644
+index d6b8a77fbe3b..a52559833752 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -608,6 +608,23 @@ static bool is_atomic_load_insn(const struct bpf_insn *insn)
@@ -100,7 +100,7 @@ index e4928846e763..7125f7434e6f 100644
  static int __get_spi(s32 off)
  {
  	return (-off - 1) / BPF_REG_SIZE;
-@@ -23378,6 +23395,145 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23860,6 +23877,145 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	return ret;
  }
  
@@ -212,7 +212,7 @@ index e4928846e763..7125f7434e6f 100644
 +	int i, err;
 +
 +	if (!env->bcf.available || st->speculative)
-+		return 0;
++		return -EOPNOTSUPP;
 +	/* BCF requested multiple times in an error path. */
 +	if (bcf_requested(env))
 +		return -EFAULT;
@@ -240,7 +240,7 @@ index e4928846e763..7125f7434e6f 100644
 +		mark_bcf_requested(env);
 +
 +	kfree(env->bcf.parents);
-+	return err ?: 1;
++	return err;
 +}
 +
  /* Lazily verify all global functions based on their BTF, if they are called

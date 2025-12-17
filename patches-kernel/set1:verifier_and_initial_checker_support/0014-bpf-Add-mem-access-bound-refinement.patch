@@ -1,9 +1,12 @@
-From 969e5ab390f0d1a42b20a12bb9fa06e57e2ba912 Mon Sep 17 00:00:00 2001
+From afe89d40599da2731e1e78120f785a336c48c44f Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Fri, 31 Oct 2025 09:53:23 +0100
 Subject: [PATCH RFC 14/17] bpf: Add mem access bound refinement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Implement on-demand refinement for memory access bound checks and add 
+Implement on-demand refinement for memory access bound checks and add
 fallback to path-unreachable when refinement is not applicable.
 
 When common bound checks (stack/map/packet) fail (min/max outside bounds) or
@@ -38,10 +41,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  2 files changed, 255 insertions(+), 13 deletions(-)
 
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
-index 9b91353a86d7..05e8e3feea30 100644
+index 7a291bcb2f03..0120761d3f19 100644
 --- a/include/linux/bpf_verifier.h
 +++ b/include/linux/bpf_verifier.h
-@@ -752,6 +752,12 @@ struct bcf_refine_state {
+@@ -754,6 +754,12 @@ struct bcf_refine_state {
  	u32 br_cond_cnt;
  	int path_cond; /* conjunction of br_conds */
  	int refine_cond; /* refinement condition */
@@ -55,7 +58,7 @@ index 9b91353a86d7..05e8e3feea30 100644
  
  /* single container for all structs
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index ec0e736f39c5..22a068bfd0f2 100644
+index e3df64361763..95f8ab8939d2 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -621,6 +621,16 @@ static bool bcf_requested(const struct bpf_verifier_env *env)
@@ -75,7 +78,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  static void mark_bcf_requested(struct bpf_verifier_env *env)
  {
  	env->prog->aux->bcf_requested = true;
-@@ -4088,8 +4098,12 @@ static int check_reg_arg(struct bpf_verifier_env *env, u32 regno,
+@@ -4119,8 +4129,12 @@ static int check_reg_arg(struct bpf_verifier_env *env, u32 regno,
  {
  	struct bpf_verifier_state *vstate = env->cur_state;
  	struct bpf_func_state *state = vstate->frame[vstate->curframe];
@@ -89,7 +92,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  }
  
  static int insn_stack_access_flags(int frameno, int spi)
-@@ -5256,6 +5270,163 @@ static bool __is_pointer_value(bool allow_ptr_leaks,
+@@ -5292,6 +5306,163 @@ static bool __is_pointer_value(bool allow_ptr_leaks,
  	return reg->type != SCALAR_VALUE;
  }
  
@@ -253,7 +256,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  static void assign_scalar_id_before_mov(struct bpf_verifier_env *env,
  					struct bpf_reg_state *src_reg)
  {
-@@ -6016,6 +6187,7 @@ static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
+@@ -6052,6 +6223,7 @@ static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
  	if (err) {
  		verbose(env, "R%d min value is outside of the allowed memory range\n",
  			regno);
@@ -261,7 +264,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  		return err;
  	}
  
-@@ -6033,6 +6205,7 @@ static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
+@@ -6069,6 +6241,7 @@ static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
  	if (err) {
  		verbose(env, "R%d max value is outside of the allowed memory range\n",
  			regno);
@@ -269,7 +272,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  		return err;
  	}
  
-@@ -7680,6 +7853,15 @@ static int check_ptr_to_map_access(struct bpf_verifier_env *env,
+@@ -7730,6 +7903,15 @@ static int check_ptr_to_map_access(struct bpf_verifier_env *env,
  	return 0;
  }
  
@@ -285,7 +288,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  /* Check that the stack access at the given offset is within bounds. The
   * maximum valid offset is -1.
   *
-@@ -7693,11 +7875,7 @@ static int check_stack_slot_within_bounds(struct bpf_verifier_env *env,
+@@ -7743,11 +7925,7 @@ static int check_stack_slot_within_bounds(struct bpf_verifier_env *env,
  {
  	int min_valid_off;
  
@@ -298,7 +301,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  	if (off < min_valid_off || off > -1)
  		return -EACCES;
  	return 0;
-@@ -7759,6 +7937,11 @@ static int check_stack_access_within_bounds(
+@@ -7809,6 +7987,11 @@ static int check_stack_access_within_bounds(
  			verbose(env, "invalid variable-offset%s stack R%d var_off=%s off=%d size=%d\n",
  				err_extra, regno, tn_buf, off, access_size);
  		}
@@ -310,7 +313,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  		return err;
  	}
  
-@@ -7785,7 +7968,7 @@ static bool get_func_retval_range(struct bpf_prog *prog,
+@@ -7835,7 +8018,7 @@ static bool get_func_retval_range(struct bpf_prog *prog,
   * if t==write && value_regno==-1, some unknown value is stored into memory
   * if t==read && value_regno==-1, don't care what we read from memory
   */
@@ -319,7 +322,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  			    int off, int bpf_size, enum bpf_access_type t,
  			    int value_regno, bool strict_alignment_once, bool is_ldsx)
  {
-@@ -8045,6 +8228,20 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
+@@ -8107,6 +8290,20 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
  	return err;
  }
  
@@ -340,7 +343,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type type,
  			     bool allow_trust_mismatch);
  
-@@ -8427,7 +8624,7 @@ static int check_stack_range_initialized(
+@@ -8489,7 +8686,7 @@ static int check_stack_range_initialized(
  	return 0;
  }
  
@@ -349,7 +352,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  				   int access_size, enum bpf_access_type access_type,
  				   bool zero_size_allowed,
  				   struct bpf_call_arg_meta *meta)
-@@ -8518,6 +8715,21 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
+@@ -8580,6 +8777,21 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
  	}
  }
  
@@ -371,7 +374,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  /* verify arguments to helpers or kfuncs consisting of a pointer and an access
   * size.
   *
-@@ -8530,6 +8742,7 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
+@@ -8592,6 +8804,7 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
  			      bool zero_size_allowed,
  			      struct bpf_call_arg_meta *meta)
  {
@@ -379,7 +382,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  	int err;
  
  	/* This is used to refine r0 return value bounds for helpers
-@@ -8553,22 +8766,40 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
+@@ -8615,22 +8828,40 @@ static int check_mem_size_reg(struct bpf_verifier_env *env,
  	if (reg->smin_value < 0) {
  		verbose(env, "R%d min value is negative, either use unsigned or 'var &= const'\n",
  			regno);
@@ -421,7 +424,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  	if (!err)
  		err = mark_chain_precision(env, regno);
  	return err;
-@@ -16367,8 +16598,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+@@ -16450,8 +16681,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
  		/* check dest operand */
  		err = check_reg_arg(env, insn->dst_reg, DST_OP_NO_MARK);
  		err = err ?: adjust_reg_min_max_vals(env, insn);
@@ -434,7 +437,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  	}
  
  	return reg_bounds_sanity_check(env, &regs[insn->dst_reg], "alu");
-@@ -20474,6 +20708,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
+@@ -20879,6 +21113,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
  			} else {
  				err = check_helper_call(env, insn, &env->insn_idx);
  			}
@@ -443,7 +446,7 @@ index ec0e736f39c5..22a068bfd0f2 100644
  			if (err)
  				return err;
  
-@@ -24224,9 +24460,9 @@ backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
+@@ -24706,9 +24942,9 @@ backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
  	return base;
  }
  

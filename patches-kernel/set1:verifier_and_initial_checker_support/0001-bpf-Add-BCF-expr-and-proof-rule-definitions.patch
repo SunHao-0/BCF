@@ -1,4 +1,4 @@
-From ee2bc31448d2dc912ad9f71d44947dc148382889 Mon Sep 17 00:00:00 2001
+From 740e776c57133d52bb2fb8bea89300707a6d20a4 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 29 Sep 2025 17:12:19 +0200
 Subject: [PATCH RFC 01/17] bpf: Add BCF expr and proof rule definitions
@@ -232,6 +232,6 @@ index 000000000000..459ad3ed5c6f
 +#undef BCF_RULE_ENUM_VARIANT
 +
 +#endif /* _UAPI__LINUX_BCF_H__ */
---
+-- 
 2.34.1
 

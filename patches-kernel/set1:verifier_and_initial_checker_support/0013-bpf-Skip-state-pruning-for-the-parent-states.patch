@@ -1,4 +1,4 @@
-From 47734ac101fc7ebd474213a558f58692f5089369 Mon Sep 17 00:00:00 2001
+From 33d981efca596912641023c685634b5e53445802 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Thu, 30 Oct 2025 14:50:36 +0100
 Subject: [PATCH RFC 13/17] bpf: Skip state pruning for the parent states
@@ -22,7 +22,7 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  2 files changed, 19 insertions(+)
 
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
-index b430702784e2..9b91353a86d7 100644
+index c0981ed055d5..7a291bcb2f03 100644
 --- a/include/linux/bpf_verifier.h
 +++ b/include/linux/bpf_verifier.h
 @@ -422,6 +422,7 @@ struct bpf_verifier_state {
@@ -34,10 +34,10 @@ index b430702784e2..9b91353a86d7 100644
  	/* first and last insn idx of this verifier state */
  	u32 first_insn_idx;
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index f1e8e70f9f61..ec0e736f39c5 100644
+index 2b6c5bb64983..e3df64361763 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -19904,6 +19904,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+@@ -20219,6 +20219,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
  		states_cnt++;
  		if (sl->state.insn_idx != insn_idx)
  			continue;
@@ -46,7 +46,7 @@ index f1e8e70f9f61..ec0e736f39c5 100644
  
  		if (sl->state.branches) {
  			struct bpf_func_state *frame = sl->state.frame[sl->state.curframe];
-@@ -20216,6 +20218,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+@@ -20531,6 +20533,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
  		return err;
  	}
  
@@ -55,7 +55,7 @@ index f1e8e70f9f61..ec0e736f39c5 100644
  	cur->parent = new;
  	cur->first_insn_idx = insn_idx;
  	cur->dfs_depth = new->dfs_depth + 1;
-@@ -24272,6 +24276,20 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -24754,6 +24758,20 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	if (!err && (env->bcf.refine_cond >= 0 || env->bcf.path_cond >= 0))
  		mark_bcf_requested(env);
  
@@ -74,7 +74,7 @@ index f1e8e70f9f61..ec0e736f39c5 100644
 +		bcf->parents[i]->children_unsafe = true;
 +
  	kfree(env->bcf.parents);
- 	return err ?: 1;
+ 	return err;
  }
 -- 
 2.34.1

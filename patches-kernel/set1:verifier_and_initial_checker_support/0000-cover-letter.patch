@@ -1,6 +1,6 @@
-From d8f7abdd2dd701d2b886c3b738389887e772eb9c Mon Sep 17 00:00:00 2001
+From aa37a037d345a2e64824f04d68c61633a5c4f0a1 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
-Date: Wed, 5 Nov 2025 12:22:11 +0100
+Date: Wed, 17 Dec 2025 10:54:42 +0100
 Subject: [PATCH RFC 00/17] bpf: Introduce proof-based verifier enhancement
 
 This patch set (and three follow-up sets) introduces a proof-based, on-demand
@@ -299,7 +299,7 @@ and it targets `bpf-next`:
 References
 ----------
 
-[1] Benchmark programs: https://github.com/SunHao-0/BCF/tree/main/bcf-progs
+[1] Benchmark programs: https://github.com/SunHao-0/BCF/tree/main/bpf-progs
 [2] Benchmark proofs: https://github.com/SunHao-0/BCF/tree/main/bcf-proofs
 [3] Early prototype: https://github.com/SunHao-0/BCF/tree/artifact-evaluation
 [4] Current full implementation: https://github.com/SunHao-0/BCF

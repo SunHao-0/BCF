@@ -1,9 +1,9 @@
-From 5323881f56390321123e50da13e34423f4a9ea24 Mon Sep 17 00:00:00 2001
+From c0f1b3889448f1fa03fbff3d7cc4fed33547fd14 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 16:12:30 +0100
 Subject: [PATCH RFC 08/17] bpf: Track mov and signed extension
 
-Add `bcf_mov()` helpers to model MOV/cast operations in `bcf_track()` and add 
+Add `bcf_mov()` helpers to model MOV/cast operations in `bcf_track()` and add
 calls into ALU processing paths. The helpers extract the source to the target
 width and apply zero/sign extension to the final width as needed.
 
@@ -22,10 +22,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 66 insertions(+), 3 deletions(-)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 7b6d509c773a..4491d665cc49 100644
+index c45ed8e24bf1..cbced029ab11 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -15959,6 +15959,57 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
+@@ -16042,6 +16042,57 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
  	return 0;
  }
  
@@ -83,7 +83,7 @@ index 7b6d509c773a..4491d665cc49 100644
  /* check validity of 32-bit and 64-bit arithmetic operations */
  static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
  {
-@@ -16084,8 +16135,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+@@ -16167,8 +16218,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
  						if (no_sext)
  							assign_scalar_id_before_mov(env, src_reg);
  						copy_register_state(dst_reg, src_reg);
@@ -97,7 +97,7 @@ index 7b6d509c773a..4491d665cc49 100644
  						coerce_reg_to_size_sx(dst_reg, insn->off >> 3);
  						dst_reg->subreg_def = DEF_NOT_SUBREG;
  					} else {
-@@ -16110,8 +16165,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+@@ -16193,8 +16248,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
  						 * range otherwise dst_reg min/max could be incorrectly
  						 * propagated into src_reg by sync_linked_regs()
  						 */
@@ -111,7 +111,7 @@ index 7b6d509c773a..4491d665cc49 100644
  						dst_reg->subreg_def = env->insn_idx + 1;
  					} else {
  						/* case: W1 = (s8, s16)W2 */
-@@ -16120,8 +16179,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+@@ -16203,8 +16262,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
  						if (no_sext)
  							assign_scalar_id_before_mov(env, src_reg);
  						copy_register_state(dst_reg, src_reg);

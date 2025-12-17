@@ -1,4 +1,4 @@
-From 899fba3f93e4a56ea7cdca3186055e0ab43421a1 Mon Sep 17 00:00:00 2001
+From 32e643d6b8432e701f18b72bc03838c99126e8c6 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 18:44:48 +0100
 Subject: [PATCH RFC 11/17] bpf: Track stack spill/fill in bcf_track()
@@ -23,10 +23,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 16 insertions(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index df6d16a1c6f6..3f2981db1d40 100644
+index f59b98f4ee33..f81677789389 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -5286,6 +5286,10 @@ static void copy_register_state(struct bpf_reg_state *dst, const struct bpf_reg_
+@@ -5322,6 +5322,10 @@ static void copy_register_state(struct bpf_reg_state *dst, const struct bpf_reg_
  	*dst = *src;
  }
  
@@ -37,7 +37,7 @@ index df6d16a1c6f6..3f2981db1d40 100644
  static void save_register_state(struct bpf_verifier_env *env,
  				struct bpf_func_state *state,
  				int spi, struct bpf_reg_state *reg,
-@@ -5295,6 +5299,11 @@ static void save_register_state(struct bpf_verifier_env *env,
+@@ -5331,6 +5335,11 @@ static void save_register_state(struct bpf_verifier_env *env,
  
  	copy_register_state(&state->stack[spi].spilled_ptr, reg);
  
@@ -49,7 +49,7 @@ index df6d16a1c6f6..3f2981db1d40 100644
  	for (i = BPF_REG_SIZE; i > BPF_REG_SIZE - size; i--)
  		state->stack[spi].slot_type[i - 1] = STACK_SPILL;
  
-@@ -5437,6 +5446,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
+@@ -5473,6 +5482,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
  
  		/* regular write of data into stack destroys any spilled ptr */
  		state->stack[spi].spilled_ptr.type = NOT_INIT;
@@ -57,7 +57,7 @@ index df6d16a1c6f6..3f2981db1d40 100644
  		/* Mark slots as STACK_MISC if they belonged to spilled ptr/dynptr/iter. */
  		if (is_stack_slot_special(&state->stack[spi]))
  			for (i = 0; i < BPF_REG_SIZE; i++)
-@@ -5566,6 +5576,7 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
+@@ -5602,6 +5612,7 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
  
  		/* Erase all other spilled pointers. */
  		state->stack[spi].spilled_ptr.type = NOT_INIT;
@@ -65,7 +65,7 @@ index df6d16a1c6f6..3f2981db1d40 100644
  
  		/* Update the slot type. */
  		new_type = STACK_MISC;
-@@ -8025,6 +8036,11 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
+@@ -8087,6 +8098,11 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
  			coerce_reg_to_size(&regs[value_regno], size);
  		else
  			coerce_reg_to_size_sx(&regs[value_regno], size);

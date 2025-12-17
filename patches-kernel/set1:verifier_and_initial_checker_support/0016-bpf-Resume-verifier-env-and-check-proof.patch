@@ -1,7 +1,10 @@
-From abf16ab52584e7538d64f59bb544e1b386d7e41e Mon Sep 17 00:00:00 2001
+From edf4c6bfc2d63613b75bb0f4c0f63e33dd56201d Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 3 Nov 2025 12:20:09 +0100
 Subject: [PATCH RFC 16/17] bpf: Resume verifier env and check proof
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Add the resume path for proof-based refinement and integrate proof check
 into the verifier flow.
@@ -31,10 +34,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  3 files changed, 94 insertions(+), 8 deletions(-)
 
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
-index 67eac7b2778e..219e211195fc 100644
+index e46acf4e113a..d9b5b152c5e1 100644
 --- a/include/linux/bpf_verifier.h
 +++ b/include/linux/bpf_verifier.h
-@@ -745,6 +745,7 @@ struct bcf_refine_state {
+@@ -747,6 +747,7 @@ struct bcf_refine_state {
  
  	bool available; /* if bcf_buf is provided. */
  	bool tracking; /* In bcf_track(). */
@@ -42,7 +45,7 @@ index 67eac7b2778e..219e211195fc 100644
  	struct bcf_expr *exprs;
  	u32 expr_size;
  	u32 expr_cnt;
-@@ -758,6 +759,7 @@ struct bcf_refine_state {
+@@ -760,6 +761,7 @@ struct bcf_refine_state {
  	int checked_off;
  	int checked_sz;
  	bool access_checked;
@@ -51,10 +54,10 @@ index 67eac7b2778e..219e211195fc 100644
  
  /* single container for all structs
 diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
-index 97914494bd18..53ed868aa20c 100644
+index 91f160566310..f5529fe49735 100644
 --- a/kernel/bpf/syscall.c
 +++ b/kernel/bpf/syscall.c
-@@ -2881,7 +2881,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+@@ -2892,7 +2892,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
  			return -EINVAL;
  		/* The resumed analysis must only uses the old, first attr. */
  		memset(attr, 0, offsetof(union bpf_attr, bcf_buf));
@@ -64,7 +67,7 @@ index 97914494bd18..53ed868aa20c 100644
  	}
  
  	if (attr->bcf_fd || attr->bcf_buf_true_size || attr->bcf_flags)
-@@ -3094,9 +3095,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+@@ -3105,9 +3106,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
  	if (err)
  		goto free_prog_sec;
  
@@ -77,7 +80,7 @@ index 97914494bd18..53ed868aa20c 100644
  	if (err < 0)
  		goto free_used_maps;
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 3b631cea827e..fb672c9cc7cd 100644
+index 01d2358769aa..da4355378b68 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -33,6 +33,7 @@
@@ -88,7 +91,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  
  #include "disasm.h"
  
-@@ -20927,6 +20928,11 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -21341,6 +21342,11 @@ static int do_check(struct bpf_verifier_env *env)
  		insn = &insns[env->insn_idx];
  		insn_aux = &env->insn_aux_data[env->insn_idx];
  
@@ -100,7 +103,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
  			verbose(env,
  				"BPF program is too large. Processed %d insn\n",
-@@ -24123,6 +24129,9 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -24604,6 +24610,9 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	struct bpf_reg_state *regs;
  	int ret, i;
  
@@ -110,7 +113,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  	env->prev_insn_idx = -1;
  	env->prev_linfo = NULL;
  	env->pass_cnt++;
-@@ -24236,6 +24245,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -24718,6 +24727,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  							  acquire_reference(env, 0) : 0;
  	}
  
@@ -118,7 +121,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  	ret = do_check(env);
  
  	/* Invoked by bcf_track(), just return. */
-@@ -24571,7 +24581,9 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
+@@ -25053,7 +25063,9 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
  
  again:
  	new_cnt = 0;
@@ -129,7 +132,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  		if (!subprog_is_global(env, i))
  			continue;
  
-@@ -24580,8 +24592,10 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
+@@ -25062,8 +25074,10 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
  			continue;
  
  		env->subprog = i;
@@ -142,7 +145,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  		ret = do_check_common(env, i);
  		if (ret) {
  			return ret;
-@@ -24611,7 +24625,10 @@ static int do_check_main(struct bpf_verifier_env *env)
+@@ -25093,7 +25107,10 @@ static int do_check_main(struct bpf_verifier_env *env)
  {
  	int ret;
  
@@ -154,7 +157,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  	ret = do_check_common(env, 0);
  	if (!ret)
  		env->prog->aux->stack_depth = env->subprog_info[0].stack_depth;
-@@ -25852,13 +25869,45 @@ static int do_request_bcf(struct bpf_verifier_env *env, union bpf_attr *attr,
+@@ -26334,13 +26351,45 @@ static int do_request_bcf(struct bpf_verifier_env *env, union bpf_attr *attr,
  	return 0;
  }
  
@@ -201,7 +204,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  
  	BTF_TYPE_EMIT(enum bpf_features);
  
-@@ -25866,6 +25915,24 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26348,6 +26397,24 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	if (ARRAY_SIZE(bpf_verifier_ops) == 0)
  		return -EINVAL;
  
@@ -226,7 +229,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  	/* 'struct bpf_verifier_env' can be global, but since it's not small,
  	 * allocate/free it every time bpf_check() is called
  	 */
-@@ -25999,6 +26066,12 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26481,6 +26548,12 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	if (ret < 0)
  		goto skip_full_check;
  
@@ -239,7 +242,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  	ret = do_check_main(env);
  	ret = ret ?: do_check_subprogs(env);
  
-@@ -26006,8 +26079,13 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26488,8 +26561,13 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  		u64 vtime = ktime_get_ns() - start_time;
  
  		env->verification_time += vtime;
@@ -254,7 +257,7 @@ index 3b631cea827e..fb672c9cc7cd 100644
  
  		unmark_bcf_requested(env);
  		env->verification_time -= vtime;
-@@ -26017,6 +26095,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26499,6 +26577,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  		ret = bpf_prog_offload_finalize(env);
  
  skip_full_check:

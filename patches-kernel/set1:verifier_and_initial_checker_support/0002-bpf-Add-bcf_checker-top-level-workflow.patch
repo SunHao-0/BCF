@@ -1,4 +1,4 @@
-From 10b5d8a80531371a15d03ac4ea8aa8d26250813c Mon Sep 17 00:00:00 2001
+From 17a67e5e2bd44f17ff48454388c42b0f08e74ed0 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 09:50:04 +0200
 Subject: [PATCH RFC 02/17] bpf: Add bcf_checker top-level workflow
@@ -43,13 +43,13 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  create mode 100644 kernel/bpf/bcf_checker.c
 
 diff --git a/.clang-format b/.clang-format
-index f371a13b4d19..7f2f85bc4c1f 100644
+index c7060124a47a..78f68ce0d4fc 100644
 --- a/.clang-format
 +++ b/.clang-format
-@@ -747,6 +747,8 @@ ForEachMacros:
-   - 'ynl_attr_for_each_nested'
+@@ -749,6 +749,8 @@ ForEachMacros:
    - 'ynl_attr_for_each_payload'
    - 'zorro_for_each_dev'
+   - 'zpci_bus_for_each'
 +  - 'bcf_for_each_arg'
 +  - 'bcf_for_each_pm_step'
  
@@ -80,7 +80,7 @@ index 000000000000..220552653c80
 +
 +#endif /* __LINUX_BCF_CHECKER_H__ */
 diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
-index 7fd0badfacb1..5084a0a918e4 100644
+index 232cbc97434d..109c26523d4d 100644
 --- a/kernel/bpf/Makefile
 +++ b/kernel/bpf/Makefile
 @@ -6,7 +6,7 @@ cflags-nogcse-$(CONFIG_X86)$(CONFIG_CC_IS_GCC) := -fno-gcse
@@ -91,7 +91,7 @@ index 7fd0badfacb1..5084a0a918e4 100644
 +obj-$(CONFIG_BPF_SYSCALL) += syscall.o verifier.o inode.o helpers.o tnum.o log.o token.o liveness.o bcf_checker.o
  obj-$(CONFIG_BPF_SYSCALL) += bpf_iter.o map_iter.o task_iter.o prog_iter.o link_iter.o
  obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o bloom_filter.o
- obj-$(CONFIG_BPF_SYSCALL) += local_storage.o queue_stack_maps.o ringbuf.o
+ obj-$(CONFIG_BPF_SYSCALL) += local_storage.o queue_stack_maps.o ringbuf.o bpf_insn_array.o
 diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
 new file mode 100644
 index 000000000000..33b6e5f04e7f
