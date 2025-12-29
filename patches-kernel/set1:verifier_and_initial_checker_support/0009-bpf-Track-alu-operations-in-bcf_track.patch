@@ -1,4 +1,4 @@
-From 34064ffe575728ab84312e78ab9146ee815873be Mon Sep 17 00:00:00 2001
+From 8484066c77316ba4960fbe841d09cf800e58c071 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 17:53:29 +0100
 Subject: [PATCH RFC 09/17] bpf: Track alu operations in bcf_track()
@@ -23,10 +23,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 76 insertions(+), 4 deletions(-)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index cbced029ab11..f91e7b350e7d 100644
+index 623b6c023a8c..2b7aef031293 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -14952,6 +14952,41 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
+@@ -14956,6 +14956,41 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
  	return 0;
  }
  
@@ -68,7 +68,7 @@ index cbced029ab11..f91e7b350e7d 100644
  /* Handles arithmetic on a pointer and a scalar: computes new min/max and var_off.
   * Caller should also handle BPF_MOV case separately.
   * If we return -EACCES, caller may want to try again treating pointer as a
-@@ -14959,12 +14994,12 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
+@@ -14963,12 +14998,12 @@ static int sanitize_check_bounds(struct bpf_verifier_env *env,
   */
  static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
  				   struct bpf_insn *insn,
@@ -84,7 +84,7 @@ index cbced029ab11..f91e7b350e7d 100644
  	bool known = tnum_is_const(off_reg->var_off);
  	s64 smin_val = off_reg->smin_value, smax_val = off_reg->smax_value,
  	    smin_ptr = ptr_reg->smin_value, smax_ptr = ptr_reg->smax_value;
-@@ -14976,6 +15011,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+@@ -14980,6 +15015,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
  	int ret, bounds_ret;
  
  	dst_reg = &regs[dst];
@@ -92,7 +92,7 @@ index cbced029ab11..f91e7b350e7d 100644
  
  	if ((known && (smin_val != smax_val || umin_val != umax_val)) ||
  	    smin_val > smax_val || umin_val > umax_val) {
-@@ -15076,8 +15112,15 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+@@ -15080,8 +15116,15 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
  			dst_reg->var_off = ptr_reg->var_off;
  			dst_reg->off = ptr_reg->off + smin_val;
  			dst_reg->raw = ptr_reg->raw;
@@ -108,7 +108,7 @@ index cbced029ab11..f91e7b350e7d 100644
  		/* A new variable offset is created.  Note that off_reg->off
  		 * == 0, since it's a scalar.
  		 * dst_reg gets the pointer type and since some positive
-@@ -15105,6 +15148,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+@@ -15109,6 +15152,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
  			/* something was added to pkt_ptr, set range to zero */
  			memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
  		}
@@ -119,7 +119,7 @@ index cbced029ab11..f91e7b350e7d 100644
  		break;
  	case BPF_SUB:
  		if (dst_reg == off_reg) {
-@@ -15133,8 +15180,15 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+@@ -15137,8 +15184,15 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
  			dst_reg->id = ptr_reg->id;
  			dst_reg->off = ptr_reg->off - smin_val;
  			dst_reg->raw = ptr_reg->raw;
@@ -135,7 +135,7 @@ index cbced029ab11..f91e7b350e7d 100644
  		/* A new variable offset is created.  If the subtrahend is known
  		 * nonnegative, then any reg->range we had before is still good.
  		 */
-@@ -15162,6 +15216,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
+@@ -15166,6 +15220,10 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
  			if (smin_val < 0)
  				memset(&dst_reg->raw, 0, sizeof(dst_reg->raw));
  		}
@@ -146,7 +146,7 @@ index cbced029ab11..f91e7b350e7d 100644
  		break;
  	case BPF_AND:
  	case BPF_OR:
-@@ -15811,7 +15869,7 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+@@ -15815,7 +15873,7 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
  {
  	u8 opcode = BPF_OP(insn->code);
  	bool alu32 = (BPF_CLASS(insn->code) != BPF_ALU64);
@@ -155,7 +155,7 @@ index cbced029ab11..f91e7b350e7d 100644
  
  	if (!is_safe_to_compute_dst_reg_range(insn, &src_reg)) {
  		__mark_reg_unknown(env, dst_reg);
-@@ -15824,6 +15882,14 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+@@ -15828,6 +15886,14 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
  			return sanitize_err(env, insn, ret, NULL, NULL);
  	}
  
@@ -170,7 +170,7 @@ index cbced029ab11..f91e7b350e7d 100644
  	/* Calculate sign/unsigned bounds and tnum for alu32 and alu64 bit ops.
  	 * There are two classes of instructions: The first class we track both
  	 * alu32 and alu64 sign/unsigned bounds independently this provides the
-@@ -15902,6 +15968,12 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
+@@ -15906,6 +15972,12 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
  	if (alu32)
  		zext_32_to_64(dst_reg);
  	reg_bounds_sync(dst_reg);

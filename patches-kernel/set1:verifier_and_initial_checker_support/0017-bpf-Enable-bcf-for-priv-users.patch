@@ -1,4 +1,4 @@
-From aa37a037d345a2e64824f04d68c61633a5c4f0a1 Mon Sep 17 00:00:00 2001
+From 23a77f57730bb26d1caef4ab9518e2359d6a9c4b Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 3 Nov 2025 16:45:53 +0100
 Subject: [PATCH RFC 17/17] bpf: Enable bcf for priv users
@@ -11,10 +11,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 1 insertion(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index da4355378b68..f4304f25397e 100644
+index 9fe0e5243ae2..0b74121d95b3 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -26443,6 +26443,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26456,6 +26456,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	env->bypass_spec_v1 = bpf_bypass_spec_v1(env->prog->aux->token);
  	env->bypass_spec_v4 = bpf_bypass_spec_v4(env->prog->aux->token);
  	env->bpf_capable = is_priv = bpf_token_capable(env->prog->aux->token, CAP_BPF);

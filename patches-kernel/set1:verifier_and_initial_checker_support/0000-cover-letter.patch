@@ -1,6 +1,6 @@
-From aa37a037d345a2e64824f04d68c61633a5c4f0a1 Mon Sep 17 00:00:00 2001
+From 23a77f57730bb26d1caef4ab9518e2359d6a9c4b Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
-Date: Wed, 17 Dec 2025 10:54:42 +0100
+Date: Mon, 29 Dec 2025 17:10:39 +0100
 Subject: [PATCH RFC 00/17] bpf: Introduce proof-based verifier enhancement
 
 This patch set (and three follow-up sets) introduces a proof-based, on-demand
@@ -335,13 +335,13 @@ Hao Sun (17):
  kernel/bpf/bcf_checker.c       |  440 ++++++++++
  kernel/bpf/liveness.c          |   15 +
  kernel/bpf/syscall.c           |   27 +-
- kernel/bpf/verifier.c          | 1397 +++++++++++++++++++++++++++++++-
+ kernel/bpf/verifier.c          | 1400 +++++++++++++++++++++++++++++++-
  tools/include/uapi/linux/bpf.h |   21 +
- 12 files changed, 2143 insertions(+), 32 deletions(-)
+ 12 files changed, 2146 insertions(+), 32 deletions(-)
  create mode 100644 include/linux/bcf_checker.h
  create mode 100644 include/uapi/linux/bcf.h
  create mode 100644 kernel/bpf/bcf_checker.c
 
---
+-- 
 2.34.1
 

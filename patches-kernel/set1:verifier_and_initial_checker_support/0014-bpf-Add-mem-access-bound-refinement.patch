@@ -1,4 +1,4 @@
-From afe89d40599da2731e1e78120f785a336c48c44f Mon Sep 17 00:00:00 2001
+From 1ad924ad61140b7402e8f7f533e0f842ed6769cc Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Fri, 31 Oct 2025 09:53:23 +0100
 Subject: [PATCH RFC 14/17] bpf: Add mem access bound refinement
@@ -58,7 +58,7 @@ index 7a291bcb2f03..0120761d3f19 100644
  
  /* single container for all structs
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index e3df64361763..95f8ab8939d2 100644
+index 28d342a2523b..0b37daa3a19b 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -621,6 +621,16 @@ static bool bcf_requested(const struct bpf_verifier_env *env)
@@ -424,7 +424,7 @@ index e3df64361763..95f8ab8939d2 100644
  	if (!err)
  		err = mark_chain_precision(env, regno);
  	return err;
-@@ -16450,8 +16681,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+@@ -16454,8 +16685,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
  		/* check dest operand */
  		err = check_reg_arg(env, insn->dst_reg, DST_OP_NO_MARK);
  		err = err ?: adjust_reg_min_max_vals(env, insn);
@@ -437,7 +437,7 @@ index e3df64361763..95f8ab8939d2 100644
  	}
  
  	return reg_bounds_sanity_check(env, &regs[insn->dst_reg], "alu");
-@@ -20879,6 +21113,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
+@@ -20883,6 +21117,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
  			} else {
  				err = check_helper_call(env, insn, &env->insn_idx);
  			}
@@ -446,7 +446,7 @@ index e3df64361763..95f8ab8939d2 100644
  			if (err)
  				return err;
  
-@@ -24706,9 +24942,9 @@ backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
+@@ -24716,9 +24952,9 @@ backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
  	return base;
  }
  

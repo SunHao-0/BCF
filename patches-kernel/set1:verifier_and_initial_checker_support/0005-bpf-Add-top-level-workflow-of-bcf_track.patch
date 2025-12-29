@@ -1,4 +1,4 @@
-From c17138b8bab3b8a5fc72975e45446eeaa31f37b1 Mon Sep 17 00:00:00 2001
+From 6f6da89e785b5c53e2f9929a57fec9fc36a5cc63 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 27 Oct 2025 18:15:03 +0100
 Subject: [PATCH RFC 05/17] bpf: Add top-level workflow of bcf_track()
@@ -124,7 +124,7 @@ index 60db5d655495..fd0bf8113644 100644
  	for (frame = env->cur_state->curframe; frame >= 0; --frame) {
  		instance = lookup_instance(env, env->cur_state, frame);
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index a52559833752..77e0e2ee1321 100644
+index 372535ddff74..1256aba42c0c 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -3955,6 +3955,9 @@ static int push_jmp_history(struct bpf_verifier_env *env, struct bpf_verifier_st
@@ -156,7 +156,7 @@ index a52559833752..77e0e2ee1321 100644
  	/* Explored states are pushed in stack order, most recent states come first */
  	head = explored_state(env, insn_idx);
  	list_for_each(pos, head) {
-@@ -14389,7 +14395,8 @@ static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
+@@ -14393,7 +14399,8 @@ static bool can_skip_alu_sanitation(const struct bpf_verifier_env *env,
  {
  	return env->bypass_spec_v1 ||
  		BPF_SRC(insn->code) == BPF_K ||
@@ -166,7 +166,7 @@ index a52559833752..77e0e2ee1321 100644
  }
  
  static int update_alu_sanitation_state(struct bpf_insn_aux_data *aux,
-@@ -14437,6 +14444,9 @@ static int sanitize_speculative_path(struct bpf_verifier_env *env,
+@@ -14441,6 +14448,9 @@ static int sanitize_speculative_path(struct bpf_verifier_env *env,
  	struct bpf_verifier_state *branch;
  	struct bpf_reg_state *regs;
  
@@ -176,7 +176,7 @@ index a52559833752..77e0e2ee1321 100644
  	branch = push_stack(env, next_idx, curr_idx, true);
  	if (!IS_ERR(branch) && insn) {
  		regs = branch->frame[branch->curframe]->regs;
-@@ -19730,6 +19740,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+@@ -19734,6 +19744,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
  	int n, err, states_cnt = 0;
  	struct list_head *pos, *tmp, *head;
  
@@ -186,7 +186,7 @@ index a52559833752..77e0e2ee1321 100644
  	force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx) ||
  			  /* Avoid accumulating infinitely long jmp history */
  			  cur->jmp_history_cnt > 40;
-@@ -20490,7 +20503,7 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -20494,7 +20507,7 @@ static int do_check(struct bpf_verifier_env *env)
  	struct bpf_insn *insns = env->prog->insnsi;
  	int insn_cnt = env->prog->len;
  	bool do_print_state = false;
@@ -195,7 +195,7 @@ index a52559833752..77e0e2ee1321 100644
  
  	for (;;) {
  		struct bpf_insn *insn;
-@@ -20592,6 +20605,14 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -20596,6 +20609,14 @@ static int do_check(struct bpf_verifier_env *env)
  		if (err)
  			return err;
  		err = do_check_insn(env, &do_print_state);
@@ -210,7 +210,7 @@ index a52559833752..77e0e2ee1321 100644
  		if (err >= 0 || error_recoverable_with_nospec(err)) {
  			marks_err = bpf_commit_stack_write_marks(env);
  			if (marks_err)
-@@ -23756,6 +23777,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23766,6 +23787,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	struct bpf_reg_state *regs;
  	int ret, i;
  
@@ -218,7 +218,7 @@ index a52559833752..77e0e2ee1321 100644
  	env->prev_linfo = NULL;
  	env->pass_cnt++;
  
-@@ -23870,6 +23892,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23880,6 +23902,10 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	}
  
  	ret = do_check(env);
@@ -229,7 +229,7 @@ index a52559833752..77e0e2ee1321 100644
  out:
  	if (!ret && pop_log)
  		bpf_vlog_reset(&env->log, 0);
-@@ -23877,11 +23903,104 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23887,11 +23913,104 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	return ret;
  }
  
@@ -335,7 +335,7 @@ index a52559833752..77e0e2ee1321 100644
  }
  
  /*
-@@ -23989,6 +24108,12 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -23999,6 +24118,12 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	/* BCF requested multiple times in an error path. */
  	if (bcf_requested(env))
  		return -EFAULT;
@@ -348,7 +348,7 @@ index a52559833752..77e0e2ee1321 100644
  
  	if (!reg_masks) {
  		for (i = 0; i < BPF_REG_FP; i++) {
-@@ -24009,7 +24134,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -24019,7 +24144,7 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	if (!err && refine_cb)
  		err = refine_cb(env, st, ctx);
  

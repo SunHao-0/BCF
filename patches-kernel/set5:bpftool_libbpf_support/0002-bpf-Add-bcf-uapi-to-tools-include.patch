@@ -1,4 +1,4 @@
-From 9641e2fa615cd2e67d5593804abc764c17d8932c Mon Sep 17 00:00:00 2001
+From 58586dc4d5bad97431fd60029781ecbec06fc654 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 3 Nov 2025 19:45:23 +0100
 Subject: [PATCH RFC 2/3] bpf: Add bcf uapi to tools/include

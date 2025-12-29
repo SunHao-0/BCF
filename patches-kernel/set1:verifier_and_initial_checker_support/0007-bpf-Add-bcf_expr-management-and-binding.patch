@@ -1,4 +1,4 @@
-From e15a1b6820479d47e1d036810941acad50777538 Mon Sep 17 00:00:00 2001
+From 93425c90fa86bd5425e4b8bd856badbc7835bbe9 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 14:43:04 +0100
 Subject: [PATCH RFC 07/17] bpf: Add bcf_expr management and binding
@@ -30,7 +30,7 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 280 insertions(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 81d36848eb34..c45ed8e24bf1 100644
+index 4c50229ee0ab..ff29f2c586f5 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -4,6 +4,7 @@
@@ -347,7 +347,7 @@ index 81d36848eb34..c45ed8e24bf1 100644
  		return 0;
  	} else {
  		/* check whether register used as dest operand can be written to */
-@@ -25730,6 +26009,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -25740,6 +26019,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	kvfree(env->scc_info);
  	kvfree(env->succ);
  	kvfree(env->gotox_tmp_buf);

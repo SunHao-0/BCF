@@ -1,0 +1,206 @@
+From 8213fbd3940376c2929f37c66d253c16a4e4269c Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Mon, 29 Dec 2025 17:25:56 +0100
+Subject: [PATCH] bpf: Batch BCF requests to reduce kernel/user interaction
+
+If the analysis behavior is known after a proof, then cache this request
+and conduct the analysis directly. For instance, if a request is to
+prove unreachable, then just cache this condition and drop the analysis
+path. When the cache is full or the analysis is done, prove all the
+cached conditions once, thereby reducing the interactions.
+
+If the behavior depends on the proof result, e.g., either unreachable or
+state refined, then the condition cannot be cached; request the proof
+directly and embed all the cache conditions into this condition:
+	path cond = disj_of (cached conds + current path cond)
+	refine cond = disj_of (cache conds + current one)
+disj is used because all the cached paths are expected unreachable,
+i.e., the condition should be unsat; the final condition must also be
+unsat, such that the solver can produce a refute proof.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  3 ++
+ kernel/bpf/verifier.c        | 85 ++++++++++++++++++++++++++++++++++--
+ 2 files changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index fb45bc7dc487..ee6ad2319f43 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -736,6 +736,7 @@ struct bpf_scc_info {
+ 
+ struct bpf_liveness;
+ 
++#define BCF_BATCH_SIZE 32
+ struct bcf_refine_state {
+ 	/* The state list that decides the path suffix, on which bcf_track()
+ 	 * collects symbolic information for target registers.
+@@ -755,6 +756,8 @@ struct bcf_refine_state {
+ 	u32 br_cond_cnt;
+ 	int path_cond; /* conjunction of br_conds */
+ 	int refine_cond; /* refinement condition */
++	u32 batched_conds[BCF_BATCH_SIZE];
++	u32 batch_cnt;
+ 
+ 	/* Refinement specific */
+ 	u32 size_regno;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index fda361fed70a..ba08e99725a4 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -24880,7 +24880,6 @@ static int bcf_track(struct bpf_verifier_env *env,
+ 	struct bcf_refine_state *bcf = &env->bcf;
+ 	int err, i;
+ 
+-	bcf->expr_cnt = 0;
+ 	bcf->path_cond = -1;
+ 	bcf->refine_cond = -1;
+ 
+@@ -25053,6 +25052,66 @@ backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
+ 	return base;
+ }
+ 
++static int process_batched_conds(struct bpf_verifier_env *env)
++{
++	struct bcf_refine_state *bcf = &env->bcf;
++	int batched;
++
++	/* Batch unreachable proof requests. */
++	if (bcf->refine_cond < 0 && bcf->path_cond >= 0 &&
++	    bcf->batch_cnt < BCF_BATCH_SIZE) {
++		bcf->batched_conds[bcf->batch_cnt++] = bcf->path_cond;
++		/* Batched, prove later. */
++		bcf->path_unreachable = true;
++		bcf->path_cond = -1;
++		return 0;
++	}
++
++	if (!bcf->batch_cnt)
++		return 0;
++
++	batched = bcf->batched_conds[0];
++	if (bcf->batch_cnt > 1) {
++		struct bcf_expr *disj;
++
++		batched = bcf_alloc_expr(env, bcf->batch_cnt + 1);
++		if (batched < 0)
++			return batched;
++		disj = bcf->exprs + batched;
++		disj->code = BCF_BOOL | BCF_DISJ;
++		disj->vlen = bcf->batch_cnt;
++		disj->params = 0;
++		memcpy(disj->args, bcf->batched_conds,
++		       sizeof(u32) * bcf->batch_cnt);
++	}
++	bcf->batch_cnt = 0;
++
++	/*
++	 * Process the batched conditions:
++	 *	path_cond = disj_of (batch_conds, path_cond)
++	 *	refine_cond = disj_of (batch_conds, refine_cond)
++	 */
++	if (bcf->refine_cond < 0 && bcf->path_cond < 0) {
++		bcf->path_cond = batched;
++		return 0;
++	}
++
++	if (bcf->path_cond >= 0) {
++		bcf->path_cond = bcf_build_expr(env, BCF_BOOL | BCF_DISJ, 0, 2,
++						batched, bcf->path_cond);
++		if (bcf->path_cond < 0)
++			return bcf->path_cond;
++	}
++	if (bcf->refine_cond >= 0) {
++		bcf->refine_cond = bcf_build_expr(env, BCF_BOOL | BCF_DISJ, 0,
++						  2, batched, bcf->refine_cond);
++		if (bcf->refine_cond < 0)
++			return bcf->refine_cond;
++	}
++
++	return 0;
++}
++
+ static int bcf_refine(struct bpf_verifier_env *env,
+ 		      struct bpf_verifier_state *st, u32 reg_masks,
+ 		      refine_state_fn refine_cb, void *ctx)
+@@ -25093,6 +25152,9 @@ static int bcf_refine(struct bpf_verifier_env *env,
+ 	if (!err && refine_cb)
+ 		err = refine_cb(env, st, ctx);
+ 
++	if (bcf->refine_cond < 0 && bcf->path_cond < 0 && !err)
++		err = -EFAULT;
++
+ 	/* The final condition is the conj of path_cond and refine_cond. */
+ 	if (!err && bcf->refine_cond >= 0 && bcf->path_cond >= 0) {
+ 		bcf->refine_cond = bcf_build_expr(env, BCF_BOOL | BCF_CONJ, 0,
+@@ -25102,6 +25164,8 @@ static int bcf_refine(struct bpf_verifier_env *env,
+ 			err = bcf->refine_cond;
+ 	}
+ 
++	err = err ?: process_batched_conds(env);
++
+ 	if (!err && (env->bcf.refine_cond >= 0 || env->bcf.path_cond >= 0))
+ 		mark_bcf_requested(env);
+ 
+@@ -26374,7 +26438,8 @@ static int bcf_release(struct inode *inode, struct file *filp)
+ 	if (!env)
+ 		return 0;
+ 
+-	free_states(env);
++	if (env->cur_state)
++		free_states(env);
+ 	kvfree(env->explored_states);
+ 
+ 	clear_insn_aux_data(env, 0, env->prog->len);
+@@ -26475,7 +26540,7 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+ 		return err;
+ 
+ 	/* Drop the last history entry */
+-	if (is_jmp_point(env, env->insn_idx))
++	if (is_jmp_point(env, env->insn_idx) && env->cur_state)
+ 		env->cur_state->jmp_history_cnt--;
+ 
+ 	if (env->log.level & BPF_LOG_LEVEL2) {
+@@ -26492,6 +26557,7 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+ 	}
+ 	bcf->backtrack_length = 0;
+ 	bcf->track_length = 0;
++	bcf->expr_cnt = 0;
+ 
+ 	return 0;
+ }
+@@ -26668,10 +26734,22 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 		ret = resume_env(env, attr, uattr);
+ 		if (ret)
+ 			goto skip_full_check;
++		if (!env->cur_state)
++			goto check_done;
+ 	}
+ 	ret = do_check_main(env);
+ 	ret = ret ?: do_check_subprogs(env);
+ 
++	if (!ret && env->bcf.batch_cnt) {
++		env->bcf.path_cond = -1;
++		env->bcf.refine_cond = -1;
++		ret = process_batched_conds(env);
++		if (!ret) {
++			ret = -EINVAL;
++			mark_bcf_requested(env);
++		}
++	}
++
+ 	if (ret && bcf_requested(env)) {
+ 		u64 vtime = ktime_get_ns() - start_time;
+ 
+@@ -26688,6 +26766,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 		env->verification_time -= vtime;
+ 	}
+ 
++check_done:
+ 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
+ 		ret = bpf_prog_offload_finalize(env);
+ 
+-- 
+2.34.1
+

@@ -1,6 +1,6 @@
-From 5be1d986dc48b6d60ea88d53ca8afe6035351d44 Mon Sep 17 00:00:00 2001
+From 8c0a3b3e2714aea8751607d4b065bd6b3985a442 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
-Date: Wed, 5 Nov 2025 16:36:47 +0100
+Date: Sun, 28 Dec 2025 12:20:12 +0100
 Subject: [PATCH RFC 00/11] bpf: Core proof rules and rewrite infrastructure
 
 This set adds the core building blocks for the in-kernel BCF proof checker:
@@ -29,8 +29,8 @@ Hao Sun (11):
   bpf: Add basic core rules
   bpf: Add core rule: evaluate
   bpf: Add core rules: ACI_NORM and ABSORB
-  bpf: Core rule: Add rewrite rule uapi
-  bpf: Core rule: Add macro-based rewrite dsl
+  bpf: Add core rule: rewrites
+  bpf: Core rule: add macro-based rewrite dsl
   bpf: Core rule: add rewrites encoded in DSL
   bpf: Core rule: apply_rewrite()
 

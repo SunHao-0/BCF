@@ -1,4 +1,4 @@
-From fd24c04dc619dfc8a6eabbb7fac167427b76f91e Mon Sep 17 00:00:00 2001
+From 262ca0e42942f73089b54225fee5540a2ae45b79 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 10:06:13 +0100
 Subject: [PATCH RFC 06/17] bpf: Add bcf_match_path() to follow the path suffix
@@ -28,10 +28,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 66 insertions(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 77e0e2ee1321..81d36848eb34 100644
+index 1256aba42c0c..4c50229ee0ab 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -20496,6 +20496,63 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
+@@ -20500,6 +20500,63 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
  	return 0;
  }
  
@@ -95,7 +95,7 @@ index 77e0e2ee1321..81d36848eb34 100644
  static int do_check(struct bpf_verifier_env *env)
  {
  	bool pop_log = !(env->log.level & BPF_LOG_LEVEL2);
-@@ -20558,6 +20615,15 @@ static int do_check(struct bpf_verifier_env *env)
+@@ -20562,6 +20619,15 @@ static int do_check(struct bpf_verifier_env *env)
  				return err;
  		}
  

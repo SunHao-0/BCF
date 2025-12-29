@@ -1,4 +1,4 @@
-From 392209c5482ea75f191159cb6209a6d50e0a758a Mon Sep 17 00:00:00 2001
+From 342c51c269fd5a2e64269b5b6fdb1678baaf2479 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 18:14:46 +0200
 Subject: [PATCH RFC 10/11] bpf: Core rule: add rewrites encoded in DSL

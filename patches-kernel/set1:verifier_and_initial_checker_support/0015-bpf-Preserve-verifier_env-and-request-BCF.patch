@@ -1,4 +1,4 @@
-From 5c8f8f181af2313fff132e092ca3a7b3cf382546 Mon Sep 17 00:00:00 2001
+From 66952ef3c77ddfaa45b7a25daedf26f60c52d9db Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 3 Nov 2025 11:06:31 +0100
 Subject: [PATCH RFC 15/17] bpf: Preserve verifier_env and request BCF
@@ -24,8 +24,8 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
 ---
  include/linux/bpf_verifier.h |   3 +
  kernel/bpf/syscall.c         |   2 +
- kernel/bpf/verifier.c        | 113 +++++++++++++++++++++++++++++++++--
- 3 files changed, 112 insertions(+), 6 deletions(-)
+ kernel/bpf/verifier.c        | 116 +++++++++++++++++++++++++++++++++--
+ 3 files changed, 115 insertions(+), 6 deletions(-)
 
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
 index 0120761d3f19..e46acf4e113a 100644
@@ -62,7 +62,7 @@ index d9a14e2b5f2c..91f160566310 100644
  		goto free_used_maps;
  
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 95f8ab8939d2..01d2358769aa 100644
+index 0b37daa3a19b..1f2085d31077 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -15,6 +15,8 @@
@@ -86,7 +86,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  static int bcf_alloc_expr(struct bpf_verifier_env *env, u32 cnt)
  {
  	struct bcf_refine_state *bcf = &env->bcf;
-@@ -22509,8 +22516,7 @@ static int opt_remove_nops(struct bpf_verifier_env *env)
+@@ -22513,8 +22520,7 @@ static int opt_remove_nops(struct bpf_verifier_env *env)
  	return 0;
  }
  
@@ -96,7 +96,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  {
  	struct bpf_insn *patch;
  	/* use env->insn_buf as two independent buffers */
-@@ -22522,7 +22528,7 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
+@@ -22526,7 +22532,7 @@ static int opt_subreg_zext_lo32_rnd_hi32(struct bpf_verifier_env *env,
  	struct bpf_prog *new_prog;
  	bool rnd_hi32;
  
@@ -105,7 +105,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  	zext_patch[1] = BPF_ZEXT_REG(0);
  	rnd_hi32_patch[1] = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, 0);
  	rnd_hi32_patch[2] = BPF_ALU64_IMM(BPF_LSH, BPF_REG_AX, 32);
-@@ -24715,7 +24721,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -24725,7 +24731,7 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	ret = do_check(env);
  
  	/* Invoked by bcf_track(), just return. */
@@ -114,7 +114,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  		return ret;
  out:
  	if (!ret && pop_log)
-@@ -25055,6 +25061,7 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
+@@ -25065,6 +25071,7 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
  		if (!sub_aux->called || sub_aux->verified)
  			continue;
  
@@ -122,7 +122,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  		env->insn_idx = env->subprog_info[i].start;
  		WARN_ON_ONCE(env->insn_idx == 0);
  		ret = do_check_common(env, i);
-@@ -26248,6 +26255,85 @@ static int compute_scc(struct bpf_verifier_env *env)
+@@ -26258,6 +26265,88 @@ static int compute_scc(struct bpf_verifier_env *env)
  	return err;
  }
  
@@ -136,6 +136,8 @@ index 95f8ab8939d2..01d2358769aa 100644
 +	free_states(env);
 +	kvfree(env->explored_states);
 +
++	clear_insn_aux_data(env, 0, env->prog->len);
++	release_insn_arrays(env);
 +	if (!env->prog->aux->used_maps)
 +		release_maps(env);
 +	if (!env->prog->aux->used_btfs)
@@ -148,6 +150,7 @@ index 95f8ab8939d2..01d2358769aa 100644
 +	kvfree(env->cfg.insn_postorder);
 +	kvfree(env->scc_info);
 +	kvfree(env->succ);
++	kvfree(env->gotox_tmp_buf);
 +	kvfree(env->bcf.exprs);
 +	kvfree(env);
 +	filp->private_data = NULL;
@@ -208,7 +211,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
  {
  	u64 start_time = ktime_get_ns();
-@@ -26328,6 +26414,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26338,6 +26427,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	if (is_priv)
  		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
  	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
@@ -216,7 +219,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  
  	env->explored_states = kvcalloc(state_htab_size(env),
  				       sizeof(struct list_head),
-@@ -26397,10 +26484,24 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26407,10 +26497,24 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	ret = do_check_main(env);
  	ret = ret ?: do_check_subprogs(env);
  
@@ -241,7 +244,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  	kvfree(env->explored_states);
  
  	/* might decrease stack depth, keep it before passes that
-@@ -26439,7 +26540,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26449,7 +26553,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	 * insns could be handled correctly.
  	 */
  	if (ret == 0 && !bpf_prog_is_offloaded(env->prog->aux)) {
@@ -250,7 +253,7 @@ index 95f8ab8939d2..01d2358769aa 100644
  		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
  								     : false;
  	}
-@@ -26447,7 +26548,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26457,7 +26561,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  	if (ret == 0)
  		ret = fixup_call_args(env);
  

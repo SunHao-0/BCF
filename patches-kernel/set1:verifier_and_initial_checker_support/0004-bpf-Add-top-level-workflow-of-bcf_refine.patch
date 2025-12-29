@@ -1,4 +1,4 @@
-From a720f29c7e37d93a55c1748ce2e67f5d93b1ffc7 Mon Sep 17 00:00:00 2001
+From b51393fa783d83093acdd18bd84b43fedc52cfc6 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 27 Oct 2025 15:58:22 +0100
 Subject: [PATCH RFC 04/17] bpf: Add top-level workflow of bcf_refine()
@@ -30,10 +30,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  3 files changed, 170 insertions(+)
 
 diff --git a/include/linux/bpf.h b/include/linux/bpf.h
-index bb3847caeae1..b353207833d2 100644
+index 4e7d72dfbcd4..7786f1df2bc3 100644
 --- a/include/linux/bpf.h
 +++ b/include/linux/bpf.h
-@@ -1672,6 +1672,7 @@ struct bpf_prog_aux {
+@@ -1688,6 +1688,7 @@ struct bpf_prog_aux {
  	bool changes_pkt_data;
  	bool might_sleep;
  	bool kprobe_write_ctx;
@@ -73,7 +73,7 @@ index 130bcbd66f60..4ff26923bacb 100644
  
  static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index d6b8a77fbe3b..a52559833752 100644
+index 2de1a736ef69..372535ddff74 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -608,6 +608,23 @@ static bool is_atomic_load_insn(const struct bpf_insn *insn)
@@ -100,7 +100,7 @@ index d6b8a77fbe3b..a52559833752 100644
  static int __get_spi(s32 off)
  {
  	return (-off - 1) / BPF_REG_SIZE;
-@@ -23860,6 +23877,145 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
+@@ -23870,6 +23887,145 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
  	return ret;
  }
  

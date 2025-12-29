@@ -1,4 +1,4 @@
-From d47b5246373189930ed369be23ff3a7bef24f507 Mon Sep 17 00:00:00 2001
+From 16541b5d269d550ee5e85b9d0cb44c17b0193895 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 3 Nov 2025 16:50:04 +0100
 Subject: [PATCH RFC 1/3] libbpf: Add bcf support for prog_load
@@ -17,7 +17,7 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  6 files changed, 65 insertions(+), 2 deletions(-)
 
 diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
-index b66f5fbfbbb2..6e33c03c9347 100644
+index 21b57a629916..cc50e1af7e48 100644
 --- a/tools/lib/bpf/bpf.c
 +++ b/tools/lib/bpf/bpf.c
 @@ -240,11 +240,12 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
@@ -70,7 +70,7 @@ index b66f5fbfbbb2..6e33c03c9347 100644
  		return fd;
  
 diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
-index e983a3e40d61..f7adc69336c2 100644
+index 1f9c28d27795..4c53fa55959b 100644
 --- a/tools/lib/bpf/bpf.h
 +++ b/tools/lib/bpf/bpf.h
 @@ -113,9 +113,13 @@ struct bpf_prog_load_opts {
@@ -98,10 +98,10 @@ index e983a3e40d61..f7adc69336c2 100644
  	size_t sz; /* size of this struct for forward/backward compatibility */
  
 diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
-index fbe74686c97d..c234e62bafb3 100644
+index 1a52d818a76c..f11f3691a907 100644
 --- a/tools/lib/bpf/libbpf.c
 +++ b/tools/lib/bpf/libbpf.c
-@@ -7525,6 +7525,17 @@ static int libbpf_prepare_prog_load(struct bpf_program *prog,
+@@ -7770,6 +7770,17 @@ static int libbpf_prepare_prog_load(struct bpf_program *prog,
  
  static void fixup_verifier_log(struct bpf_program *prog, char *buf, size_t buf_sz);
  
@@ -119,7 +119,7 @@ index fbe74686c97d..c234e62bafb3 100644
  static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog,
  				struct bpf_insn *insns, int insns_cnt,
  				const char *license, __u32 kern_version, int *prog_fd)
-@@ -7535,6 +7546,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+@@ -7780,6 +7791,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
  	char *log_buf = NULL, *tmp;
  	bool own_log_buf = true;
  	__u32 log_level = prog->log_level;
@@ -127,7 +127,7 @@ index fbe74686c97d..c234e62bafb3 100644
  	int ret, err;
  
  	/* Be more helpful by rejecting programs that can't be validated early
-@@ -7610,6 +7622,15 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+@@ -7855,6 +7867,15 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
  		return 0;
  	}
  
@@ -143,7 +143,7 @@ index fbe74686c97d..c234e62bafb3 100644
  retry_load:
  	/* if log_level is zero, we don't request logs initially even if
  	 * custom log_buf is specified; if the program load fails, then we'll
-@@ -7701,6 +7722,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+@@ -7946,6 +7967,7 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
  out:
  	if (own_log_buf)
  		free(log_buf);
@@ -152,10 +152,10 @@ index fbe74686c97d..c234e62bafb3 100644
  }
  
 diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
-index 5118d0a90e24..1c2a30502e98 100644
+index e14d9e349f9c..9b67005f26f5 100644
 --- a/tools/lib/bpf/libbpf.h
 +++ b/tools/lib/bpf/libbpf.h
-@@ -1896,6 +1896,11 @@ LIBBPF_API int bpf_linker__add_buf(struct bpf_linker *linker, void *buf, size_t
+@@ -1917,6 +1917,11 @@ LIBBPF_API int bpf_linker__add_buf(struct bpf_linker *linker, void *buf, size_t
  LIBBPF_API int bpf_linker__finalize(struct bpf_linker *linker);
  LIBBPF_API void bpf_linker__free(struct bpf_linker *linker);
  
@@ -168,20 +168,20 @@ index 5118d0a90e24..1c2a30502e98 100644
   * Custom handling of BPF program's SEC() definitions
   */
 diff --git a/tools/lib/bpf/libbpf.map b/tools/lib/bpf/libbpf.map
-index 8ed8749907d4..b306e10cb9fc 100644
+index 84fb90a016c9..9a0e05990674 100644
 --- a/tools/lib/bpf/libbpf.map
 +++ b/tools/lib/bpf/libbpf.map
-@@ -451,4 +451,5 @@ LIBBPF_1.7.0 {
- 	global:
- 		bpf_map__set_exclusive_program;
+@@ -453,4 +453,5 @@ LIBBPF_1.7.0 {
  		bpf_map__exclusive_program;
+ 		bpf_prog_assoc_struct_ops;
+ 		bpf_program__assoc_struct_ops;
 +		libbpf_set_prover;
  } LIBBPF_1.6.0;
 diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
-index 35b2527bedec..0f2259bf988b 100644
+index fc59b21b51b5..e5384a9c0ead 100644
 --- a/tools/lib/bpf/libbpf_internal.h
 +++ b/tools/lib/bpf/libbpf_internal.h
-@@ -755,4 +755,6 @@ int probe_fd(int fd);
+@@ -757,4 +757,6 @@ int probe_fd(int fd);
  #define SHA256_DWORD_SIZE SHA256_DIGEST_LENGTH / sizeof(__u64)
  
  void libbpf_sha256(const void *data, size_t len, __u8 out[SHA256_DIGEST_LENGTH]);

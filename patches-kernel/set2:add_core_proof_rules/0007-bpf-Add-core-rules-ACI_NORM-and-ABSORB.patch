@@ -1,4 +1,4 @@
-From 42fb5667e26d973b50ff4956afa9ef25e693ffed Mon Sep 17 00:00:00 2001
+From 0dc2dd6cc03fa9c6520c635ff96c9fd36ea1ec0e Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 17:37:14 +0200
 Subject: [PATCH RFC 07/11] bpf: Add core rules: ACI_NORM and ABSORB

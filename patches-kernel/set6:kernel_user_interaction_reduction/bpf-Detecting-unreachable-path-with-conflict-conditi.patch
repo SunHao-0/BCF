@@ -1,0 +1,139 @@
+From 77ddc2515b45cfc191e9ef5ec331356ec2ca4bbd Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Thu, 18 Dec 2025 16:05:56 +0100
+Subject: [PATCH] bpf: Detecting unreachable path with conflict conditions
+
+When loading the progs from calico, user/kernel interaction would
+be triggered many times for simple unreachable path conditions:
+
+	...
+	262: (56) if w8 != 0x5 goto pc+4
+	...
+	267: (56) if w8 != 0x5 goto pc+16     ; R8=5
+	268: (61) r4 = *(u32 *)(r7 +372)      ; unreachable
+	269: (61) r3 = *(u32 *)(r1 +0)
+
+This can detected using the collected symbolic state:
+	- before adding a eq/neq condition to br_conds, check
+	  if there exists a previously added conflict cond.
+	- A conflict cond is the one with rev_opcode() while
+	  the ops are the same.
+	- Using the symbolic expr, regs alias can be handled
+	  naturally, e.g., they point to the same expr node.
+
+The following can also be detected.
+
+	1899: (63) *(u32 *)(r10 -296) = r8
+	1900: (16) if w8 == 0x6 goto pc+1
+	1901: (b7) r3 = 0
+	1902: (61) r6 = *(u32 *)(r10 -216)
+	1903: (61) r1 = *(u32 *)(r10 -296)
+	1901: (b7) r3 = 0
+	...
+	1907: (56) if w1 != 0x6 goto pc+10
+	1908: (69) r1 = *(u16 *)(r3 +12) ; unreachable
+
+This currently considers the `reg eq/neq const` conditions.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ kernel/bpf/verifier.c | 55 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 2d80316bf6e1..1e0e6f0bb3e4 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -21285,6 +21285,49 @@ static int bcf_match_path(struct bpf_verifier_env *env)
+ 	return PATH_MATCH;
+ }
+ 
++static void detect_conflict_eq(struct bpf_verifier_env *env,
++			       struct bcf_expr *cond)
++{
++	struct bcf_refine_state *bcf = &env->bcf;
++	u8 op = BCF_OP(cond->code), conflict_op;
++	struct bcf_expr *expr, *imm;
++	u32 i;
++
++	if (op != BPF_JEQ && op != BPF_JNE)
++		return;
++
++	/*
++	 * Find a condtion that conflicts with `expr op imm`; for e0 op' e1,
++	 * e0 = expr, e1 = imm, op' = rev_opcode(op).
++	 */
++	conflict_op = rev_opcode(op);
++	expr = bcf->exprs + cond->args[0];
++	imm = bcf->exprs + cond->args[1];
++	if (imm->code != (BCF_VAL | BCF_BV))
++		return;
++
++	for (i = bcf->br_cond_cnt; i; i--) {
++		struct bcf_expr *old = bcf->exprs + bcf->br_conds[i - 1];
++		struct bcf_expr *e0, *e1;
++
++		if (BCF_OP(old->code) != conflict_op)
++			continue;
++
++		e0 = bcf->exprs + old->args[0];
++		if (e0->vlen != expr->vlen ||
++		    memcmp(expr, e0, struct_size_t(struct bcf_expr, args, expr->vlen)))
++			continue;
++
++		e1 = bcf->exprs + old->args[1];
++		if (e1->vlen != imm->vlen ||
++		    memcmp(imm, e1, struct_size_t(struct bcf_expr, args, imm->vlen)))
++			continue;
++
++		bcf->path_unreachable = true;
++		break;
++	}
++}
++
+ static int record_path_cond(struct bpf_verifier_env *env)
+ {
+ 	int prev_insn_idx = env->prev_insn_idx;
+@@ -21344,6 +21387,8 @@ static int record_path_cond(struct bpf_verifier_env *env)
+ 			op = rev_opcode(op);
+ 		cond_expr = bcf_build_expr(env, BCF_BOOL | op, 0, 2, dst_expr,
+ 					   src_expr);
++		if (cond_expr >= 0)
++			detect_conflict_eq(env, env->bcf.exprs + cond_expr);
+ 	}
+ 
+ 	return bcf_add_cond(env, cond_expr);
+@@ -21422,6 +21467,8 @@ static int do_check(struct bpf_verifier_env *env)
+ 			if (path == PATH_MISMATCH)
+ 				goto process_bpf_exit;
+ 			err = record_path_cond(env);
++			if (env->bcf.path_unreachable)
++				return -EINVAL;
+ 			if (err || path == PATH_DONE)
+ 				return err;
+ 		}
+@@ -21473,6 +21520,12 @@ static int do_check(struct bpf_verifier_env *env)
+ 		if (err)
+ 			return err;
+ 		err = do_check_insn(env, &do_print_state);
++		if (env->bcf.path_unreachable) {
++			env->bcf.path_unreachable = false;
++			verbose(env, "BCF: unreachable path detected at insn %d, skipping\n",
++				env->insn_idx);
++			goto process_bpf_exit;
++		}
+ 		/*
+ 		 * bcf_track() only follows checked insns, errors during it
+ 		 * indicate a previously refined location; The refinement
+@@ -25010,7 +25063,7 @@ static int bcf_refine(struct bpf_verifier_env *env,
+ 	if (!env->bcf.available || st->speculative)
+ 		return -EOPNOTSUPP;
+ 	/* BCF requested multiple times in an error path. */
+-	if (bcf_requested(env))
++	if (bcf_requested(env) || env->bcf.path_unreachable)
+ 		return -EFAULT;
+ 	/* BCF requested during bcf_track(), known safe just refine. */
+ 	if (env->bcf.tracking) {
+-- 
+2.34.1
+

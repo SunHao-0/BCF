@@ -1,4 +1,4 @@
-From a54a1aa6f411788db2d9c78e40892c01ae020acc Mon Sep 17 00:00:00 2001
+From 01c813d971a18030ef88016de177c3d387af0e33 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 18:08:48 +0200
 Subject: [PATCH RFC 09/11] bpf: Core rule: add macro-based rewrite dsl

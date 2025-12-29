@@ -1,7 +1,10 @@
-From d9947482f61a615d2d96e1dfcccc2d32fc81c721 Mon Sep 17 00:00:00 2001
+From 97a41eeef0912a622c698cebf047c94d5b8f59bd Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 17:46:22 +0200
-Subject: [PATCH RFC 08/11] bpf: Add core rule: rewrites 
+Subject: [PATCH RFC 08/11] bpf: Add core rule: rewrites
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Extend UAPI with a catalog of rewrite identifiers (BCF_REWRITE_*). Each
 rewrite denotes a proven equivalence schema from the solver (match = target),

@@ -1,0 +1,83 @@
+From a5cad6edf8fe2b5b1e25bec3af11f6e7586a8fca Mon Sep 17 00:00:00 2001
+From: Hao Sun <hao.sun@inf.ethz.ch>
+Date: Sun, 28 Dec 2025 12:01:49 +0100
+Subject: [PATCH] bpf: Collect BCF refinement stats
+
+Collect backtrack length, symbolic track length, and proof
+check related stats.
+
+Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
+---
+ include/linux/bpf_verifier.h |  5 +++++
+ kernel/bpf/verifier.c        | 18 ++++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index d9b5b152c5e1..fb45bc7dc487 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -762,6 +762,11 @@ struct bcf_refine_state {
+ 	int checked_sz;
+ 	bool access_checked;
+ 	bool path_unreachable;
++
++	/* Statistics */
++	u32 proof_check_cnt;
++	u32 backtrack_length;
++	u32 track_length;
+ };
+ 
+ /* single container for all structs
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 1e0e6f0bb3e4..1561e3a5b990 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -21464,6 +21464,7 @@ static int do_check(struct bpf_verifier_env *env)
+ 		if (env->bcf.tracking) {
+ 			int path = bcf_match_path(env);
+ 
++			env->bcf.track_length++;
+ 			if (path == PATH_MISMATCH)
+ 				goto process_bpf_exit;
+ 			err = record_path_cond(env);
+@@ -25006,6 +25007,7 @@ backtrack_states(struct bpf_verifier_env *env, struct bpf_verifier_state *cur,
+ 				hist = get_jmp_hist_entry(st, history, i);
+ 				err = backtrack_insn(env, i, subseq_idx, hist, bt);
+ 			}
++			bcf->backtrack_length++;
+ 			if (err) /* Track the entire path. */
+ 				goto out;
+ 			if (bt_empty(bt)) { /* Base state found. */
+@@ -26447,6 +26449,7 @@ static int do_request_bcf(struct bpf_verifier_env *env, union bpf_attr *attr,
+ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+ 		      bpfptr_t uattr)
+ {
++	u64 start_time = ktime_get_ns();
+ 	bpfptr_t proof;
+ 	int cond, err;
+ 
+@@ -26472,6 +26475,21 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+ 	if (is_jmp_point(env, env->insn_idx))
+ 		env->cur_state->jmp_history_cnt--;
+ 
++	if (env->log.level & BPF_LOG_LEVEL2) {
++		struct bcf_refine_state *bcf = &env->bcf;
++
++		bcf->proof_check_cnt++;
++		verbose(env,
++			"bcf proof checked %d nth in %lld ns, size %d bytes, type %s backtrack_length %d track_length %d cond_size %ld\n",
++			bcf->proof_check_cnt, ktime_get_ns() - start_time,
++			attr->bcf_buf_true_size,
++			bcf->path_unreachable ? "path" : "range",
++			bcf->backtrack_length, bcf->track_length,
++			bcf->expr_cnt * sizeof(struct bcf_expr));
++	}
++	bcf->backtrack_length = 0;
++	bcf->track_length = 0;
++
+ 	return 0;
+ }
+ 
+-- 
+2.34.1
+

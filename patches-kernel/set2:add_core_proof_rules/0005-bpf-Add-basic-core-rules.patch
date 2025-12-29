@@ -1,4 +1,4 @@
-From 2104ad286aaba836f953786314a28d66f6007449 Mon Sep 17 00:00:00 2001
+From 27c065b25867d54783db316c3b4dc4e5d196f2e3 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 12:45:24 +0200
 Subject: [PATCH RFC 05/11] bpf: Add basic core rules
@@ -18,10 +18,10 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  2 files changed, 187 insertions(+), 16 deletions(-)
 
 diff --git a/.clang-format b/.clang-format
-index a357a3c723d4..c318487f90ae 100644
+index 097185ef5a56..095618af946c 100644
 --- a/.clang-format
 +++ b/.clang-format
-@@ -751,6 +751,7 @@ ForEachMacros:
+@@ -753,6 +753,7 @@ ForEachMacros:
    - 'bcf_for_each_expr'
    - 'bcf_for_each_arg_expr'
    - 'bcf_for_each_pm_step'

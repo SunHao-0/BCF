@@ -1,4 +1,4 @@
-From 33d981efca596912641023c685634b5e53445802 Mon Sep 17 00:00:00 2001
+From e096405da87806f5d078c70dd04ea3e4ce8cfe56 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Thu, 30 Oct 2025 14:50:36 +0100
 Subject: [PATCH RFC 13/17] bpf: Skip state pruning for the parent states
@@ -34,10 +34,10 @@ index c0981ed055d5..7a291bcb2f03 100644
  	/* first and last insn idx of this verifier state */
  	u32 first_insn_idx;
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index 2b6c5bb64983..e3df64361763 100644
+index 47615da6b181..28d342a2523b 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
-@@ -20219,6 +20219,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+@@ -20223,6 +20223,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
  		states_cnt++;
  		if (sl->state.insn_idx != insn_idx)
  			continue;
@@ -46,7 +46,7 @@ index 2b6c5bb64983..e3df64361763 100644
  
  		if (sl->state.branches) {
  			struct bpf_func_state *frame = sl->state.frame[sl->state.curframe];
-@@ -20531,6 +20533,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
+@@ -20535,6 +20537,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
  		return err;
  	}
  
@@ -55,7 +55,7 @@ index 2b6c5bb64983..e3df64361763 100644
  	cur->parent = new;
  	cur->first_insn_idx = insn_idx;
  	cur->dfs_depth = new->dfs_depth + 1;
-@@ -24754,6 +24758,20 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
+@@ -24764,6 +24768,20 @@ static int __used bcf_refine(struct bpf_verifier_env *env,
  	if (!err && (env->bcf.refine_cond >= 0 || env->bcf.path_cond >= 0))
  		mark_bcf_requested(env);
  

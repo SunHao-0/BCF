@@ -1,7 +1,10 @@
-From 152b0091df5ba98aa2bf3a02e51f27c2a9c14836 Mon Sep 17 00:00:00 2001
+From ffe9137862c4b7ef4616de9362b584a2b9e361af Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 12:11:33 +0200
 Subject: [PATCH RFC 03/11] bpf: Add expr_equiv() for proof goal check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Add structural expression equivalence with variable renaming and argument
 sharing for faster repeated checks. Also use it to verify the ASSUME goal

@@ -1,4 +1,4 @@
-From 32e643d6b8432e701f18b72bc03838c99126e8c6 Mon Sep 17 00:00:00 2001
+From 580cf33436ed09995821beacd00aac783ddd3bf1 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Wed, 29 Oct 2025 18:44:48 +0100
 Subject: [PATCH RFC 11/17] bpf: Track stack spill/fill in bcf_track()
@@ -23,7 +23,7 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  1 file changed, 16 insertions(+)
 
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index f59b98f4ee33..f81677789389 100644
+index 607e36b56835..9276a25354f2 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -5322,6 +5322,10 @@ static void copy_register_state(struct bpf_reg_state *dst, const struct bpf_reg_

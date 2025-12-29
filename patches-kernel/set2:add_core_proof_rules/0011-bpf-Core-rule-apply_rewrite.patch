@@ -1,4 +1,4 @@
-From 5be1d986dc48b6d60ea88d53ca8afe6035351d44 Mon Sep 17 00:00:00 2001
+From 8c0a3b3e2714aea8751607d4b065bd6b3985a442 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 18:22:44 +0200
 Subject: [PATCH RFC 11/11] bpf: Core rule: apply_rewrite()

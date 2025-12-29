@@ -1,4 +1,4 @@
-From 17a67e5e2bd44f17ff48454388c42b0f08e74ed0 Mon Sep 17 00:00:00 2001
+From 823b88f2aae4541b646b196c614910a3041d24c8 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 09:50:04 +0200
 Subject: [PATCH RFC 02/17] bpf: Add bcf_checker top-level workflow
@@ -80,7 +80,7 @@ index 000000000000..220552653c80
 +
 +#endif /* __LINUX_BCF_CHECKER_H__ */
 diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
-index 232cbc97434d..109c26523d4d 100644
+index 79cf22860a99..006f1311444e 100644
 --- a/kernel/bpf/Makefile
 +++ b/kernel/bpf/Makefile
 @@ -6,7 +6,7 @@ cflags-nogcse-$(CONFIG_X86)$(CONFIG_CC_IS_GCC) := -fno-gcse

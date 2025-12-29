@@ -1,10 +1,10 @@
-From 92802b31168cfc1c1121ef7d52d6c625a0dd63b6 Mon Sep 17 00:00:00 2001
+From 58add1c300080cb1b9b34e180abcbbe151cbd269 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 11:39:57 +0200
 Subject: [PATCH RFC 01/11] bpf: Add bcf expr type check
 
 Add structural and type checking for BCF expressions in the proof checker.
-Validate per-node opcode, arity, and operand types (BV/BOOL/LIST), and 
+Validate per-node opcode, arity, and operand types (BV/BOOL/LIST), and
 compute widths for BV terms (including indexed ops EXTRACT/EXTEND/REPEAT,
 etc.).
 
@@ -23,12 +23,12 @@ Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
  2 files changed, 365 insertions(+), 1 deletion(-)
 
 diff --git a/.clang-format b/.clang-format
-index 7f2f85bc4c1f..a357a3c723d4 100644
+index 78f68ce0d4fc..097185ef5a56 100644
 --- a/.clang-format
 +++ b/.clang-format
-@@ -748,6 +748,8 @@ ForEachMacros:
-   - 'ynl_attr_for_each_payload'
+@@ -750,6 +750,8 @@ ForEachMacros:
    - 'zorro_for_each_dev'
+   - 'zpci_bus_for_each'
    - 'bcf_for_each_arg'
 +  - 'bcf_for_each_expr'
 +  - 'bcf_for_each_arg_expr'

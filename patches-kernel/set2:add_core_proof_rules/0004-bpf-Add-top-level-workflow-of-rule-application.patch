@@ -1,7 +1,10 @@
-From 6bca694d400fdf0a430d3f24e03d6fd7a6203f60 Mon Sep 17 00:00:00 2001
+From c4af03ca22f69f4963dc2920ba747d3e032fb2d3 Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Tue, 30 Sep 2025 12:35:05 +0200
 Subject: [PATCH RFC 04/11] bpf: Add top-level workflow of rule application
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Add the rule engine: dispatch by class (core/boolean/bv), fetch premises,
 validate parameters, compute a conclusion (fact), and record last-use of
