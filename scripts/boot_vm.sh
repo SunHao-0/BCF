@@ -41,7 +41,7 @@ qemu-system-x86_64 \
     -m "$MEM" \
     -smp $(nproc) \
     -kernel "$KERNEL_PATH" \
-    -append "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0" \
+    -append "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0 panic_on_warn=0" \
     -drive file="$VM_IMG",format=raw \
     -net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:"$VM_SSH_PORT"-:22 \
     -net nic,model=e1000 \

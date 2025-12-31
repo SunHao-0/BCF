@@ -93,7 +93,6 @@ which makes the verifier accept bpf_wiregard.bpf.c
 
 Reported-by: Hao Sun <sunhao.th@gmail.com>
 Signed-off-by: Alexei Starovoitov <ast@kernel.org>
-Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
 ---
  kernel/bpf/verifier.c | 30 ++++++++++++++++++++++++++++++
  1 file changed, 30 insertions(+)

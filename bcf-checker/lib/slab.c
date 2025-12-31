@@ -8,10 +8,9 @@
 #include <malloc.h>
 #include <linux/gfp.h>
 
-atomic_int kmalloc_nr_allocated;
+#ifdef BCF_MEM_PROFILE
 atomic_long kmalloc_bytes_allocated;
 atomic_long kmalloc_max_bytes_allocated;
-int kmalloc_verbose;
 
 static void update_max_memory(void)
 {
@@ -22,6 +21,7 @@ static void update_max_memory(void)
 					     current)) {
 	}
 }
+#endif
 
 struct kmem_cache {
 	const char *name;
@@ -44,14 +44,13 @@ void *kmalloc(size_t size, gfp_t gfp)
 		return NULL;
 
 	ret = malloc(size);
-	atomic_fetch_add(&kmalloc_nr_allocated, 1);
+#ifdef BCF_MEM_PROFILE
 	if (ret) {
 		atomic_fetch_add(&kmalloc_bytes_allocated,
 				 malloc_usable_size(ret));
 		update_max_memory();
 	}
-	if (kmalloc_verbose)
-		printf("Allocating %p from malloc\n", ret);
+#endif
 	if (gfp & __GFP_ZERO)
 		memset(ret, 0, size);
 	return ret;
@@ -60,13 +59,15 @@ void *kmalloc(size_t size, gfp_t gfp)
 void *krealloc(void *p, size_t new_size, gfp_t gfp)
 {
 	void *ret;
+#ifdef BCF_MEM_PROFILE
 	size_t old_size = 0;
 
 	if (p)
 		old_size = malloc_usable_size(p);
+#endif
 
 	ret = realloc(p, new_size);
-
+#ifdef BCF_MEM_PROFILE
 	if (ret) {
 		if (p)
 			atomic_fetch_sub(&kmalloc_bytes_allocated, old_size);
@@ -74,6 +75,7 @@ void *krealloc(void *p, size_t new_size, gfp_t gfp)
 				 malloc_usable_size(ret));
 		update_max_memory();
 	}
+#endif
 
 	if (ret && (gfp & __GFP_ZERO))
 		memset(ret, 0, new_size);
@@ -84,10 +86,9 @@ void kfree(void *p)
 {
 	if (!p)
 		return;
-	atomic_fetch_sub(&kmalloc_nr_allocated, 1);
+#ifdef BCF_MEM_PROFILE
 	atomic_fetch_sub(&kmalloc_bytes_allocated, malloc_usable_size(p));
-	if (kmalloc_verbose)
-		printf("Freeing %p to malloc\n", p);
+#endif
 	free(p);
 }
 
@@ -99,20 +100,20 @@ void *kmalloc_array(size_t n, size_t size, gfp_t gfp)
 		return NULL;
 
 	ret = calloc(n, size);
-	atomic_fetch_add(&kmalloc_nr_allocated, 1);
+#ifdef BCF_MEM_PROFILE
 	if (ret) {
 		atomic_fetch_add(&kmalloc_bytes_allocated,
 				 malloc_usable_size(ret));
 		update_max_memory();
 	}
-	if (kmalloc_verbose)
-		printf("Allocating %p from calloc\n", ret);
+#endif
 	if (gfp & __GFP_ZERO)
 		memset(ret, 0, n * size);
 	return ret;
 }
 
-void *kmem_cache_alloc_lru(struct kmem_cache *cachep, struct list_lru *lru, int flags)
+void *kmem_cache_alloc_lru(struct kmem_cache *cachep, struct list_lru *lru,
+			   int flags)
 {
 	void *ret;
 
@@ -122,12 +123,10 @@ void *kmem_cache_alloc_lru(struct kmem_cache *cachep, struct list_lru *lru, int 
 	ret = malloc(cachep->size);
 	if (!ret)
 		return NULL;
-
-	atomic_fetch_add(&kmalloc_nr_allocated, 1);
+#ifdef BCF_MEM_PROFILE
 	atomic_fetch_add(&kmalloc_bytes_allocated, malloc_usable_size(ret));
 	update_max_memory();
-	if (kmalloc_verbose)
-		printf("Allocating %p from kmem_cache %s\n", ret, cachep->name);
+#endif
 
 	// Call constructor if provided
 	if (cachep->ctor)
@@ -141,17 +140,15 @@ void kmem_cache_free(struct kmem_cache *cachep, void *objp)
 	if (!objp || !cachep)
 		return;
 
-	atomic_fetch_sub(&kmalloc_nr_allocated, 1);
+#ifdef BCF_MEM_PROFILE
 	atomic_fetch_sub(&kmalloc_bytes_allocated, malloc_usable_size(objp));
-	if (kmalloc_verbose)
-		printf("Freeing %p to kmem_cache %s\n", objp, cachep->name);
-
+#endif
 	free(objp);
 }
 
 struct kmem_cache *kmem_cache_create(const char *name, unsigned int size,
-			unsigned int align, unsigned int flags,
-			void (*ctor)(void *))
+				     unsigned int align, unsigned int flags,
+				     void (*ctor)(void *))
 {
 	struct kmem_cache *cachep;
 
@@ -159,18 +156,15 @@ struct kmem_cache *kmem_cache_create(const char *name, unsigned int size,
 	if (!cachep)
 		return NULL;
 
+#ifdef BCF_MEM_PROFILE
 	atomic_fetch_add(&kmalloc_bytes_allocated, malloc_usable_size(cachep));
 	update_max_memory();
-
+#endif
 	cachep->name = name;
 	cachep->size = size;
 	cachep->align = align;
 	cachep->flags = flags;
 	cachep->ctor = ctor;
-
-	if (kmalloc_verbose)
-		printf("Created kmem_cache %s with size %u\n", name, size);
-
 	return cachep;
 }
 

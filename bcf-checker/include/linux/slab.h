@@ -7,8 +7,10 @@
 #include <linux/err.h>
 #include <stdatomic.h>
 
+#ifdef BCF_MEM_PROFILE
 extern atomic_long kmalloc_bytes_allocated;
 extern atomic_long kmalloc_max_bytes_allocated;
+#endif
 
 #define SLAB_PANIC 2
 #define SLAB_RECLAIM_ACCOUNT 0x00020000UL /* Objects are reclaimable */

@@ -7,7 +7,7 @@
 #include <linux/bpfptr.h>
 #include <linux/bpf_verifier.h> /* For log level. */
 
-#define MAX_BCF_PROOF_SIZE (8 * 1024 * 1024)
+#define MAX_BCF_PROOF_SIZE (32 * 1024 * 1024)
 
 typedef void (*bcf_logger_cb)(void *private, const char *fmt, va_list args);
 

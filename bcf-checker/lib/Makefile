@@ -24,6 +24,10 @@ else
     BUILDCONFIG := $(BUILDDIR)/.release
 endif
 
+ifdef MEM_PROFILE
+    CFLAGS += -DBCF_MEM_PROFILE
+endif
+
 Q := $(if $(filter 1,$(V)),,@)
 
 # Find all C source files in the lib directory

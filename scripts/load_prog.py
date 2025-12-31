@@ -171,6 +171,10 @@ def handle_object_group(
         if obj_file in obj_prog_types:
             prog_type = obj_prog_types[obj_file]
             force_type = True
+        elif project == "collected":
+            # For collected objects, they are known to load/reject w/o prog type
+            prog_type = None
+            force_type = True
         else:
             force_type = False
 
@@ -413,7 +417,7 @@ def benchmark_command(command, runs=5, cpu_core=0, use_high_priority=True, clean
 
 def bench_load_accepted_prog(prog_dir, output_dir):
     accepted_prog_index, obj_prog_types = load_index(
-        prog_dir, prog_index_file="accepted_prog_index.json"
+        output_dir, prog_index_file="accepted_prog_index.json"
     )
     os.makedirs(output_dir, exist_ok=True)
     exec_time_csv_path = os.path.join(output_dir, "prog_load_time.json")

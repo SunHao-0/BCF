@@ -39,6 +39,10 @@ else
     BUILDCONFIG := $(BUILDDIR)/.release
 endif
 
+ifdef MEM_PROFILE
+    CFLAGS += -DBCF_MEM_PROFILE
+endif
+
 TEST_CFLAGS := $(CFLAGS) -DTEST_BUILD $(SANITIZER_FLAGS) $(COVERAGE_FLAGS) \
                -Wno-unused-variable -Wno-unused-but-set-variable \
                -Wno-unused-function

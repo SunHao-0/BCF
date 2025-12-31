@@ -8,9 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <time.h>
 #include <linux/slab.h>
 
@@ -247,7 +245,11 @@ int main(int argc, char **argv)
 		long mem_bytes;
 
 		clock_gettime(CLOCK_MONOTONIC, &end);
+#ifdef BCF_MEM_PROFILE
 		mem_bytes = atomic_load(&kmalloc_max_bytes_allocated);
+#else
+		mem_bytes = 0;
+#endif
 		time_us = (end.tv_sec - start.tv_sec) * 1000000ULL +
 			  (end.tv_nsec - start.tv_nsec) / 1000;
 		printf("{\"time_us\": %lu, \"memory_bytes\": %ld, \"status\": %d}\n",
