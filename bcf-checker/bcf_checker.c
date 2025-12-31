@@ -4812,10 +4812,10 @@ static int format_sexpr(struct bcf_checker_state *st, struct bcf_expr *root,
 static void verbose_expr(struct bcf_checker_state *st, struct bcf_expr *expr,
 			 u32 depth)
 {
-	char buf[1024];
+	char buf[512];
 	int ret;
 
-	ret = format_sexpr(st, expr, buf, 1024, depth);
+	ret = format_sexpr(st, expr, buf, 512, depth);
 	if (ret < 0)
 		return;
 	verbose(st, "%s", buf);
