@@ -1,4 +1,4 @@
-From 8213fbd3940376c2929f37c66d253c16a4e4269c Mon Sep 17 00:00:00 2001
+From 022dd0e6487d8d671a829c720c6e3518bab3b5ab Mon Sep 17 00:00:00 2001
 From: Hao Sun <hao.sun@inf.ethz.ch>
 Date: Mon, 29 Dec 2025 17:25:56 +0100
 Subject: [PATCH] bpf: Batch BCF requests to reduce kernel/user interaction
@@ -21,18 +21,19 @@ unsat, such that the solver can produce a refute proof.
 Signed-off-by: Hao Sun <hao.sun@inf.ethz.ch>
 ---
  include/linux/bpf_verifier.h |  3 ++
+ kernel/bpf/bcf_checker.c     |  2 +-
  kernel/bpf/verifier.c        | 85 ++++++++++++++++++++++++++++++++++--
- 2 files changed, 85 insertions(+), 3 deletions(-)
+ 3 files changed, 86 insertions(+), 4 deletions(-)
 
 diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
-index fb45bc7dc487..ee6ad2319f43 100644
+index fb45bc7dc487..45ab44cb901b 100644
 --- a/include/linux/bpf_verifier.h
 +++ b/include/linux/bpf_verifier.h
 @@ -736,6 +736,7 @@ struct bpf_scc_info {
  
  struct bpf_liveness;
  
-+#define BCF_BATCH_SIZE 32
++#define BCF_BATCH_SIZE 16
  struct bcf_refine_state {
  	/* The state list that decides the path suffix, on which bcf_track()
  	 * collects symbolic information for target registers.
@@ -45,8 +46,21 @@ index fb45bc7dc487..ee6ad2319f43 100644
  
  	/* Refinement specific */
  	u32 size_regno;
+diff --git a/kernel/bpf/bcf_checker.c b/kernel/bpf/bcf_checker.c
+index f7031331fb6f..7ac5870a2b10 100644
+--- a/kernel/bpf/bcf_checker.c
++++ b/kernel/bpf/bcf_checker.c
+@@ -1112,7 +1112,7 @@ static bool is_leaf_node(struct bcf_expr *e)
+ 	return !e->vlen || !expr_arg_is_id(e->code);
+ }
+ 
+-#define BCF_MAX_VAR_MAP 128
++#define BCF_MAX_VAR_MAP 256
+ struct bcf_var_map {
+ 	struct {
+ 		u32 idx0;
 diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
-index fda361fed70a..ba08e99725a4 100644
+index 6209f40d5984..fbb003466bea 100644
 --- a/kernel/bpf/verifier.c
 +++ b/kernel/bpf/verifier.c
 @@ -24880,7 +24880,6 @@ static int bcf_track(struct bpf_verifier_env *env,
@@ -153,7 +167,7 @@ index fda361fed70a..ba08e99725a4 100644
  	kvfree(env->explored_states);
  
  	clear_insn_aux_data(env, 0, env->prog->len);
-@@ -26475,7 +26540,7 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+@@ -26476,7 +26541,7 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
  		return err;
  
  	/* Drop the last history entry */
@@ -162,7 +176,7 @@ index fda361fed70a..ba08e99725a4 100644
  		env->cur_state->jmp_history_cnt--;
  
  	if (env->log.level & BPF_LOG_LEVEL2) {
-@@ -26492,6 +26557,7 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
+@@ -26491,6 +26556,7 @@ static int resume_env(struct bpf_verifier_env *env, union bpf_attr *attr,
  	}
  	bcf->backtrack_length = 0;
  	bcf->track_length = 0;
@@ -170,7 +184,7 @@ index fda361fed70a..ba08e99725a4 100644
  
  	return 0;
  }
-@@ -26668,10 +26734,22 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26667,10 +26733,22 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  		ret = resume_env(env, attr, uattr);
  		if (ret)
  			goto skip_full_check;
@@ -193,7 +207,7 @@ index fda361fed70a..ba08e99725a4 100644
  	if (ret && bcf_requested(env)) {
  		u64 vtime = ktime_get_ns() - start_time;
  
-@@ -26688,6 +26766,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+@@ -26687,6 +26765,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
  		env->verification_time -= vtime;
  	}
  
