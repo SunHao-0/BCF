@@ -644,8 +644,10 @@ def analyze_prog_load_time(output_dir):
 
         # compute proportion using geometric mean
         real_time = np.array(obj_user_times) + np.array(obj_sys_times)
-        user_proportion.append(np.exp(np.mean(np.log(np.array(obj_user_times) / real_time))))
-        sys_proportion.append(np.exp(np.mean(np.log(np.array(obj_sys_times) / real_time))))
+        # Skip proportion calculation if any time is zero to avoid divide by zero / log(0)
+        if not (np.any(real_time == 0) or np.any(np.array(obj_user_times) == 0) or np.any(np.array(obj_sys_times) == 0)):
+            user_proportion.append(np.exp(np.mean(np.log(np.array(obj_user_times) / real_time))))
+            sys_proportion.append(np.exp(np.mean(np.log(np.array(obj_sys_times) / real_time))))
 
         real_times.append(obj_real_time)
         user_times.append(obj_user_time)
@@ -735,6 +737,7 @@ def draw_hist(data, title, xlabel, ylabel, filename, bins=None, last_bin_start=-
         bins[0] = min(data)
     bins[len(bins)-1] = max(data)
     bin_edges = bins
+    bin_edges = sorted(list(set(bin_edges)))
 
     counts, edges = np.histogram(data, bins=bin_edges)
     total = np.sum(counts)
@@ -768,9 +771,9 @@ def draw_hist(data, title, xlabel, ylabel, filename, bins=None, last_bin_start=-
     if draw_sep_line:
         plt.axvline(x=x_pos[-2] + 0.5, color='red', linestyle='--')
         percent = (np.sum(counts[:-1]) / total) * 100
-        sep = f"{bins[-2]}"
+        sep = f"{int(edges[-2])}"
         if convertor:
-            sep = convertor(bins[-2])
+            sep = convertor(edges[-2])
             sep = f"{sep:.1f}"
         plt.text(
             # place the text to the right of the line plus a bit of padding
@@ -981,7 +984,7 @@ def analyze_bcf_stats(output_dir, progs_dir, validate_fails=False, summary_map=N
         ok("load results: {:.2%} rejected".format(
             len(rejected_objs) / len(all_objs)))
 
-    # analyze_prog_load_time(output_dir)
+    analyze_prog_load_time(output_dir)
 
     # Next, let's read bcf_stats.csv to analyze the BCF statistics of loaded objects
     ack("Analyzing BCF statistics of loaded objects...")
@@ -1030,9 +1033,9 @@ def analyze_bcf_stats(output_dir, progs_dir, validate_fails=False, summary_map=N
     check_count_total = sum(check_counts)
     # log the min, avg, max with different color
     ok(f"check count min/avg/max/total: {check_count_min}/{check_count_avg:.2f}/{check_count_max}/{check_count_total}")
-    # draw_hist(check_counts, "Distribution of Proof Request Times",
-    #           "Proof Request Times", "Frequency", "check_counts_hist.pdf", last_bin_start=900)
-    # ack("check_counts_hist.pdf saved")
+    draw_hist(check_counts, "Distribution of Proof Request Times",
+              "Proof Request Times", "Frequency", "check_counts_hist.pdf", last_bin_start=900)
+    ack("check_counts_hist.pdf saved")
 
     # count and output objs without bcf proof checks, those are the objs in the accepted set but not in the obj_stats
     no_bcf_objs = loaded_objs - set(obj_stats.keys())
@@ -1045,9 +1048,9 @@ def analyze_bcf_stats(output_dir, progs_dir, validate_fails=False, summary_map=N
     check_time_avg = sum(check_times) / len(check_times) / 1000
     check_time_max = max(check_times) / 1000
     ok(f"check time (us) min/avg/max: {check_time_min}/{check_time_avg:.2f}/{check_time_max}")
-    # draw_hist(check_times, "Distribution of Time Taken for Proof Checks",
-    #           "Proof Check Times (us)", "Frequency", "check_times_hist.pdf", convertor=lambda x: x / 1000)
-    # ack("check_times_hist.pdf saved")
+    draw_hist(check_times, "Distribution of Time Taken for Proof Checks",
+              "Proof Check Times (us)", "Frequency", "check_times_hist.pdf", convertor=lambda x: x / 1000)
+    ack("check_times_hist.pdf saved")
 
     # Analyze the distribution of the size of proofs generated
     proof_sizes = [size for stats in obj_stats.values()
@@ -1056,22 +1059,22 @@ def analyze_bcf_stats(output_dir, progs_dir, validate_fails=False, summary_map=N
     proof_size_avg = sum(proof_sizes) / len(proof_sizes)
     proof_size_max = max(proof_sizes)
     ok(f"proof size (bytes) min/avg/max: {proof_size_min}/{proof_size_avg:.2f}/{proof_size_max}")
-    # draw_hist(proof_sizes, "Distribution of Proof Sizes (Bytes)",
-    #           None, "Frequency", "proof_sizes_hist.pdf",
-              # bins=[128, 256, 512, 1024, 4096, 0])
-    # ack("proof_sizes_hist.pdf saved")
+    draw_hist(proof_sizes, "Distribution of Proof Sizes (Bytes)",
+              None, "Frequency", "proof_sizes_hist.pdf",
+              bins=[128, 256, 512, 1024, 4096, 0])
+    ack("proof_sizes_hist.pdf saved")
 
-    # ack("Analyzing the correlation between the size of proofs and time taken...")
+    ack("Analyzing the correlation between the size of proofs and time taken...")
     # Correlate the size of the proof with the time taken for the check
-    # proof_sizes = []
-    # proof_times = []
-    # for stats in obj_stats.values():
-    #     for size, time in zip(stats["size"], stats["time"]):
-    #         proof_sizes.append(size)
-    #         proof_times.append(time/1000)
-    # plot_boxplot(proof_sizes, proof_times, 'Proof Size (bytes)', 'Proof Check Time (us)',
-    #              'Proof Size vs. Check Time', save_path='proof_size_vs_check_time_boxplot.pdf')
-    # ack("proof_size_vs_check_time_boxplot.pdf saved")
+    proof_sizes = []
+    proof_times = []
+    for stats in obj_stats.values():
+        for size, time in zip(stats["size"], stats["time"]):
+            proof_sizes.append(size)
+            proof_times.append(time/1000)
+    plot_boxplot(proof_sizes, proof_times, 'Proof Size (bytes)', 'Proof Check Time (us)',
+                 'Proof Size vs. Check Time', save_path='proof_size_vs_check_time_boxplot.pdf')
+    ack("proof_size_vs_check_time_boxplot.pdf saved")
 
 
     # proof time / verification time
@@ -1130,18 +1133,18 @@ def analyze_bcf_stats(output_dir, progs_dir, validate_fails=False, summary_map=N
     # geometric mean
     proof_percetage_avg = np.exp(
         np.mean([np.log(p[0]/p[1]) for p in proof_time_vtime]))
-    # ok(f"proof time / verification time min/avg/max: {proof_percetage_min:.6f}/{proof_percetage_avg:.6f}/{proof_percetage_max:.6f}")
-    # draw_hist([p[0]/p[1] for p in proof_time_vtime], "Distribution of Proof Time / Verification Time",
-    #           "Proof Time / Verification Time", "Frequency", "proof_time_vtime_hist.pdf", convertor=lambda x: x)
+    ok(f"proof time / verification time min/avg/max: {proof_percetage_min:.6f}/{proof_percetage_avg:.6f}/{proof_percetage_max:.6f}")
+    draw_hist([p[0]/p[1] for p in proof_time_vtime], "Distribution of Proof Time / Verification Time",
+              "Proof Time / Verification Time", "Frequency", "proof_time_vtime_hist.pdf", convertor=lambda x: x)
 
     # proof request time vs. insn processed
     proof_n_min = min([p[0]/p[1] for p in proof_n_insn_n])
     proof_n_max = max([p[0]/p[1] for p in proof_n_insn_n])
     # geometric mean
     proof_n_avg = np.exp(np.mean([np.log(p[0]/p[1]) for p in proof_n_insn_n]))
-    # ok(f"insn with proof / total insn processed min/avg/max: {proof_n_min:.6f}/{proof_n_avg:.6f}/{proof_n_max:.6f}")
-    # draw_hist([p[1]/p[0] for p in proof_n_insn_n], "Distribution of Proof N / Insn Processed",
-    #           "Proof N / Insn Processed", "Frequency", "proof_n_insn_hist.pdf", convertor=lambda x: x)
+    ok(f"insn with proof / total insn processed min/avg/max: {proof_n_min:.6f}/{proof_n_avg:.6f}/{proof_n_max:.6f}")
+    draw_hist([p[1]/p[0] for p in proof_n_insn_n], "Distribution of Proof N / Insn Processed",
+              "Proof N / Insn Processed", "Frequency", "proof_n_insn_hist.pdf", convertor=lambda x: x)
 
     from prettytable import PrettyTable  # type: ignore
     table = PrettyTable()
